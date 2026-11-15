@@ -71,6 +71,18 @@ NODE_OF_SITE = {v: k for k, v in SITE_OF_NODE.items()}
 EXPECTED_ROBOTS = {"mn1": 4, "mn2": 2, "mn3": 4}
 
 VAL_RATIO = float(os.getenv("AMR_VAL_RATIO", "0.2"))
+
+# 정상 구간 중 시험 전용으로 떼어 둘 비율.
+# 검증(임계값 보정)과 시험(평가)이 겹치면 평가가 독립적이지 않다.
+TEST_NORMAL_RATIO = float(os.getenv("AMR_TEST_NORMAL_RATIO", "0.2"))
+
+# 블록 경계에서 버릴 윈도우 수.
+# 1초 윈도우가 연속이라 경계를 맞댄 두 윈도우는 사실상 같은 장면이다.
+EMBARGO = int(os.getenv("AMR_EMBARGO", "2"))
+
+# run 단위로 나누려면 run이 최소 몇 개 있어야 하는가.
+# 4개면 학습 2 / 검증 1 / 시험 1 이 된다. 그보다 적으면 run 안에서 자른다.
+MIN_RUNS_FOR_RUN_SPLIT = int(os.getenv("AMR_MIN_RUNS", "4"))
 SEED = int(os.getenv("AMR_SEED", "42"))
 
 _fallback_warned = False
@@ -170,6 +182,8 @@ def iter_records(src: str):
 # ── 파싱 ──────────────────────────────────────────────────
 def parse(src: str) -> dict:
     X, C, NAV, ROBOT, POSE, NODE, LABEL = [], [], [], [], [], [], []
+    # run 경계를 찾고 시간순으로 정렬하려면 순서 정보가 필요하다.
+    SEQ, TSIM = [], []
     skipped = 0
 
     for con, lbl in iter_records(src):
@@ -204,6 +218,13 @@ def parse(src: str) -> dict:
         NODE.append(site_of_robot(con.get("robot", "unknown")))
         LABEL.append(cond_name)
 
+        # seq는 로봇별 CIN 순번, t_sim은 시뮬레이션 시각.
+        # 둘 다 주행이 다시 시작되면 되돌아간다.
+        SEQ.append(_as_int(con.get("seq")))
+        ts = con.get("t_sim")
+        TSIM.append(float(ts[0]) if isinstance(ts, list) and ts
+                    else _as_float(ts))
+
     return {
         "X": np.asarray(X, dtype=np.float32),
         "C": np.asarray(C, dtype=np.float32),
@@ -212,8 +233,135 @@ def parse(src: str) -> dict:
         "pose": np.asarray(POSE, dtype=np.float32),
         "node": np.asarray(NODE),
         "label": np.asarray(LABEL),
+        "seq": np.asarray(SEQ, dtype=np.int64),
+        "t_sim": np.asarray(TSIM, dtype=np.float64),
         "skipped": skipped,
     }
+
+
+# ── run 식별과 분할 ───────────────────────────────────────
+
+def _as_int(v) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _as_float(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def derive_run_ids(robot: np.ndarray, seq: np.ndarray,
+                   t_sim: np.ndarray) -> np.ndarray:
+    """
+    윈도우마다 run(주행) 식별자를 붙인다.
+
+    새 run으로 보는 경우
+      - 로봇이 바뀐다
+      - seq가 줄거나 같다 (주행이 다시 시작돼 순번이 리셋됨)
+      - t_sim이 뒤로 간다 (시뮬레이션 시각이 되감김)
+
+    지금 데이터는 로봇 하나가 연속 주행 하나라 run = 로봇이 된다.
+    나중에 한 로봇이 여러 번 주행한 덤프가 와도 그대로 동작한다.
+    """
+    n = len(robot)
+    if n == 0:
+        return np.zeros(0, dtype=np.int64)
+
+    run = np.zeros(n, dtype=np.int64)
+    cur = 0
+    for i in range(1, n):
+        new_run = robot[i] != robot[i - 1]
+        if not new_run and seq[i] >= 0 and seq[i - 1] >= 0:
+            new_run = seq[i] <= seq[i - 1]
+        if not new_run and np.isfinite(t_sim[i]) and np.isfinite(t_sim[i - 1]):
+            new_run = t_sim[i] < t_sim[i - 1]
+        if new_run:
+            cur += 1
+        run[i] = cur
+    return run
+
+
+def _blocks_in_run(order: np.ndarray) -> tuple:
+    """
+    한 run 안을 시간순 연속 블록 셋으로 자른다.
+      [학습][embargo][검증][embargo][시험]
+
+    무작위로 섞지 않는 이유는, 이웃한 1초 윈도우가 사실상 같은 장면이라
+    섞으면 학습과 검증이 같은 장면을 나눠 갖기 때문이다.
+    embargo는 블록이 맞닿는 지점의 윈도우를 버려서 그 누수를 막는다.
+    """
+    n = len(order)
+    if n == 0:
+        return order[:0], order[:0], order[:0]
+
+    n_test = int(n * TEST_NORMAL_RATIO)
+    n_val = int(n * VAL_RATIO)
+
+    # 너무 짧으면 나누지 않고 전부 학습으로 둔다.
+    if n < 3 * (EMBARGO + 1) or n_val < 1 or n_test < 1:
+        return order, order[:0], order[:0]
+
+    n_train = n - n_val - n_test - 2 * EMBARGO
+    if n_train < 1:
+        return order, order[:0], order[:0]
+
+    a = n_train
+    b = a + EMBARGO
+    c = b + n_val
+    d = c + EMBARGO
+    return order[:a], order[b:c], order[d:]
+
+
+def split_normals(idx: np.ndarray, run: np.ndarray,
+                  rng: np.random.Generator) -> tuple:
+    """
+    정상 윈도우 인덱스를 학습 / 검증 / 시험으로 나눈다.
+
+    run이 넉넉하면 run 통째로 배정한다. 서로 다른 주행이므로 누수가 없다.
+    부족하면 run 안에서 시간순 블록으로 자른다.
+    반환에 어느 방식을 썼는지도 같이 준다.
+    """
+    if len(idx) == 0:
+        e = idx[:0]
+        return e, e, e, "없음"
+
+    runs = np.unique(run[idx])
+
+    if len(runs) >= MIN_RUNS_FOR_RUN_SPLIT:
+        order = rng.permutation(runs)
+        n_val = max(1, int(round(len(runs) * VAL_RATIO)))
+        n_test = max(1, int(round(len(runs) * TEST_NORMAL_RATIO)))
+        # 학습 run이 최소 하나는 남아야 한다.
+        while n_val + n_test >= len(runs) and n_val + n_test > 2:
+            if n_val >= n_test:
+                n_val -= 1
+            else:
+                n_test -= 1
+
+        val_runs = set(order[:n_val].tolist())
+        test_runs = set(order[n_val:n_val + n_test].tolist())
+
+        in_val = np.isin(run[idx], list(val_runs))
+        in_test = np.isin(run[idx], list(test_runs))
+        return (idx[~(in_val | in_test)], idx[in_val], idx[in_test],
+                f"run 단위 ({len(runs)}개 run: 학습 "
+                f"{len(runs) - n_val - n_test} / 검증 {n_val} / 시험 {n_test})")
+
+    tr, va, te = [], [], []
+    for r in runs:
+        order = idx[run[idx] == r]
+        order = order[np.argsort(order)]      # 시간순
+        a, b, c = _blocks_in_run(order)
+        tr.append(a); va.append(b); te.append(c)
+
+    cat = lambda parts: (np.concatenate(parts) if parts else idx[:0])
+    return (cat(tr), cat(va), cat(te),
+            f"run 내 시간순 블록 ({len(runs)}개 run, embargo {EMBARGO})")
 
 
 # ── 노드별 PKL ────────────────────────────────────────────
@@ -225,6 +373,10 @@ def build_node_pkl(d: dict, node: str, rng: np.random.Generator) -> dict:
     X, C = d["X"][sel], d["C"][sel]
     nav, robot = d["nav"][sel], d["robot"][sel]
     pose, label = d["pose"][sel], d["label"][sel]
+    seq, t_sim = d["seq"][sel], d["t_sim"][sel]
+
+    # 주행 단위. 누수 없이 나누려면 구간이 아니라 주행으로 갈라야 한다.
+    run = derive_run_ids(robot, seq, t_sim)
 
     # 학습 후보: 움직이는 구간 + 이상 아님 + 제외 nav 아님
     moving = sch.moving_mask(X)
@@ -232,15 +384,23 @@ def build_node_pkl(d: dict, node: str, rng: np.random.Generator) -> dict:
     not_excluded = ~np.isin(nav, list(sch.EXCLUDE_NAV_TRAIN))
     trainable = moving & is_normal & not_excluded
 
-    idx = np.where(trainable)[0]
-    rng.shuffle(idx)
-    n_val = max(1, int(len(idx) * VAL_RATIO)) if len(idx) else 0
-    val_idx, tr_idx = idx[:n_val], idx[n_val:]
+    # 정상을 셋으로 나눈다. 검증은 임계값 보정, 시험은 평가 전용이다.
+    tr_idx, val_idx, te_norm_idx, how = split_normals(
+        np.where(trainable)[0], run, rng)
 
     tr = np.zeros(len(X), bool); tr[tr_idx] = True
     va = np.zeros(len(X), bool); va[val_idx] = True
-    # 평가: 움직이는 구간 전부 (검증용 정상 + 이상 + 중단 포함)
-    te = moving & (va | ~is_normal | ~not_excluded)
+    te_norm = np.zeros(len(X), bool); te_norm[te_norm_idx] = True
+
+    # 평가 = 시험 전용 정상 + 이상 + 중단.
+    # 검증 구간(va)은 넣지 않는다. 임계값을 맞춘 데이터로 점수를 매기면
+    # 독립적인 평가가 아니다.
+    te = moving & (te_norm | ~is_normal | ~not_excluded)
+
+    print(f"    [{node}] 분할 방식: {how}")
+    if va.any() and not te_norm.any():
+        print(f"    [{node}] ⚠ 시험용 정상 구간이 없다. "
+              f"AMR_TEST_NORMAL_RATIO를 올리거나 데이터를 늘려라.")
 
     if tr.any():
         mean = X[tr].mean(axis=(0, 2), keepdims=True)
@@ -256,15 +416,18 @@ def build_node_pkl(d: dict, node: str, rng: np.random.Generator) -> dict:
     return {
         "train_signals": norm(X[tr]), "train_cond": C[tr],
         "train_nav": nav[tr], "train_robot": robot[tr],
+        "train_run_id": run[tr],
 
         "val_signals": norm(X[va]), "val_cond": C[va],
         "val_labels": np.zeros(int(va.sum()), dtype=np.int64),
-        "val_nav": nav[va],
+        "val_nav": nav[va], "val_run_id": run[va],
 
         "test_signals": norm(X[te]), "test_cond": C[te],
         "test_labels": (label[te] != NORMAL).astype(np.int64),
         "test_label_name": label[te], "test_nav": nav[te],
         "test_pose": pose[te], "test_robot": robot[te],
+        "test_run_id": run[te],
+        "split_method": how,
 
         "norm_mean": mean.astype(np.float32),
         "norm_std": std.astype(np.float32),
