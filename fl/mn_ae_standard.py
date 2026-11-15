@@ -28,6 +28,11 @@ import model_codec
 import onem2m_utils as om2m
 from edge_node import AEEdgeNode
 
+# "이번 라운드는 학습할 수 없다. 다만 노드를 죽일 일은 아니다"를 나타내는 신호.
+# 통신 실패(None)와 구분해야 한다. 전자는 다음 라운드에 회복될 수 있지만
+# 후자는 그렇지 않다.
+SKIP_ROUND = object()
+
 
 class MNAETrainer:
     def __init__(self, node_id: int, notification_port: int, inject_anomaly: bool = False):
@@ -492,12 +497,29 @@ class MNAETrainer:
             self.norm_mean = X.mean(axis=(0, 2), keepdims=True)
             self.norm_std = X.std(axis=(0, 2), keepdims=True) + 1e-8
 
-        # 학습은 정상만. 라벨이 없으면 전부 정상 주행으로 본다.
+        # 학습은 정상 주행만 쓴다.
+        #
+        # 예전에는 정상이 하나도 없으면 전부 학습 대상으로 돌렸는데, 그건
+        # 이상 데이터로 정상 패턴을 배우는 꼴이라 목적과 정면으로 충돌한다.
+        # 더 나쁜 것은 그 결과가 FedAvg를 타고 다른 사업장까지 번진다는 점이다.
+        # 그래서 지금은 되돌리지 않고 이 라운드를 건너뛴다.
+        #
+        # 제외 nav(중단된 주행 등)도 오프라인 전처리와 같은 기준으로 뺀다.
+        # 온라인과 오프라인이 다른 학습 집합을 쓰면 비교가 안 된다.
+        navs = got.get("nav")
+        if navs is not None and len(navs) == len(mv):
+            navs = navs[mv] if mv.any() else navs
         is_normal = names == "normal"
-        if not is_normal.any():
-            is_normal = np.ones(len(Xn), dtype=bool)
+        if navs is not None and len(navs) == len(is_normal):
+            is_normal = is_normal & ~np.isin(navs, list(sch.EXCLUDE_NAV_TRAIN))
 
-        print(f"      이동 {len(Xn)}개 중 학습 대상 {int(is_normal.sum())}개")
+        n_normal = int(is_normal.sum())
+        print(f"      이동 {len(Xn)}개 중 학습 대상 {n_normal}개")
+
+        if n_normal == 0:
+            print("      ✗ 정상 주행 구간이 없다. 이 라운드는 학습하지 않는다.")
+            print("        (이상 구간으로 정상 패턴을 학습할 수는 없다)")
+            return SKIP_ROUND
 
         return {
             "train_signals": Xn[is_normal],
@@ -1085,6 +1107,16 @@ class MNAETrainer:
 
             # 데이터 로드 + AEEdgeNode 생성
             data_dict = self._load_sensor_data_for_round(round_num)
+
+            if data_dict is SKIP_ROUND:
+                # 정상 주행이 없는 라운드. 이상 데이터로 학습하느니 빠진다.
+                # IN-AE에는 수집 타임아웃이 있어 나머지 노드로 집계가 진행된다.
+                print(
+                    f"  ⊘ Round {round_num}: 학습 가능한 정상 구간이 없어 "
+                    f"이번 라운드는 빠진다 ({self.node_name})"
+                )
+                continue
+
             if data_dict is None:
                 print(
                     f"  ✗ failed to load data for round {round_num}; "

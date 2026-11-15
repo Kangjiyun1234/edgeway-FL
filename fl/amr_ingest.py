@@ -79,6 +79,7 @@ def _empty() -> Dict[str, np.ndarray]:
         "robot": np.asarray([]),
         "pose": np.zeros((0, 2), np.float32),
         "cond_name": np.asarray([]),
+        "nav": np.asarray([]),
         "n_raw": 0,
     }
 
@@ -135,6 +136,7 @@ def fetch_site_windows(
         "robot": np.concatenate([p["robot"] for p in parts]),
         "pose": np.concatenate([p["pose"] for p in parts]),
         "cond_name": np.concatenate([p["cond_name"] for p in parts]),
+        "nav": np.concatenate([p["nav"] for p in parts]),
         "n_raw": sum(p["n_raw"] for p in parts),
     }
 
@@ -187,7 +189,7 @@ def fetch_round_windows(
 
 def build_from_cins(cins: List[Dict]) -> Dict[str, np.ndarray]:
     """CIN 목록 -> 학습 입력. 라벨에서 조건과 상태를 읽는다."""
-    sigs, conds, robots, poses, names = [], [], [], [], []
+    sigs, conds, robots, poses, names, navs = [], [], [], [], [], []
 
     for cin in cins:
         con = _con_of(cin)
@@ -212,6 +214,7 @@ def build_from_cins(cins: List[Dict]) -> Dict[str, np.ndarray]:
         poses.append(meta["pose"])
         names.append(lab.get("cond", "floor_bump"
                              if meta["nav"] in ("over_bump",) else "normal"))
+        navs.append(meta["nav"] or "idle")
 
     if not sigs:
         out = _empty()
@@ -224,6 +227,7 @@ def build_from_cins(cins: List[Dict]) -> Dict[str, np.ndarray]:
         "robot": np.asarray(robots),
         "pose": np.asarray(poses, dtype=np.float32),
         "cond_name": np.asarray(names),
+        "nav": np.asarray(navs),
         "n_raw": len(cins),
     }
 
