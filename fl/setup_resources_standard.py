@@ -101,8 +101,21 @@ def bind_mn(node: str) -> str:
 def reachable(label: str) -> bool:
     """현재 바인딩된 CSE의 베이스를 RETRIEVE 해서 살아 있는지 본다."""
     cse = om2m.cse_name()
-    if om2m.get_resource(cse) is None:
-        print(f"  ✗ {label}: {om2m.base_url()}/{cse} 응답 없음")
+    code, body = om2m.probe_resource(cse)
+    if code != 200:
+        print(f"  ✗ {label}: {om2m.base_url()}/{cse}")
+        if code is None:
+            print(f"      연결 실패 — {body}")
+        else:
+            print(f"      HTTP {code}  {body}")
+            hint = {
+                400: "헤더가 잘못됐을 수 있다 (RETRIEVE에 Content-Type ty)",
+                401: "인증 필요 — FL_IN_USER / FL_IN_PASS 를 설정하라",
+                403: "권한 없음 — X-M2M-Origin 과 ACP를 확인하라",
+                404: "경로에 리소스가 없다 — CSE 이름을 확인하라",
+            }.get(code)
+            if hint:
+                print(f"      → {hint}")
         return False
     print(f"  ✓ {label}: {om2m.base_url()}/{cse}")
     return True

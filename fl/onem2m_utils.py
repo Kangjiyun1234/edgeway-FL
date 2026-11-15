@@ -93,8 +93,26 @@ def strip_prefix(path: str) -> str:
     return p[len(IN_PREFIX):] if p.startswith(IN_PREFIX) else p
 
 
+_WARNED_INSECURE = False
+
+
 def _verify():
-    return getattr(config, "TLS_VERIFY", True)
+    """
+    TLS 검증 여부. 끄면 urllib3가 요청마다 경고를 찍어 로그를 덮으므로
+    한 번만 알리고 이후 경고는 끈다. 끈 사실 자체는 반드시 보이게 둔다.
+    """
+    global _WARNED_INSECURE
+    v = getattr(config, "TLS_VERIFY", True)
+    if not v and not _WARNED_INSECURE:
+        _WARNED_INSECURE = True
+        print("  ⚠ TLS 검증을 껐다 (FL_TLS_VERIFY=0). 중간자 공격을 막지 못한다.")
+        try:
+            import urllib3
+            urllib3.disable_warnings(
+                urllib3.exceptions.InsecureRequestWarning)
+        except Exception:
+            pass
+    return v
 
 
 def _auth_for(url: str):
@@ -153,11 +171,21 @@ def _next_request_id() -> str:
     return f"{os.getpid()}-{time.time_ns()}-{next(_RI_COUNTER)}"
 
 
-def _headers(ty: Optional[int] = None) -> Dict[str, str]:
+def _headers(ty: Optional[int] = None, body: bool = False) -> Dict[str, str]:
+    """
+    요청 헤더를 만든다.
+
+    ty를 주면 CREATE용 Content-Type(application/json;ty=N)을 붙인다.
+    body=True면 ty 없는 본문 요청(UPDATE)이므로 Content-Type만 붙인다.
+    둘 다 아니면 Content-Type을 넣지 않는다. RETRIEVE나 DELETE에
+    Content-Type을 실으면 CSE가 요청을 거부한다.
+    """
     h = config.HEADERS.copy()
     h["X-M2M-RI"] = _next_request_id()
     if ty is not None:
         h["Content-Type"] = f"application/json;ty={ty}"
+    elif body:
+        h["Content-Type"] = "application/json"
     return h
 
 
@@ -210,7 +238,8 @@ def update_acpi(resource_path: str, acpi: List[str]) -> bool:
     url = _url(resource_path)
     payload = {"m2m:cnt": {"acpi": acpi}}
     try:
-        r = _request_with_retry("put", url, json=payload, headers=_headers(), timeout=10)
+        r = _request_with_retry("put", url, json=payload,
+                                headers=_headers(body=True), timeout=10)
         return r.status_code in (200, 204)
     except Exception as e:
         print(f"✗ update_acpi error: {e}")
@@ -346,6 +375,21 @@ def get_latest_content_instance(container_path: str) -> Optional[Dict]:
     except Exception as e:
         print(f"✗ get_latest CIN error: {e}")
         return None
+
+
+def probe_resource(resource_path: str):
+    """
+    RETRIEVE를 보내고 (status_code, 본문 일부)를 돌려준다.
+
+    get_resource는 200이 아니면 조용히 None을 준다. 그래서 401(인증)과
+    400(헤더 문제)과 404(경로 없음)를 구분할 수 없었다. 진단용으로 쓴다.
+    """
+    url = _url(resource_path)
+    try:
+        r = _request_with_retry("get", url, headers=_headers(), timeout=10)
+        return r.status_code, r.text[:200]
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
 
 
 def get_resource(resource_path: str) -> Optional[Dict]:

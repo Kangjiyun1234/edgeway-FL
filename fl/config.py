@@ -292,10 +292,15 @@ ORIGINATOR = os.getenv("FL_ORIGINATOR", "CAdmin")
 # X-M2M-RI(Request Identifier)는 TS-0009 HTTP 바인딩에서 모든 요청에 필수다.
 # 요청마다 고유값이어야 하므로 여기 고정값을 두지 않고
 # onem2m_utils._headers() 에서 매번 생성한다.
+# 공통 헤더. Content-Type은 넣지 않는다.
+#
+# TS-0009에서 Content-Type의 ty 파라미터는 CREATE에만 붙는다. RETRIEVE나
+# DELETE처럼 본문이 없는 요청에 ty=4를 실어 보내면 CSE가 거부한다.
+# 예전에는 여기에 ty=4를 기본값으로 박아 두어 모든 GET이 실패했다.
+# 필요한 요청에만 onem2m_utils._headers(ty=...) 로 붙인다.
 HEADERS = {
     "X-M2M-Origin": ORIGINATOR,
     "X-M2M-RVI": os.getenv("FL_RVI", "3"),
-    "Content-Type": "application/json;ty=4",
     "Accept": "application/json",
 }
 
