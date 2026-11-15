@@ -365,6 +365,59 @@ class MNAETrainer:
     # ---------------------------
     # Sensor data load (AE 버전)
     # ---------------------------
+    def _wait_for_robots(self) -> bool:
+        """
+        Isaac Sim이 이 사업장의 로봇 AE와 telemetry를 올릴 때까지 기다린다.
+
+        샌드박스가 뜬 직후에는 MN-CSE만 있고 로봇 AE는 없다. Isaac이 등록한다.
+        그래서 FL을 바로 시작하면 읽을 것이 없다. 라운드 안에서 기다리는 것과
+        별개로, 기동 시점에 한 번 확실히 기다린다.
+
+        기대 대수를 다 못 채워도 최소 대수만 준비되면 진행한다.
+        로봇 한 대가 빠졌다고 사업장 전체를 멈출 이유는 없고, 뒤늦게 올라온
+        로봇은 다음 라운드의 수집에서 자연히 포함된다.
+        """
+        timeout = float(os.getenv("FL_ROBOT_WAIT_SEC", "300"))
+        min_robots = int(os.getenv("FL_MIN_ROBOTS_PER_SITE", "1"))
+        poll = float(os.getenv("FL_ROBOT_POLL_SEC", "5"))
+
+        site = config.SITE_OF_NODE.get(self.node_name, self.node_name)
+        print(f"\n  [{self.node_name}/{site}] Isaac Sim 대기 "
+              f"(최대 {timeout:.0f}s, 최소 {min_robots}대)")
+
+        deadline = time.time() + timeout
+        next_log = 0.0
+
+        while True:
+            ready = [
+                rb for rb, path in zip(self.robot_names, self.telemetry_paths)
+                if om2m.resource_exists(path)
+            ]
+            now = time.time()
+
+            if len(ready) >= min_robots:
+                print(f"    ✓ {len(ready)}/{len(self.robot_names)}대 준비됨 "
+                      f"({', '.join(ready)})")
+                missing = [r for r in self.robot_names if r not in ready]
+                if missing:
+                    print(f"    ⓘ 아직 없는 로봇: {', '.join(missing)} "
+                          f"(나중에 올라오면 그 라운드부터 포함된다)")
+                return True
+
+            if now >= deadline:
+                print(f"    ✗ {timeout:.0f}s 동안 로봇이 올라오지 않았다")
+                print(f"      기대: {', '.join(self.robot_names)}")
+                print(f"      확인: Isaac Sim이 {self.mn_cse_name} 에 "
+                      f"등록 중인지")
+                return False
+
+            if now >= next_log:
+                print(f"    ⏳ {len(ready)}/{min_robots}대 "
+                      f"(남은 {deadline - now:.0f}s)")
+                next_log = now + 10.0
+
+            time.sleep(poll)
+
     def _load_sensor_data_for_round(self, round_num: int, max_attempts: int = 3):
         """
         이번 라운드에 학습할 윈도우를 모은다.
@@ -1082,6 +1135,10 @@ class MNAETrainer:
             return
 
         self._ensure_local_model_container()
+
+        if not self._wait_for_robots():
+            print(f"  ✗ {self.node_name}: 로봇 텔레메트리 없이는 학습할 수 없다")
+            return
 
         for round_num in range(1, config.GLOBAL_ROUNDS + 1):
             print("\n" + "─" * 50)

@@ -47,6 +47,7 @@ ACOP 비트마스크 (TS-0001)
 """
 
 import argparse
+import os
 import sys
 import time
 from typing import Dict, List, Optional
@@ -366,6 +367,83 @@ def setup_mn_resources(node: str) -> Dict[str, bool]:
 
 
 # ════════════════════════════════════════════════════════
+# Isaac Sim 대기
+# ════════════════════════════════════════════════════════
+
+def count_ready_robots(node: str) -> tuple:
+    """
+    이 사업장에서 telemetry 컨테이너까지 갖춘 로봇 수를 센다.
+    반환: (준비된 로봇 이름들, 기대 대수)
+
+    AE만 있고 telemetry가 없으면 아직 발행 준비가 안 된 것이므로 세지 않는다.
+    """
+    cse = om2m.cse_name()
+    site = config.SITE_OF_NODE.get(node, node)
+    want = config.ROBOTS_PER_NODE.get(node, 0)
+
+    uril = om2m.discover(cse, ty=2, lim=200)
+    names = sorted({
+        p.rstrip("/").split("/")[-1]
+        for p in uril
+        if p.rstrip("/").split("/")[-1].startswith(f"{site}_")
+    })
+    ready = [n for n in names
+             if om2m.resource_exists(f"{cse}/{n}/{config.ROBOT_TELEMETRY_CNT}")]
+    return ready, want
+
+
+def wait_for_robots(nodes: List[str],
+                    timeout: float,
+                    min_per_site: int) -> bool:
+    """
+    Isaac Sim이 로봇 AE와 telemetry를 올릴 때까지 기다린다.
+
+    로봇 AE는 우리가 만들지 않는다. 샌드박스가 뜬 직후에는 MN-CSE만 있고
+    AE는 Isaac이 등록한다. 그래서 FL을 바로 시작하면 학습할 데이터가 없다.
+
+    기대 대수를 다 못 채워도 사업장마다 min_per_site 대만 준비되면 진행한다.
+    로봇 한 대가 고장나 있다고 데모 전체를 막을 이유는 없다.
+    시간이 다 되면 현재 상태를 알리고 그대로 진행한다 — 멈추지 않는다.
+    """
+    print(f"\n=== Isaac Sim 대기 (최대 {timeout:.0f}s, "
+          f"사업장당 최소 {min_per_site}대) ===")
+
+    deadline = time.time() + timeout
+    next_log = 0.0
+
+    while True:
+        status = {}
+        for node in nodes:
+            bind_mn(node)
+            status[node] = count_ready_robots(node)
+
+        done = all(len(r) >= min_per_site for r, _ in status.values())
+        now = time.time()
+
+        if done or now >= deadline:
+            for node, (ready, want) in status.items():
+                site = config.SITE_OF_NODE.get(node, node)
+                mark = "✓" if len(ready) >= min_per_site else "✗"
+                print(f"  {mark} {site}: {len(ready)}/{want}대 "
+                      f"({', '.join(ready) if ready else '없음'})")
+            if done:
+                print("  ✓ 학습을 시작할 수 있다")
+                return True
+            print(f"\n  ⚠ {timeout:.0f}s 안에 다 준비되지 않았다.")
+            print("    Isaac Sim이 이 샌드박스에 등록 중인지 확인하라.")
+            return False
+
+        if now >= next_log:
+            parts = [f"{config.SITE_OF_NODE.get(n, n)} {len(r)}/{w}"
+                     for n, (r, w) in status.items()]
+            print(f"  ⏳ {' / '.join(parts)}  "
+                  f"(남은 {deadline - now:.0f}s)")
+            next_log = now + 10.0
+
+        time.sleep(5.0)
+
+
+# ════════════════════════════════════════════════════════
 # 확인
 # ════════════════════════════════════════════════════════
 
@@ -455,6 +533,13 @@ def main() -> None:
                     help="생성하지 않고 확인만 한다")
     ap.add_argument("--nodes", default=",".join(config.ALL_NODES),
                     help="대상 노드 (기본: mn1,mn2,mn3)")
+    ap.add_argument("--wait-robots", nargs="?", type=float,
+                    const=float(os.getenv("FL_ROBOT_WAIT_SEC", "300")),
+                    default=None,
+                    help="Isaac Sim이 로봇 AE를 올릴 때까지 기다린다 (초)")
+    ap.add_argument("--min-robots", type=int,
+                    default=int(os.getenv("FL_MIN_ROBOTS_PER_SITE", "1")),
+                    help="사업장당 최소 로봇 수 (기본 1)")
     args = ap.parse_args()
 
     config.require_sandbox()
@@ -482,6 +567,12 @@ def main() -> None:
         print("\n✗ 닿지 않는 CSE가 있다. 샌드박스 시나리오가 떠 있는지,")
         print("  FL_SANDBOX_HOST / FL_SANDBOX_NAME 이 맞는지 확인하라.")
         sys.exit(1)
+
+    if args.wait_robots is not None:
+        ok = wait_for_robots(nodes, args.wait_robots, args.min_robots)
+        if args.verify:
+            sys.exit(0 if (verify(nodes) and ok) else 1)
+        sys.exit(0 if ok else 1)
 
     if args.verify:
         sys.exit(0 if verify(nodes) else 1)

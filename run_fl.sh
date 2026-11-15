@@ -26,21 +26,33 @@ trap cleanup EXIT INT TERM
 FROM_CSE="${FL_SENSOR_FROM_CSE:-1}"
 
 if [ "$FROM_CSE" = "0" ]; then
-  echo "[1/4] 오프라인 모드: pkl 준비"
+  echo "[1/5] 오프라인 모드: pkl 준비"
   echo "      AMR_DATA 가 가리키는 telemetry.json 들을 읽는다"
   python3 fl/prepare_data_amr.py
 else
-  echo "[1/4] oneM2M 리소스 확인"
-  # 로봇 AE가 없으면 여기서 경고가 난다. Isaac을 먼저 띄워야 한다.
+  echo "[1/5] oneM2M 리소스 확인"
+  # 우리 리소스(IN-AE, MN-AE-i, 컨테이너, ACP)만 본다.
+  # 로봇 AE는 Isaac 소유라 여기서 실패로 치지 않는다.
   if ! python3 fl/setup_resources_standard.py --verify; then
     echo
     echo "  리소스가 빠져 있다. 먼저 생성한다."
     python3 fl/setup_resources_standard.py
   fi
+
+  echo
+  echo "[2/5] Isaac Sim 대기"
+  # 샌드박스가 뜬 직후에는 MN-CSE만 있고 로봇 AE는 없다. Isaac이 등록한다.
+  # 이걸 안 기다리고 MN-AE를 띄우면 읽을 텔레메트리가 없다.
+  # 사업장당 최소 FL_MIN_ROBOTS_PER_SITE 대(기본 1)만 준비되면 진행한다.
+  if ! python3 fl/setup_resources_standard.py --wait-robots; then
+    echo
+    echo "  ⚠ 로봇이 다 준비되지 않았다. 그래도 진행한다."
+    echo "    (뒤늦게 올라온 로봇은 그 라운드부터 포함된다)"
+  fi
 fi
 
 echo
-echo "[2/4] MN-AE 기동 (사업장 3곳)"
+echo "[3/5] MN-AE 기동 (사업장 3곳)"
 python3 -u fl/mn_ae_standard.py 0 5001 &
 PIDS+=("$!")
 echo "  MN-AE-1 (siteA / mep-a) PID: ${PIDS[-1]}"
@@ -58,7 +70,7 @@ echo "  MN-AE-3 (siteC / mep-c) PID: ${PIDS[-1]}"
 sleep 5
 
 echo
-echo "[3/4] IN-AE 기동 (클라우드 IN-CSE 코디네이터)"
+echo "[4/5] IN-AE 기동 (클라우드 IN-CSE 코디네이터)"
 python3 -u fl/in_ae_standard.py &
 PIDS+=("$!")
 echo "  IN-AE PID: ${PIDS[-1]}"
@@ -66,6 +78,6 @@ echo "  IN-AE PID: ${PIDS[-1]}"
 sleep 2
 
 echo
-echo "[4/4] 대시보드"
+echo "[5/5] 대시보드"
 echo "  -> http://localhost:7000"
 python3 fl/dashboard_server.py
