@@ -1,0 +1,445 @@
+"""
+fl/config.py — FL + oneM2M 통합 설정 (AMR 바닥·로봇 점검 서비스)
+
+- 사업장 3곳
+  - mn1 = 사업장 A : 로봇 4대, 학습 참여
+  - mn2 = 사업장 B : 로봇 2대, 학습 참여
+  - mn3 = 사업장 C : 로봇 4대, 공통 모델을 받아 자기 데이터로만 보정.
+                     FedAvg에는 기여하지 않는다 (FL_LOCAL_ONLY_NODES)
+- 조건부 1D CNN VAE(model_cvae.CVAE1D) 기반 이상 탐지
+- 정상 주행 데이터만으로 학습한다
+
+[CSE 구성]
+사업장 CSE(MN-CSE)와 중앙 CSE(IN-CSE)가 분리되어 있다.
+MN-CSE는 현장 MEC 호스트에, IN-CSE는 클라우드에 있다.
+AE는 Isaac Sim 쪽에서 등록하므로 이 코드는 AE를 만들지 않는다.
+"""
+
+import os
+from dataclasses import dataclass
+
+
+# ════════════════════════════════════════════════════════
+# AE 모델 설정
+# ════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class AEConfig:
+    """조건부 1D CNN VAE 규격. prepare_data_amr.py 출력과 맞춰야 한다."""
+
+    # 60Hz × 1초 = 윈도우 한 개
+    seq_len: int = 60
+
+    # IMU 24채널 + 엔코더 14채널
+    n_channels: int = 38
+
+    # 조건 벡터: nav 그룹(5) + 속도 버킷(3). amr_schema.COND_DIM 과 같아야 한다.
+    cond_dim: int = 8
+
+    # 잠재 차원과 은닉 채널. 이 조합에서 90,806 파라미터이고
+    # fp16+gzip+base64로 약 217KB라 contentInstance 하나에 들어간다.
+    latent_dim: int = 24
+    hidden: int = 48
+
+    # ELBO의 KL 가중치
+    beta: float = 0.5
+
+    # 이상 점수 집계: 0이면 전 채널 평균, n>0이면 상위 n개 채널 평균
+    score_topk: int = 0
+
+
+# ════════════════════════════════════════════════════════
+# 학습 설정
+# ════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class TrainConfig:
+    rounds: int = 10
+    local_epochs: int = 10
+    batch_size: int = 32
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    device: str = "cpu"
+    seed: int = 42
+    log_every: int = 1
+
+    # 레거시 필드
+    train_split: float = 0.8
+    hidden_size: int = 128
+    num_classes: int = 2
+
+
+# ════════════════════════════════════════════════════════
+# 데이터 설정
+# ════════════════════════════════════════════════════════
+
+# prepare_data_amr.py 가 만드는 PKL 디렉터리.
+AMR_DATA_DIR = os.getenv(
+    "FL_PKL_DIR",
+    "/tmp/fl_data/amr",
+)
+
+# 하위 호환용 별칭 (옛 코드가 참조할 수 있다)
+
+
+NODE_DATA_FILES = {
+    "mn1": os.path.join(AMR_DATA_DIR, "mn1.pkl"),
+    "mn2": os.path.join(AMR_DATA_DIR, "mn2.pkl"),
+    "mn3": os.path.join(AMR_DATA_DIR, "mn3.pkl"),
+}
+
+# 사업장 이름과 로봇 대수 (prepare_data_amr.py 와 일치해야 한다)
+SITE_OF_NODE = {"mn1": "siteA", "mn2": "siteB", "mn3": "siteC"}
+ROBOTS_PER_NODE = {"mn1": 4, "mn2": 2, "mn3": 4}
+
+# Isaac Sim이 로봇 AE 아래에 만드는 컨테이너 이름.
+# 센서 데이터는 MN-AE가 아니라 로봇 AE 아래에 쌓인다.
+#   <MN-CSE>/siteA_AMR_1/telemetry/<cin>
+ROBOT_TELEMETRY_CNT = os.getenv("FL_ROBOT_TELEMETRY_CNT", "telemetry")
+ROBOT_STATUS_CNT = os.getenv("FL_ROBOT_STATUS_CNT", "status")
+
+
+def robot_names(node: str):
+    """한 사업장의 로봇 AE 이름 목록. siteA_AMR_1 … siteA_AMR_4"""
+    site = SITE_OF_NODE.get(node, node)
+    return [
+        f"{site}_AMR_{i}"
+        for i in range(1, ROBOTS_PER_NODE.get(node, 0) + 1)
+    ]
+
+CLASS_NAMES = ["정상", "이상"]
+NUM_CLASSES = 2
+
+# RMS가 처음 이 값을 초과한 파일을 fault onset으로 사용
+RMS_FAULT_THRESHOLD = 1.0
+
+
+# ════════════════════════════════════════════════════════
+# Anomaly Detection 설정
+# ════════════════════════════════════════════════════════
+
+# 재구성 오차가 threshold를 연속 K회 초과하면 fault 판정
+ANOMALY_K_CONSECUTIVE = 3
+
+# threshold = 정상 validation MSE 평균 + N × 표준편차
+THRESHOLD_N_SIGMA = 3.0
+
+# 데모에서 이상 상태를 표시할 노드
+ANOMALY_DEMO_NODE = os.getenv(
+    "FL_ANOMALY_DEMO_NODE",
+    "mn3",
+)
+
+# MN3는 기본적으로 Round 7부터 이상 샘플을 표시한다.
+ANOMALY_START_ROUND = int(
+    os.getenv(
+        "FL_ANOMALY_START_ROUND",
+        "7",
+    )
+)
+
+
+# ════════════════════════════════════════════════════════
+# oneM2M 연결 설정
+# ════════════════════════════════════════════════════════
+
+# ETSI MEC Sandbox의 ACME CSE를 쓴다.
+#
+# 사업장마다 MEP가 따로 있고 MN-CSE도 따로다.
+#   mn1 = 사업장 A = mep-a
+#   mn2 = 사업장 B = mep-b
+#   mn3 = 사업장 C = mep-c
+#
+# 실제 주소 형태:
+#   https://<host>/<sandbox>/<mep>/meep-acme-mn-cse/acme-cse-mn-<mep>-<sandbox>
+#   └───────── base url ─────────┘ └──────── CSE 이름 ────────┘
+#
+# 샌드박스 주소는 코드에 두지 않는다. 공개 저장소이므로 환경변수로 받는다.
+#
+#   export FL_SANDBOX_HOST=<샌드박스가 뜬 호스트>
+#   export FL_SANDBOX_NAME=<샌드박스 인스턴스 이름>
+#
+# 어디서 실행하느냐에 따라 호스트가 달라진다.
+#   유선망            연구실 공인 IP
+#   같은 공유기 Wi-Fi  사설 IP (192.168.x.x)
+#   테일넷            100.x.x.x  — Isaac Sim PC도 테일넷이라 보통 이쪽이 편하다
+#
+# .env.local 에 적어 두고 셸에서 읽어 들이면 된다. .gitignore가 .env* 를 막는다.
+#
+# MN-CSE는 REMOTE_CSE_* 설정으로 IN-CSE에 등록된다(Mcc).
+# 사업장↔중앙 연결은 CSE가 처리하고, 이 코드는 각 CSE에 Mca로 붙는다.
+
+SANDBOX_SCHEME = os.getenv("FL_SANDBOX_SCHEME", "https")
+SANDBOX_HOST = os.getenv("FL_SANDBOX_HOST", "").strip()
+SANDBOX_NAME = os.getenv("FL_SANDBOX_NAME", "").strip()
+
+# 설정이 안 됐을 때 URL에 들어갈 자리표시자.
+# .invalid 는 RFC 2606이 예약한 도메인이라 반드시 이름 해석에 실패한다.
+# 빈 문자열을 그대로 쓰면 "https:///..." 같은 주소가 만들어져서
+# 왜 실패했는지 알기 어렵다.
+_HOST_UNSET = "sandbox-host-not-set.invalid"
+_NAME_UNSET = "sandbox-name-not-set"
+
+
+def sandbox_ready() -> bool:
+    """샌드박스 주소가 설정돼 있는가."""
+    return bool(SANDBOX_HOST and SANDBOX_NAME)
+
+
+def require_sandbox() -> None:
+    """
+    샌드박스에 붙어야 하는 진입점에서 먼저 부른다.
+    설정이 없으면 무엇을 해야 하는지 알리고 멈춘다.
+
+    import 시점에 막지 않는 이유는, prepare_data_amr.py 처럼 파일만
+    다루는 작업은 샌드박스 없이도 돌아가야 하기 때문이다.
+    """
+    if sandbox_ready():
+        return
+    raise SystemExit(
+        "\n샌드박스 주소가 설정되지 않았다.\n"
+        "  export FL_SANDBOX_HOST=<호스트>     # 예: 테일넷 주소나 공인 IP\n"
+        "  export FL_SANDBOX_NAME=<인스턴스 이름>\n"
+        "\n"
+        "공개 저장소라 실제 주소를 코드에 두지 않는다.\n"
+        ".env.local 에 적어 두고 `source .env.local` 해도 된다.\n"
+    )
+
+# 샌드박스가 IP 기반 자체 서명 인증서를 쓰면 검증이 실패한다.
+# 그때만 0으로 내린다. 끄면 중간자 공격을 막지 못한다.
+TLS_VERIFY = os.getenv("FL_TLS_VERIFY", "1") not in ("0", "false", "False")
+
+MEP_OF_NODE = {"mn1": "mep-a", "mn2": "mep-b", "mn3": "mep-c"}
+
+
+def mn_endpoint(node: str):
+    """사업장 노드의 (base_url, cse_name)."""
+    mep = MEP_OF_NODE.get(node, "mep-a")
+    override_url = os.getenv(f"FL_MN_BASE_URL_{node.upper()}")
+    override_cse = os.getenv(f"FL_MN_CSE_NAME_{node.upper()}")
+    base = override_url or (
+        f"{SANDBOX_SCHEME}://{SANDBOX_HOST or _HOST_UNSET}"
+        f"/{SANDBOX_NAME or _NAME_UNSET}/{mep}/meep-acme-mn-cse"
+    )
+    cse = override_cse or f"acme-cse-mn-{mep}-{SANDBOX_NAME or _NAME_UNSET}"
+    return base, cse
+
+
+def in_endpoint():
+    """중앙 CSE의 (base_url, cse_name)."""
+    base = os.getenv("FL_IN_BASE_URL") or (
+        f"{SANDBOX_SCHEME}://{SANDBOX_HOST or _HOST_UNSET}"
+        f"/{SANDBOX_NAME or _NAME_UNSET}/meep-acme-in-cse"
+    )
+    cse = os.getenv("FL_IN_CSE_NAME") or f"acme-cse-in-{SANDBOX_NAME or _NAME_UNSET}"
+    return base, cse
+
+
+# 기본값(단일 엔드포인트를 가정하는 기존 코드용). 사업장 A를 가리킨다.
+# MN-AE는 기동 시 자기 노드의 엔드포인트로 onem2m_utils.set_endpoint()를 호출한다.
+MN_BASE_URL, MN_CSE_NAME = mn_endpoint("mn1")
+MN_CSE_ID = os.getenv("FL_MN_CSE_ID", "")
+
+IN_BASE_URL, IN_CSE_NAME = in_endpoint()
+IN_CSE_ID = os.getenv("FL_IN_CSE_ID", "")
+
+IN_IS_REMOTE = (IN_BASE_URL != MN_BASE_URL) or (IN_CSE_NAME != MN_CSE_NAME)
+
+# 기존 코드가 참조하는 이름. 사업장 CSE를 가리킨다.
+BASE_URL = MN_BASE_URL
+CSE_NAME = MN_CSE_NAME
+
+MN_AE_NAME = "MN-AE-1"
+IN_AE_NAME = "IN-AE"
+
+# AE는 Isaac Sim 쪽에서 등록한다. setup_resources는 만들지 않고 존재만 확인한다.
+CREATE_AES = os.getenv("FL_CREATE_AES", "0") in ("1", "true", "True")
+
+# AE가 올라올 때까지 기다릴 시간(초)
+AE_WAIT_SEC = float(os.getenv("FL_AE_WAIT_SEC", "60"))
+
+NOTIFY_HOST = os.getenv(
+    "FL_NOTIFY_HOST",
+    "127.0.0.1",
+)
+
+NUM_CLIENTS = 3
+GLOBAL_ROUNDS = 10
+
+ORIGINATOR = os.getenv("FL_ORIGINATOR", "CAdmin")
+
+# X-M2M-RI(Request Identifier)는 TS-0009 HTTP 바인딩에서 모든 요청에 필수다.
+# 요청마다 고유값이어야 하므로 여기 고정값을 두지 않고
+# onem2m_utils._headers() 에서 매번 생성한다.
+HEADERS = {
+    "X-M2M-Origin": ORIGINATOR,
+    "X-M2M-RVI": os.getenv("FL_RVI", "3"),
+    "Content-Type": "application/json;ty=4",
+    "Accept": "application/json",
+}
+
+# contentInstance의 con에 JSON 문자열을 넣을 때 표시할 contentInfo
+CIN_CONTENT_INFO = os.getenv("FL_CIN_CNF", "application/json:0")
+
+
+# ════════════════════════════════════════════════════════
+# 모델 저장 경로
+# ════════════════════════════════════════════════════════
+
+MODEL_BASE_DIR = os.getenv(
+    "FL_MODEL_BASE_DIR",
+    "/tmp/fl_models",
+)
+
+LOCAL_MODEL_DIR = os.path.join(
+    MODEL_BASE_DIR,
+    "local",
+)
+
+GLOBAL_MODEL_DIR = os.path.join(
+    MODEL_BASE_DIR,
+    "global",
+)
+
+CACHE_MODEL_DIR = os.path.join(
+    MODEL_BASE_DIR,
+    "cache",
+)
+
+# clean_fl.sh가 새로운 데모 실행마다 이 파일의 수정 시각을 갱신한다.
+#
+# Dashboard는 이 시각보다 오래된 global_round*.pt 파일을
+# 이전 실행에서 남은 stale model로 판단하고 사용하지 않는다.
+DEMO_RUN_MARKER = os.getenv(
+    "FL_DEMO_RUN_MARKER",
+    os.path.join(
+        MODEL_BASE_DIR,
+        ".demo_run_started",
+    ),
+)
+
+os.makedirs(
+    LOCAL_MODEL_DIR,
+    exist_ok=True,
+)
+
+os.makedirs(
+    GLOBAL_MODEL_DIR,
+    exist_ok=True,
+)
+
+os.makedirs(
+    CACHE_MODEL_DIR,
+    exist_ok=True,
+)
+
+
+# ════════════════════════════════════════════════════════
+# DP-SGD 설정
+# ════════════════════════════════════════════════════════
+
+DP_EPSILON = 12.0
+DP_DELTA = 5e-4
+DP_MAX_GRAD_NORM = 1.5
+
+
+# ════════════════════════════════════════════════════════
+# cold start 노드 설정
+# ════════════════════════════════════════════════════════
+
+# 노드 역할은 셋이다.
+#
+#   학습 참여      : 로컬 학습 + FedAvg 기여          (기본)
+#   로컬 전용      : 로컬 학습은 하되 FedAvg 미기여    FL_LOCAL_ONLY_NODES
+#   관측 전용      : 학습 안 하고 추론만              FL_COLD_START_NODES
+#
+# 사업장 C(mn3)는 '로컬 전용'이다. 공통 모델을 받아 자기 정상 데이터로
+# 보정하면서 점점 안정화되지만, 가중치는 중앙에 올리지 않는다.
+# 관측 전용은 자체 데이터도 쓰지 않는 더 엄격한 신규 사업장 시연용이다.
+COLD_START_NODES = [
+    n.strip()
+    for n in os.getenv("FL_COLD_START_NODES", "").split(",")
+    if n.strip()
+]
+
+LOCAL_ONLY_NODES = [
+    n.strip()
+    for n in os.getenv("FL_LOCAL_ONLY_NODES", "mn3").split(",")
+    if n.strip()
+]
+
+ALL_NODES = [f"mn{i}" for i in range(1, NUM_CLIENTS + 1)]
+
+# FedAvg에 기여하는 노드만 '학습 노드'다.
+# 로컬 전용 노드는 학습은 하지만 집계 대기 대상이 아니다.
+NON_CONTRIBUTING_NODES = list(
+    dict.fromkeys(COLD_START_NODES + LOCAL_ONLY_NODES)
+)
+
+TRAINING_NODES = [
+    n for n in ALL_NODES if n not in NON_CONTRIBUTING_NODES
+]
+
+
+# ════════════════════════════════════════════════════════
+# 센서 데이터 출처
+# ════════════════════════════════════════════════════════
+
+# True면 MN-CSE의 contentInstance에서 실제 신호를 읽는다.
+# False면 예전처럼 con에 실린 로컬 pkl 경로(data_path)를 읽는다.
+# 경로 방식은 로봇/시뮬레이터와 학습 앱이 같은 머신에 있을 때만 동작한다.
+FL_SENSOR_FROM_CSE = os.getenv(
+    "FL_SENSOR_FROM_CSE",
+    "1",
+) not in ("0", "false", "False")
+
+
+# ════════════════════════════════════════════════════════
+# oneM2M 가중치 전송 설정
+# ════════════════════════════════════════════════════════
+
+# True면 모델 가중치를 contentInstance의 con 안에 base64로 실어 보낸다.
+# False면 기존처럼 로컬 파일 경로만 전달한다(같은 PC에서만 동작).
+FL_EMBED_WEIGHTS = os.getenv(
+    "FL_EMBED_WEIGHTS",
+    "1",
+) not in ("0", "false", "False")
+
+# 가중치를 fp16으로 줄여 보낼지 여부. 전송량이 절반이 된다.
+# 정확도가 민감하면 0으로 끄면 된다.
+FL_WEIGHTS_FP16 = os.getenv(
+    "FL_WEIGHTS_FP16",
+    "1",
+) not in ("0", "false", "False")
+
+# contentInstance 하나에 담을 base64 가중치의 상한(바이트).
+# 이 값을 넘으면 embed를 포기하고 경로 전달로 되돌아간다.
+#
+# ACME 기준으로 넉넉히 둔다. CVAE1D 가중치가 base64로 약 217KB이므로 통과한다.
+# 이 값을 CSE의 실제 페이로드 한계보다 크게 잡으면 CIN 생성이 실패하고
+# 라운드 전체가 멈춘다.
+FL_MAX_CIN_BYTES = int(
+    os.getenv(
+        "FL_MAX_CIN_BYTES",
+        str(4 * 1024 * 1024),
+    )
+)
+
+# 가중치가 위 상한을 넘을 때 조각내어 보낼지 여부.
+#
+# 기본값은 꺼짐(0)이다. ACME에는 작은 페이로드 상한이 없고 CVAE1D 가중치가
+# base64로 약 217KB라 contentInstance 하나에 그대로 들어간다.
+# 페이로드 상한이 작은 CSE로 옮길 때만 켠다(조각마다 전용 컨테이너를 두고
+# 각각의 la를 읽는 방식으로 검증해 둠: 39조각 업로드 0.8s / 회수 0.1s).
+FL_CHUNK_WEIGHTS = os.getenv(
+    "FL_CHUNK_WEIGHTS",
+    "0",
+) not in ("0", "false", "False")
+
+
+# ════════════════════════════════════════════════════════
+# 설정 인스턴스
+# ════════════════════════════════════════════════════════
+
+TRAIN_CFG = TrainConfig()
+AE_CFG = AEConfig()

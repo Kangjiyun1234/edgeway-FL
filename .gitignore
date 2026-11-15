@@ -1,0 +1,68 @@
+# ===== Secrets / Keys =====
+.env
+.env.*
+**/kaggle.json
+.kaggle/
+*.pem
+*.key
+*.crt
+secrets/
+config.local.*
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== IDE / OS =====
+.vscode/
+.idea/
+.DS_Store
+
+# ===== Project: real paths =====
+/data/
+
+# ===== Common ML artifacts (if created later) =====
+logs/
+log/
+runs/
+outputs/
+output/
+results/
+result/
+checkpoints/
+checkpoint/
+ckpt/
+wandb/
+mlruns/
+
+# ===== Model/artifact files (if created later) =====
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.joblib
+*.pkl
+*.log
+
+# ===== edgeway-FL =====
+# 실행 로그. 데모를 돌리면 계속 쌓이므로 추적하지 않는다.
+logs/
+
+# 센서 데이터와 중간 산출물. 용량이 커서 레포에 두지 않는다.
+# (FEMTO 시절 fl_buffer/*.pkl 53MB, femto_replay/*.npz 50MB가 히스토리에
+#  들어가 있었다. 새 레포에서는 처음부터 막는다)
+*.npz
+fl_buffer/
+femto_replay/
+data/
+/tmp/
+
+# 네트워크 시나리오 3의 store-and-forward 큐
+fl_net_buffer/
