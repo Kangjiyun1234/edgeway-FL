@@ -503,6 +503,39 @@ def discover(parent_path: str, ty: int, lim: int = 100) -> List[str]:
         return []
 
 
+def discover_cins_after(container_path: str,
+                        since_ct: Optional[str] = None,
+                        lim: int = 300) -> List[str]:
+    """
+    컨테이너에서 since_ct 이후에 만들어진 contentInstance 경로만 가져온다.
+
+    oneM2M TS-0001의 filterCriteria에 createdAfter(cra)가 있다. 표준이
+    제공하는 필터이므로 전부 받아서 클라이언트가 거르는 것보다 낫다.
+    받는 양도 줄고, "이번 라운드에 새로 들어온 것"이 서버 기준으로 정해진다.
+
+    since_ct가 없으면 최근 lim개를 준다(첫 라운드).
+    cra를 지원하지 않는 CSE면 빈 결과가 오므로, 호출하는 쪽에서
+    전체를 받아 ct로 거르는 방식으로 되돌아간다.
+
+    ct 형식은 oneM2M 절대시각이다. 예: 20261115T060913,588453
+    """
+    if not since_ct:
+        return list_uril(container_path, lim=lim)
+
+    # ct의 쉼표 뒤(마이크로초)는 cra가 받지 않는 구현이 있어 떼어낸다.
+    stamp = str(since_ct).split(",")[0]
+    url = _url(f"{container_path}?fu=1&ty=4&lim={lim}&cra={stamp}")
+    try:
+        r = _request_with_retry("get", url, headers=_headers(), timeout=15)
+        if r.status_code != 200:
+            return []
+        uril = r.json().get("m2m:uril", [])
+        return uril if isinstance(uril, list) else []
+    except Exception as e:
+        print(f"✗ discover_cins_after error: {e}")
+        return []
+
+
 def resource_exists(resource_path: str) -> bool:
     """단건 RETRIEVE로 존재 여부만 확인한다."""
     return get_resource(resource_path) is not None

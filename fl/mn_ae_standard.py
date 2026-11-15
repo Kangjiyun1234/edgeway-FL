@@ -73,6 +73,9 @@ class MNAETrainer:
         # 사업장 하나가 FL 노드 하나이므로 로봇 대수만큼의 컨테이너를
         # 여기서 모아 "한 공장의 데이터"로 합친다.
         self.robot_names = config.robot_names(self.node_name)
+        # 로봇별로 어디까지 읽었는지. 라운드마다 그 뒤만 읽는다.
+        # 비워 두면 첫 라운드는 최근 분량을 받는다.
+        self.telemetry_cursor = {}
         self.telemetry_paths = [
             f"{mn_cse}/{rb}/{config.ROBOT_TELEMETRY_CNT}"
             for rb in self.robot_names
@@ -441,15 +444,26 @@ class MNAETrainer:
             return self._load_sensor_data_from_pkl(round_num)
 
         want_min   = int(os.getenv("FL_SENSOR_MIN_WINDOWS", "40"))
-        per_robot  = int(os.getenv("FL_SENSOR_CIN_LIMIT_PER_ROBOT", "150"))
+        per_robot  = int(os.getenv("FL_SENSOR_CIN_LIMIT_PER_ROBOT", "300"))
         wait_total = float(os.getenv("FL_SENSOR_ROUND_WAIT_SEC", "90"))
         poll       = float(os.getenv("FL_SENSOR_ROUND_POLL_SEC", "2.0"))
 
+        # 라운드마다 "최근 N개"를 다시 긁으면 간격이 짧을 때 같은 데이터를
+        # 반복 학습하게 된다. 읽은 지점(ct)을 기억해 그 뒤만 받는다.
+        # FL_SENSOR_INCREMENTAL=0 으로 끄면 예전처럼 최근 N개를 받는다.
+        incremental = os.getenv("FL_SENSOR_INCREMENTAL", "1") != "0"
+
         deadline = time.time() + wait_total
         next_log = 0.0
+        cursors = dict(self.telemetry_cursor)
 
         while True:
-            got = amr_ingest.fetch_site_windows(self.telemetry_paths, per_robot)
+            if incremental:
+                got, cursors = amr_ingest.fetch_site_windows_since(
+                    self.telemetry_paths, self.telemetry_cursor, per_robot)
+            else:
+                got = amr_ingest.fetch_site_windows(
+                    self.telemetry_paths, per_robot)
             n = len(got["signals"])
 
             if n >= want_min:
@@ -457,6 +471,11 @@ class MNAETrainer:
 
             now = time.time()
             if now >= deadline:
+                if n == 0 and incremental and self.telemetry_cursor:
+                    print(f"    ⊘ 지난 라운드 이후 새 윈도우가 없다.")
+                    print(f"      로봇이 주행 중인지, 라운드 간격이 너무 "
+                          f"짧지 않은지 확인하라.")
+                    return SKIP_ROUND
                 if n == 0:
                     print(f"    ✗ {site} 로봇 텔레메트리가 비어 있다.")
                     print(f"      확인: {len(self.telemetry_paths)}개 컨테이너 "
@@ -473,9 +492,15 @@ class MNAETrainer:
 
             time.sleep(poll)
 
+        # 쓰기로 한 데이터까지만 커서를 민다. 실패한 라운드의 데이터를
+        # 건너뛰지 않기 위해, 여기까지 온 뒤에 갱신한다.
+        if incremental:
+            self.telemetry_cursor = cursors
+
         robots_seen = sorted(set(got["robot"].tolist()))
         print(f"    ✓ 윈도우 {len(got['signals'])}개 / 로봇 {len(robots_seen)}대 "
-              f"(CIN {got['n_raw']}개)")
+              f"(CIN {got['n_raw']}개"
+              f"{', 증분' if incremental else ', 최근 N개'})")
         if len(robots_seen) < len(self.robot_names):
             missing = [r for r in self.robot_names if r not in robots_seen]
             print(f"    ⚠ 데이터가 없는 로봇: {', '.join(missing)}")

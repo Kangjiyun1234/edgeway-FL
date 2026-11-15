@@ -80,6 +80,8 @@ def _empty() -> Dict[str, np.ndarray]:
         "pose": np.zeros((0, 2), np.float32),
         "cond_name": np.asarray([]),
         "nav": np.asarray([]),
+        "ct": np.asarray([]),
+        "max_ct": "",
         "n_raw": 0,
     }
 
@@ -104,6 +106,78 @@ def fetch_latest_windows(
         if res and "m2m:cin" in res:
             cins.append(res)
     return build_from_cins(cins)
+
+
+def fetch_new_windows(container_path: str,
+                      since_ct: Optional[str] = None,
+                      limit: int = 300) -> Dict[str, np.ndarray]:
+    """
+    since_ct 이후에 들어온 윈도우만 가져온다.
+
+    라운드마다 "최근 N개"를 긁으면 라운드 간격이 짧을 때 거의 같은 데이터를
+    다시 학습하게 된다. 그러면 라운드가 지나며 좋아진 것이 데이터가 늘어서인지
+    에폭이 쌓여서인지 구분할 수 없다. 그래서 읽은 지점을 기억하고 그 뒤만 읽는다.
+
+    서버의 cra 필터를 먼저 쓰고, 그게 듣지 않으면 받아서 ct로 거른다.
+    """
+    uril = om2m.discover_cins_after(container_path, since_ct, lim=limit)
+    if not uril:
+        return _empty()
+
+    cins = []
+    for u in uril[-limit:]:
+        res = om2m.get_resource(u.lstrip("/"))
+        if res and "m2m:cin" in res:
+            cins.append(res)
+
+    got = build_from_cins(cins)
+
+    # cra를 무시하는 CSE 대비. 받은 것 중 since_ct 이후만 남긴다.
+    if since_ct and len(got["signals"]):
+        keep = got["ct"] > since_ct
+        if not keep.all():
+            for k in ("signals", "cond", "robot", "pose", "cond_name",
+                      "nav", "ct"):
+                got[k] = got[k][keep]
+            got["max_ct"] = max([c for c in got["ct"].tolist() if c],
+                                default=since_ct)
+    return got
+
+
+def fetch_site_windows_since(container_paths: List[str],
+                             cursors: Dict[str, str],
+                             limit_per_robot: int = 300) -> tuple:
+    """
+    사업장 로봇 전체에서 각자의 커서 이후 윈도우만 모아 합친다.
+
+    반환: (합쳐진 데이터, 갱신된 커서)
+    커서는 컨테이너 경로별 마지막 ct다. 로봇마다 발행 속도가 다르므로
+    따로 관리한다.
+    """
+    parts, new_cursors = [], dict(cursors)
+
+    for path in container_paths:
+        got = fetch_new_windows(path, cursors.get(path), limit_per_robot)
+        if len(got["signals"]):
+            parts.append(got)
+            if got["max_ct"]:
+                new_cursors[path] = got["max_ct"]
+
+    if not parts:
+        return _empty(), new_cursors
+
+    merged = {
+        "signals": np.concatenate([p["signals"] for p in parts]),
+        "cond": np.concatenate([p["cond"] for p in parts]),
+        "robot": np.concatenate([p["robot"] for p in parts]),
+        "pose": np.concatenate([p["pose"] for p in parts]),
+        "cond_name": np.concatenate([p["cond_name"] for p in parts]),
+        "nav": np.concatenate([p["nav"] for p in parts]),
+        "ct": np.concatenate([p["ct"] for p in parts]),
+        "max_ct": max([p["max_ct"] for p in parts], default=""),
+        "n_raw": sum(p["n_raw"] for p in parts),
+    }
+    return merged, new_cursors
 
 
 def fetch_site_windows(
@@ -137,6 +211,8 @@ def fetch_site_windows(
         "pose": np.concatenate([p["pose"] for p in parts]),
         "cond_name": np.concatenate([p["cond_name"] for p in parts]),
         "nav": np.concatenate([p["nav"] for p in parts]),
+        "ct": np.concatenate([p["ct"] for p in parts]),
+        "max_ct": max([p["max_ct"] for p in parts], default=""),
         "n_raw": sum(p["n_raw"] for p in parts),
     }
 
@@ -190,6 +266,7 @@ def fetch_round_windows(
 def build_from_cins(cins: List[Dict]) -> Dict[str, np.ndarray]:
     """CIN 목록 -> 학습 입력. 라벨에서 조건과 상태를 읽는다."""
     sigs, conds, robots, poses, names, navs = [], [], [], [], [], []
+    cts = []   # CIN 생성시각. 다음 라운드의 커서로 쓴다.
 
     for cin in cins:
         con = _con_of(cin)
@@ -215,6 +292,7 @@ def build_from_cins(cins: List[Dict]) -> Dict[str, np.ndarray]:
         names.append(lab.get("cond", "floor_bump"
                              if meta["nav"] in ("over_bump",) else "normal"))
         navs.append(meta["nav"] or "idle")
+        cts.append(str(cin.get("m2m:cin", {}).get("ct", "")))
 
     if not sigs:
         out = _empty()
@@ -228,6 +306,8 @@ def build_from_cins(cins: List[Dict]) -> Dict[str, np.ndarray]:
         "pose": np.asarray(poses, dtype=np.float32),
         "cond_name": np.asarray(names),
         "nav": np.asarray(navs),
+        "ct": np.asarray(cts),
+        "max_ct": max([c for c in cts if c], default=""),
         "n_raw": len(cins),
     }
 
