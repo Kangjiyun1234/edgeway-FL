@@ -965,6 +965,12 @@ class INAECoordinator:
             return 0.0, None
 
         client_states = [(sd, num_samples[n]) for n, sd in state_dicts.items()]
+
+        # 어떤 가중치로 합쳤는지 남긴다. 사업장 균등인지 샘플 수 비례인지가
+        # 결과 해석을 바꾸므로 로그에 보여야 한다.
+        print(f"    집계 가중: {self.aggregator.describe(client_states)}")
+        print(f"      노드 순서: {', '.join(state_dicts.keys())}")
+
         global_state = self.aggregator.aggregate(client_states)
 
         out_path = f"{self.global_model_dir}/global_round{round_num}.pt"

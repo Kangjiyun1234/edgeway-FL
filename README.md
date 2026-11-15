@@ -150,7 +150,59 @@ Each drop-box carries its own ACP so one site cannot read another site's updates
 
 Site C is the point of the demo. It joins late, has little data of its own, and
 must still detect faults it has never seen — using a model trained on two other
-sites' floors. FedAvg is weighted by sample count.
+sites' floors.
+
+#### Aggregation weighting: equal per site, not per sample
+
+Textbook FedAvg weights each client by its sample count, because the goal is to
+approximate training on the pooled data. This demo deliberately does not.
+
+The participants here are **sites**, and sites run different numbers of robots
+(A has four, B has two). Robots publish continuously, so in any given round a
+four-robot site accumulates roughly twice the windows of a two-robot site. Under
+sample-count weighting that difference becomes influence: the larger site pulls
+the shared model twice as hard. Fleet size is a fact about a warehouse's budget,
+not a claim to a louder voice.
+
+So every site carries the same weight, regardless of how much it contributed
+that round. This is the usual choice in cross-silo federated learning, where
+each participant is an institution rather than a device. It equalizes influence
+without discarding anyone's data — the alternative, trimming every site down to
+the smallest one's volume, throws away real observations to achieve the same
+balance.
+
+Concretely, with site A holding a model parameter at 10 and site B at 0:
+
+| Weighting | A's share | Result |
+| --- | ---: | ---: |
+| sample count (240 vs 120) | 67 % | 6.67 |
+| **equal per site** | **50 %** | **5.00** |
+
+A node that trained on nothing in a round (no normal windows arrived) is dropped
+from the average rather than counted as a zero-weight participant.
+
+Set `FL_AGG_WEIGHTING=samples` to use textbook FedAvg instead. Every round logs
+which weighting was applied and the resulting per-node weights.
+
+#### Keeping the data balanced
+
+Two caps exist so that one site's volume does not quietly dominate, each at a
+different stage:
+
+| Setting | Stage | Default |
+| --- | --- | --- |
+| `FL_SENSOR_MAX_WINDOWS_PER_SITE` | live collection, per round | 600 |
+| `AMR_MAX_NORMAL_PER_SITE` | offline preprocessing | off |
+
+Both trim evenly across a site's robots and sample across the whole time span
+rather than taking a prefix, so no single robot or stretch of driving dominates.
+Neither ever trims anomalous windows — site C has only a handful of bump
+traversals and losing them would leave nothing to evaluate against.
+
+The offline cap is off by default because `min` silently discards most of the
+data when one site's collection is incomplete. Enabling it when the smallest
+site holds less than `AMR_MIN_BALANCE_RATIO` (0.5) of the largest is refused
+with an explanation rather than applied.
 
 Robots within a site are pooled: however many robots a site runs, their windows
 become one site dataset, because a fault in the floor belongs to the site, not
@@ -381,6 +433,12 @@ control  https://<host>/<sandbox>/sandbox-ctrl/v1
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `FL_AGG_WEIGHTING` | `uniform` | `samples` for textbook sample-count FedAvg |
+| `FL_SENSOR_INCREMENTAL` | `1` | `0` refetches the latest N instead of only new CINs |
+| `FL_SENSOR_MAX_WINDOWS_PER_SITE` | `600` | per-round cap per site; `0` disables |
+| `AMR_MAX_NORMAL_PER_SITE` | `0` | offline cap: `min`, a number, or `0` |
+| `FL_ROBOT_WAIT_SEC` | `300` | how long to wait for Isaac Sim to register robots |
+| `FL_MIN_ROBOTS_PER_SITE` | `1` | robots required per site before training starts |
 | `FL_LOCAL_ONLY_NODES` | `mn3` | receives the global model, never contributes |
 | `FL_COLD_START_NODES` | — | excluded from training entirely |
 | `FL_SENSOR_FROM_CSE` | `1` | `0` falls back to local pkl (offline) |
@@ -509,7 +567,9 @@ Stated plainly, because the measurements are what they are.
 On the current site C data, FedAvg(A,B) scores AUROC 0.5925 for floor-bump
 detection while a model-free z-score baseline scores 0.6150. Local fine-tuning on
 site C makes it worse (0.59 → 0.51) because site C has far too little data to
-fine-tune on.
+fine-tune on. Those figures predate the split fix below and the move to equal
+per-site weighting, so they need re-measuring once the sites hold comparable
+amounts of data.
 
 **Site C is data-starved.** Only one robot has usable data, 25 moving windows.
 The design calls for four. Normal driving at site A's scale (~400 windows) and
@@ -528,6 +588,12 @@ reworked for AMR telemetry.
 
 **The sandbox scenario YAML lists four robots at site B** while the code and data
 use two (`ROBOTS_PER_NODE`). The YAML is being corrected.
+
+**Earlier evaluation numbers came from a leaky split.** Until the run-aware split
+landed, training and validation drew neighbouring one-second windows from the
+same traversal, and the validation normals were reused inside the test set. Any
+AUROC measured before that fix was optimistic, and with only two normal windows
+on the honest side at site C it was also close to noise.
 
 ---
 
