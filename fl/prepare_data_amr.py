@@ -83,6 +83,28 @@ EMBARGO = int(os.getenv("AMR_EMBARGO", "2"))
 # run 단위로 나누려면 run이 최소 몇 개 있어야 하는가.
 # 4개면 학습 2 / 검증 1 / 시험 1 이 된다. 그보다 적으면 run 안에서 자른다.
 MIN_RUNS_FOR_RUN_SPLIT = int(os.getenv("AMR_MIN_RUNS", "4"))
+
+# 사업장당 정상 윈도우 상한.
+#
+# 사업장마다 로봇 수와 주행량이 달라 총량이 어긋난다. FedAvg가 샘플 수로
+# 가중하므로 많이 가진 사업장이 더 큰 영향력을 갖는다. 사업장별 기여를
+# 맞추려면 여기서 잘라야 한다.
+#
+#   "0"    자르지 않는다 (기본)
+#   "min"  가장 적은 사업장에 맞춘다
+#   숫자   그 값으로 맞춘다
+#
+# 기본이 끔인 이유는, 한 사업장의 수집이 덜 됐을 때 "min"이 나머지를
+# 거기에 맞춰 조용히 날려버리기 때문이다. 사업장이 고르게 모인 것을
+# 확인한 뒤에 켜는 편이 안전하다.
+#
+# 이상 구간은 절대 자르지 않는다. 단차가 수십 개뿐이라 건드리면 평가가
+# 불가능해진다. 상한은 정상 윈도우에만 적용한다.
+MAX_NORMAL_PER_SITE = os.getenv("AMR_MAX_NORMAL_PER_SITE", "0").strip()
+
+# "min"이 안전한지 판단하는 기준. 가장 적은 사업장이 가장 많은 사업장의
+# 이 비율보다 작으면, 맞추는 것이 득보다 실이 크다고 보고 경고한다.
+MIN_BALANCE_RATIO = float(os.getenv("AMR_MIN_BALANCE_RATIO", "0.5"))
 SEED = int(os.getenv("AMR_SEED", "42"))
 
 _fallback_warned = False
@@ -317,6 +339,43 @@ def _blocks_in_run(order: np.ndarray) -> tuple:
     return order[:a], order[b:c], order[d:]
 
 
+def balance_indices(idx: np.ndarray, robot: np.ndarray,
+                    cap: int) -> np.ndarray:
+    """
+    인덱스를 cap개로 줄이되 로봇별로 고르게 남긴다.
+
+    로봇마다 cap/로봇수 만큼 배정하고, 적게 가진 로봇의 몫은 나머지가
+    나눠 갖는다. 앞에서 자르면 주행 초반만 남으므로 시간 축 전체에서
+    균등 간격으로 뽑는다.
+    """
+    if cap <= 0 or len(idx) <= cap:
+        return idx
+
+    uniq = sorted(set(robot[idx].tolist()))
+    by_robot = {r: idx[robot[idx] == r] for r in uniq}
+
+    quota = {r: 0 for r in uniq}
+    remaining, pool = cap, list(uniq)
+    while remaining > 0 and pool:
+        share = max(1, remaining // len(pool))
+        for r in list(pool):
+            take = min(share, len(by_robot[r]) - quota[r], remaining)
+            quota[r] += take
+            remaining -= take
+            if quota[r] >= len(by_robot[r]):
+                pool.remove(r)
+            if remaining <= 0:
+                break
+
+    keep = []
+    for r in uniq:
+        src = np.sort(by_robot[r])
+        k = quota[r]
+        if k > 0:
+            keep.append(src[np.linspace(0, len(src) - 1, k).astype(np.int64)])
+    return np.sort(np.concatenate(keep)) if keep else idx[:0]
+
+
 def split_normals(idx: np.ndarray, run: np.ndarray,
                   rng: np.random.Generator) -> tuple:
     """
@@ -365,7 +424,8 @@ def split_normals(idx: np.ndarray, run: np.ndarray,
 
 
 # ── 노드별 PKL ────────────────────────────────────────────
-def build_node_pkl(d: dict, node: str, rng: np.random.Generator) -> dict:
+def build_node_pkl(d: dict, node: str, rng: np.random.Generator,
+                   normal_cap: int = 0) -> dict:
     sel = d["node"] == node
     if not sel.any():
         return {}
@@ -384,9 +444,16 @@ def build_node_pkl(d: dict, node: str, rng: np.random.Generator) -> dict:
     not_excluded = ~np.isin(nav, list(sch.EXCLUDE_NAV_TRAIN))
     trainable = moving & is_normal & not_excluded
 
+    # 사업장별 총량을 맞춘다. 이상 구간은 건드리지 않는다.
+    train_pool = np.where(trainable)[0]
+    if normal_cap > 0 and len(train_pool) > normal_cap:
+        before = len(train_pool)
+        train_pool = balance_indices(train_pool, robot, normal_cap)
+        print(f"    [{node}] 사업장 상한: 정상 {before} -> "
+              f"{len(train_pool)}개 (로봇별 균등)")
+
     # 정상을 셋으로 나눈다. 검증은 임계값 보정, 시험은 평가 전용이다.
-    tr_idx, val_idx, te_norm_idx, how = split_normals(
-        np.where(trainable)[0], run, rng)
+    tr_idx, val_idx, te_norm_idx, how = split_normals(train_pool, run, rng)
 
     tr = np.zeros(len(X), bool); tr[tr_idx] = True
     va = np.zeros(len(X), bool); va[val_idx] = True
@@ -463,8 +530,54 @@ def main() -> int:
     os.makedirs(OUT_DIR, exist_ok=True)
     rng = np.random.default_rng(SEED)
 
+    # 사업장별 정상 윈도우 수를 먼저 세고 상한을 정한다.
+    # "min"이면 가장 적은 사업장에 맞춘다.
+    normal_cap = 0
+    counts = {}
     for node in NODES:
-        pkl = build_node_pkl(d, node, rng)
+        sel = d["node"] == node
+        if not sel.any():
+            continue
+        X = d["X"][sel]
+        ok = (sch.moving_mask(X)
+              & (d["label"][sel] == NORMAL)
+              & ~np.isin(d["nav"][sel], list(sch.EXCLUDE_NAV_TRAIN)))
+        counts[node] = int(ok.sum())
+
+    if counts:
+        if MAX_NORMAL_PER_SITE.lower() == "min":
+            normal_cap = min(counts.values())
+        elif MAX_NORMAL_PER_SITE.isdigit():
+            normal_cap = int(MAX_NORMAL_PER_SITE)
+
+        lo, hi = min(counts.values()), max(counts.values())
+        ratio = (lo / hi) if hi else 1.0
+
+        print(f"  사업장별 정상: "
+              + " / ".join(f"{SITE_OF_NODE.get(n, n)} {c}"
+                           for n, c in counts.items())
+              + f"   (최소/최대 {ratio:.2f})")
+
+        if normal_cap > 0:
+            if normal_cap < hi * MIN_BALANCE_RATIO:
+                print(f"  ⚠ 상한 {normal_cap}이 가장 많은 사업장({hi})의 "
+                      f"{normal_cap / hi * 100:.0f}%밖에 안 된다.")
+                print(f"    맞추려다 데이터 대부분을 버리게 된다. "
+                      f"수집이 고르게 될 때까지 끄는 편이 낫다.")
+                print(f"    그래도 쓰려면 AMR_MIN_BALANCE_RATIO 를 낮춰라. "
+                      f"지금은 상한을 적용하지 않는다.")
+                normal_cap = 0
+            else:
+                print(f"  → 상한 {normal_cap}개로 맞춘다 "
+                      f"(AMR_MAX_NORMAL_PER_SITE={MAX_NORMAL_PER_SITE})")
+        else:
+            print("  → 상한 없음 (맞추려면 AMR_MAX_NORMAL_PER_SITE=min)")
+            if ratio < MIN_BALANCE_RATIO:
+                print(f"    ⓘ 사업장 간 차이가 크다. FedAvg가 샘플 수로 "
+                      f"가중하므로 많이 가진 사업장의 영향이 커진다.")
+
+    for node in NODES:
+        pkl = build_node_pkl(d, node, rng, normal_cap)
         if not pkl:
             print(f"  ⚠ {node}({SITE_OF_NODE[node]}): 배정된 데이터가 없다")
             continue

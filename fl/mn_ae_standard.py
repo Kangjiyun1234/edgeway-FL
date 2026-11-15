@@ -444,7 +444,22 @@ class MNAETrainer:
             return self._load_sensor_data_from_pkl(round_num)
 
         want_min   = int(os.getenv("FL_SENSOR_MIN_WINDOWS", "40"))
-        per_robot  = int(os.getenv("FL_SENSOR_CIN_LIMIT_PER_ROBOT", "300"))
+
+        # 사업장 단위 상한. 로봇 수가 사업장마다 다르므로(A 4대, B 2대)
+        # 로봇당 상한만 두면 사업장 총량이 2배 차이 나고, FedAvg가 샘플 수로
+        # 가중하기 때문에 로봇이 많은 사업장이 더 큰 영향력을 갖는다.
+        # 사업장별 기여를 맞추려면 여기서 사업장 단위로 자른다.
+        # 0으로 두면 자르지 않는다(예전 동작).
+        site_cap = int(os.getenv("FL_SENSOR_MAX_WINDOWS_PER_SITE", "600"))
+
+        # 로봇별 조회 상한은 사업장 상한에서 역산한다. 넉넉히 받아 두고
+        # 합친 뒤에 고르게 줄이는 편이, 로봇 하나가 쉬고 있을 때도
+        # 사업장 총량을 채울 수 있어 낫다.
+        n_robots = max(1, len(self.telemetry_paths))
+        default_per_robot = (max(50, site_cap // n_robots * 2)
+                             if site_cap > 0 else 300)
+        per_robot = int(os.getenv("FL_SENSOR_CIN_LIMIT_PER_ROBOT",
+                                  str(default_per_robot)))
         wait_total = float(os.getenv("FL_SENSOR_ROUND_WAIT_SEC", "90"))
         poll       = float(os.getenv("FL_SENSOR_ROUND_POLL_SEC", "2.0"))
 
@@ -496,6 +511,13 @@ class MNAETrainer:
         # 건너뛰지 않기 위해, 여기까지 온 뒤에 갱신한다.
         if incremental:
             self.telemetry_cursor = cursors
+
+        # 사업장 단위로 고르게 줄인다.
+        if site_cap > 0 and len(got["signals"]) > site_cap:
+            before = len(got["signals"])
+            got = amr_ingest.balance_across_robots(got, site_cap)
+            print(f"    ⓘ 사업장 상한 적용: {before} -> "
+                  f"{len(got['signals'])}개 (로봇별 균등)")
 
         robots_seen = sorted(set(got["robot"].tolist()))
         print(f"    ✓ 윈도우 {len(got['signals'])}개 / 로봇 {len(robots_seen)}대 "

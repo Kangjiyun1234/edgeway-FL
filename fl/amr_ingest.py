@@ -108,6 +108,62 @@ def fetch_latest_windows(
     return build_from_cins(cins)
 
 
+def balance_across_robots(got: Dict[str, np.ndarray],
+                          cap: int) -> Dict[str, np.ndarray]:
+    """
+    사업장 전체 윈도우를 cap개 이하로 줄이되, 로봇별로 고르게 남긴다.
+
+    로봇 수가 사업장마다 다르면(A 4대, B 2대) 로봇당 같은 상한을 줘도
+    사업장 총량이 2배 차이 난다. FedAvg가 샘플 수로 가중하므로 그대로
+    두면 로봇이 많은 사업장이 더 큰 영향력을 갖는다. 사업장별 기여를
+    맞추려면 사업장 단위로 잘라야 한다.
+
+    로봇마다 cap/로봇수 만큼 배정하고, 적게 가진 로봇의 몫은 남은 로봇이
+    나눠 갖는다. 한 로봇이 몰아서 채우는 일을 막는다.
+    앞에서 자르지 않고 시간 축 전체에서 고르게 뽑는다.
+    """
+    n = len(got["signals"])
+    if cap <= 0 or n <= cap:
+        return got
+
+    robots = got["robot"]
+    uniq = sorted(set(robots.tolist()))
+    idx_by_robot = {r: np.where(robots == r)[0] for r in uniq}
+
+    quota = {r: 0 for r in uniq}
+    remaining = cap
+    pool = list(uniq)
+    while remaining > 0 and pool:
+        share = max(1, remaining // len(pool))
+        for r in list(pool):
+            avail = len(idx_by_robot[r]) - quota[r]
+            take = min(share, avail, remaining)
+            quota[r] += take
+            remaining -= take
+            if quota[r] >= len(idx_by_robot[r]):
+                pool.remove(r)
+            if remaining <= 0:
+                break
+
+    keep = []
+    for r in uniq:
+        src = idx_by_robot[r]
+        k = quota[r]
+        if k <= 0:
+            continue
+        # 앞쪽만 자르면 주행 초반만 보게 되므로 균등 간격으로 뽑는다.
+        pick = np.linspace(0, len(src) - 1, k).astype(np.int64)
+        keep.append(src[pick])
+
+    keep = np.sort(np.concatenate(keep)) if keep else np.array([], dtype=np.int64)
+
+    out = dict(got)
+    for k in ("signals", "cond", "robot", "pose", "cond_name", "nav", "ct"):
+        if k in out and len(out[k]) == n:
+            out[k] = out[k][keep]
+    return out
+
+
 def fetch_new_windows(container_path: str,
                       since_ct: Optional[str] = None,
                       limit: int = 300) -> Dict[str, np.ndarray]:
