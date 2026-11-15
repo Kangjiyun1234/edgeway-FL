@@ -45,13 +45,19 @@ _IN_CSE_NAME = config.IN_CSE_NAME
 # 사업장 CSE와 중앙 CSE 주소가 다르므로 어느 쪽인지 표시가 필요하다.
 IN_PREFIX = "@in/"
 
+# 바인딩할 때마다 엔드포인트를 찍을지.
+# 사업장을 오가며 수십 번 바인딩하므로 기본은 끔이다. 매번 찍으면
+# 정작 봐야 할 ✓/✗ 가 묻힌다. 디버깅할 때만 FL_VERBOSE_BIND=1 로 켠다.
+_VERBOSE_BIND = os.getenv("FL_VERBOSE_BIND", "0") == "1"
+
 
 def set_endpoint(base_url: str, cse_name: str) -> None:
     """이 프로세스의 기본 CSE를 지정한다."""
     global _BASE_URL, _CSE_NAME
     _BASE_URL = base_url.rstrip("/")
     _CSE_NAME = cse_name
-    print(f"  [oneM2M] 기본 CSE -> {_BASE_URL}/{_CSE_NAME}")
+    if _VERBOSE_BIND:
+        print(f"  [oneM2M] 기본 CSE -> {_BASE_URL}/{_CSE_NAME}")
 
 
 def set_in_endpoint(base_url: str, cse_name: str) -> None:
@@ -59,7 +65,8 @@ def set_in_endpoint(base_url: str, cse_name: str) -> None:
     global _IN_BASE_URL, _IN_CSE_NAME
     _IN_BASE_URL = base_url.rstrip("/")
     _IN_CSE_NAME = cse_name
-    print(f"  [oneM2M] 중앙 CSE -> {_IN_BASE_URL}/{_IN_CSE_NAME}")
+    if _VERBOSE_BIND:
+        print(f"  [oneM2M] 중앙 CSE -> {_IN_BASE_URL}/{_IN_CSE_NAME}")
 
 
 def base_url() -> str:
