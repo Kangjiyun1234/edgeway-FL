@@ -132,15 +132,14 @@ def create_fl_ae(ae_name: str, origin: str) -> bool:
     headers = om2m._headers(2)
     headers["X-M2M-Origin"] = origin
 
-    import requests
-
     try:
-        r = requests.post(
+        # _request_with_retry 를 거쳐야 TLS 설정과 기본 인증이 같이 적용된다.
+        r = om2m._request_with_retry(
+            "post",
             om2m._url(cse),
             json=payload,
             headers=headers,
             timeout=10,
-            verify=om2m._verify(),
         )
     except Exception as e:
         print(f"  ✗ AE {ae_name}: {e}")

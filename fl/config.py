@@ -181,6 +181,27 @@ _HOST_UNSET = "sandbox-host-not-set.invalid"
 _NAME_UNSET = "sandbox-name-not-set"
 
 
+# CSE가 HTTP 기본 인증을 요구할 때 쓴다.
+#
+# 샌드박스의 MN-CSE는 인증 없이 열려 있지만, 클라우드 IN-CSE는 401을 돌려준다.
+# 자격증명은 코드에 두지 않는다. 공개 저장소이므로 환경변수로만 받는다.
+# edgeway.yaml 의 REMOTE_CSE_USER / REMOTE_CSE_PASS 와 같은 값이다.
+IN_AUTH_USER = os.getenv("FL_IN_USER", "")
+IN_AUTH_PASS = os.getenv("FL_IN_PASS", "")
+MN_AUTH_USER = os.getenv("FL_MN_USER", "")
+MN_AUTH_PASS = os.getenv("FL_MN_PASS", "")
+
+
+def in_auth():
+    """IN-CSE용 (user, pass). 설정이 없으면 None."""
+    return (IN_AUTH_USER, IN_AUTH_PASS) if IN_AUTH_USER else None
+
+
+def mn_auth():
+    """MN-CSE용 (user, pass). 설정이 없으면 None."""
+    return (MN_AUTH_USER, MN_AUTH_PASS) if MN_AUTH_USER else None
+
+
 def sandbox_ready() -> bool:
     """샌드박스 주소가 설정돼 있는가."""
     return bool(SANDBOX_HOST and SANDBOX_NAME)

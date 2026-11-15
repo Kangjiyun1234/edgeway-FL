@@ -97,10 +97,27 @@ def _verify():
     return getattr(config, "TLS_VERIFY", True)
 
 
+def _auth_for(url: str):
+    """
+    이 URL이 어느 CSE로 가는지 보고 HTTP 기본 인증 정보를 고른다.
+
+    샌드박스의 MN-CSE는 열려 있지만 클라우드 IN-CSE는 401을 돌려준다.
+    두 CSE의 자격증명이 다를 수 있으므로 URL로 구분한다.
+    설정이 없으면 None이고, requests는 auth=None을 인증 없음으로 처리한다.
+    """
+    try:
+        if _IN_BASE_URL and url.startswith(_IN_BASE_URL):
+            return config.in_auth()
+        return config.mn_auth()
+    except Exception:
+        return None
+
+
 def _request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
     delay = RETRY_DELAY
     last_exc = None
     kwargs.setdefault("verify", _verify())
+    kwargs.setdefault("auth", _auth_for(url))
     for attempt in range(MAX_RETRY):
         try:
             return requests.request(method, url, **kwargs)
@@ -397,7 +414,7 @@ def discover_uril_by_label(container_path: str, label: str, lim: int = 20) -> Li
     ]
     for url in candidates:
         try:
-            r = requests.get(url, headers=_headers(), timeout=10, verify=_verify())
+            r = _request_with_retry("get", url, headers=_headers(), timeout=10)
             if r.status_code == 200:
                 data = r.json()
                 uril = data.get("m2m:uril", [])
@@ -411,7 +428,7 @@ def discover_uril_by_label(container_path: str, label: str, lim: int = 20) -> Li
 def list_uril(container_path: str, lim: int = 50) -> List[str]:
     url = _url(f"{container_path}?fu=1&ty=4&lim={lim}")
     try:
-        r = requests.get(url, headers=_headers(), timeout=10, verify=_verify())
+        r = _request_with_retry("get", url, headers=_headers(), timeout=10)
         if r.status_code != 200:
             return []
         data = r.json()
