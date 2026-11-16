@@ -79,9 +79,41 @@ reset_previous_run() {
     do
       pkill -KILL -f "$pat" 2>/dev/null || true
     done
-    echo "  ✓ 지난 실행 프로세스 종료"
-  else
+    echo "  ✓ 지난 실행 프로세스 종료 (이름 기준)"
+  fi
+
+  # 이름으로 못 잡는 것이 남는다. 다른 경로에서 띄웠거나, 부모가 먼저
+  # 죽어 고아가 된 프로세스는 cmdline 이 달라 pkill -f 를 피해 간다.
+  # 그런데 우리에게 필요한 건 "그 포트가 비어 있는 것" 하나뿐이다.
+  # 그러니 이름이 아니라 포트를 기준으로 비운다.
+  local busy=0
+  for port in 7000 6000 5001 5002 5003
+  do
+    local pid
+    pid="$(ss -ltnpH "sport = :${port}" 2>/dev/null \
+           | grep -oP 'pid=\K[0-9]+' | head -1 || true)"
+    if [ -n "${pid:-}" ]; then
+      echo "  · 포트 ${port} 를 PID ${pid} 가 잡고 있다 -> 내린다"
+      kill -TERM "$pid" 2>/dev/null || true
+      busy=1
+    fi
+  done
+
+  if [ "$busy" = "1" ]; then
+    sleep 2
+    for port in 7000 6000 5001 5002 5003
+    do
+      local pid
+      pid="$(ss -ltnpH "sport = :${port}" 2>/dev/null \
+             | grep -oP 'pid=\K[0-9]+' | head -1 || true)"
+      [ -n "${pid:-}" ] && kill -KILL "$pid" 2>/dev/null || true
+    done
+  fi
+
+  if [ "$killed" = "0" ] && [ "$busy" = "0" ]; then
     echo "  ✓ 남아 있는 프로세스 없음"
+  else
+    echo "  ✓ 포트 7000/6000/5001-5003 비움"
   fi
 
   rm -rf "${base}/global" "${base}/local" "${base}/cache"
@@ -103,8 +135,40 @@ start_dashboard() {
   echo "[2/5] 대시보드"
   python3 -u fl/dashboard_server.py &
   PIDS+=("$!")
-  echo "  -> http://localhost:7000   (PID ${PIDS[-1]})"
-  sleep 2
+  local pid="${PIDS[-1]}"
+  echo "  -> http://localhost:7000   (PID ${pid})"
+
+  # 띄워놓고 확인을 안 했다. 그래서 bind 에 실패해 죽어도 이 줄만
+  # 찍히고 넘어갔고, 왜 대시보드가 안 뜨는지 매번 로그를 뒤져야 했다.
+  # 최대 10초 기다리며 실제로 응답하는지 본다.
+  local ok=0
+  for _ in 1 2 3 4 5 6 7 8 9 10
+  do
+    sleep 1
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break            # 프로세스가 죽었다. 더 기다릴 것 없다.
+    fi
+    if curl -sS -o /dev/null --max-time 2 "http://127.0.0.1:7000/" 2>/dev/null; then
+      ok=1
+      break
+    fi
+  done
+
+  if [ "$ok" = "1" ]; then
+    echo "  ✓ 대시보드 응답 확인"
+  else
+    echo
+    echo "  ✗ 대시보드가 뜨지 않았다."
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "    프로세스는 살아 있는데 7000 이 응답하지 않는다."
+    else
+      echo "    프로세스가 죽었다. 바로 위에 찍힌 파이썬 오류를 보라."
+      echo "    'Address already in use' 면 7000 을 다른 것이 잡고 있다:"
+      echo "      ss -ltnp | grep 7000"
+    fi
+    echo "    FL 자체는 계속 진행한다."
+    echo
+  fi
 }
 
 # ── 1. 데이터 경로 준비 ─────────────────────────────────
