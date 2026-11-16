@@ -271,7 +271,13 @@ BASE_URL = MN_BASE_URL
 CSE_NAME = MN_CSE_NAME
 
 MN_AE_NAME = "MN-AE-1"
-IN_AE_NAME = "IN-AE"
+# 중앙 조정 앱의 AE 이름과 AE-ID.
+#
+# IN-CSE 는 여러 팀이 같이 쓰는 공유 자원이다. "IN-AE" 는 누구나 쓸 법한
+# 이름이라 남의 것과 헷갈리거나 먼저 선점당할 수 있다. 바꾸려면 두 값을
+# 같이 바꾸고 setup_resources_standard.py 를 다시 돌려야 한다.
+# 컨테이너와 ACP 가 전부 이 이름 아래에 매달려 있기 때문이다.
+IN_AE_NAME = os.getenv("FL_IN_AE_NAME", "IN-AE")
 
 # AE는 Isaac Sim 쪽에서 등록한다. setup_resources는 만들지 않고 존재만 확인한다.
 CREATE_AES = os.getenv("FL_CREATE_AES", "0") in ("1", "true", "True")
@@ -382,6 +388,17 @@ def analysis_ae_name(node: str) -> str:
 def analysis_ae_id(node: str) -> str:
     """mn1 -> CANALYSIS-AE-1"""
     return f"C{analysis_ae_name(node)}"
+
+
+# IN-AE 의 ACP 자가진단을 돌릴지.
+#
+# 이 진단은 사업장 MN-CSE 3곳에 직접 접속해서 권한을 확인한다. IN-AE 가
+# 사업장과 같은 네트워크에 있을 때만 가능하다.
+#
+# 설계상 IN-AE 는 IN 노드(중앙)에서 돈다. 거기서는 사업장 MN-CSE 가 방화벽
+# 뒤에 있어 닿지 않으므로 이 진단을 끈다. 끄는 것은 기능이 아니라 진단이므로
+# 연합학습 동작에는 영향이 없다.
+VERIFY_ACP = os.getenv("FL_VERIFY_ACP", "1") not in ("0", "false", "False")
 
 # X-M2M-RI(Request Identifier)는 TS-0009 HTTP 바인딩에서 모든 요청에 필수다.
 # 요청마다 고유값이어야 하므로 여기 고정값을 두지 않고

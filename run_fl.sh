@@ -100,10 +100,27 @@ sleep 5
 # ── 3. 코디네이터 ───────────────────────────────────────
 
 echo
-echo "[5/5] IN-AE 기동 (클라우드 IN-CSE 코디네이터)"
-python3 -u fl/in_ae_standard.py &
-PIDS+=("$!")
-echo "  IN-AE PID: ${PIDS[-1]}"
+echo "[5/5] IN-AE"
+# IN-AE 는 중앙 조정 앱이라 IN 노드에서 돈다. 설계서가 IN 노드를
+# "중앙 인프라에서 CSE 를 운영하고 AE 도 실행할 수 있는 노드" 로 정의한다.
+# 사업장 서버에서 띄우면 중앙 CSE 가 방화벽 뒤를 호출하지 못해
+# <pollingChannel> 로 우회해야 했다. 중앙에서 돌면 직접 알림을 받는다.
+#
+# 중앙 CSE 옆에 우리 프로세스를 둘 자리가 없어서 여기서 띄운다.
+# 공유 IN-CSE 는 엔드포인트만 제공되고, ESTIMED 호스팅 샌드박스도
+# 프런트엔드 접근만 허용된다("not recommended for full development").
+# 그래서 IN-AE 가 캠퍼스 방화벽 뒤에 놓이고, 중앙 CSE 가 우리를 호출하지
+# 못한다. TS-0001 이 요청 도달 불가 AE 를 위해 정의한 <pollingChannel> 로
+# 받는다. FL_NOTIFY_REMOTE 기본값이 pch 라 따로 줄 것은 없다.
+#
+# 나중에 중앙 노드에 자리가 생기면 FL_START_IN_AE=0 으로 끄고 거기서 띄운다.
+if [ "${FL_START_IN_AE:-1}" = "1" ]; then
+  python3 -u fl/in_ae_standard.py &
+  PIDS+=("$!")
+  echo "  IN-AE PID: ${PIDS[-1]}  (중앙 CSE 는 원격, 알림은 pollingChannel)"
+else
+  echo "  → 여기서는 안 띄운다 (FL_START_IN_AE=0). 중앙 노드에서 띄울 것."
+fi
 
 echo
 echo "============================================================"

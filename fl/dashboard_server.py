@@ -58,6 +58,7 @@ from sklearn.metrics import roc_auc_score
 
 import config
 import onem2m_utils as om2m
+import model_codec
 from model_cvae import CVAE1D
 
 
@@ -420,6 +421,18 @@ def _find_latest_model(
     3. global_roundN.pt 형식이 아닌 모델
     """
 
+    # 중앙 CSE 에 올라온 것을 먼저 본다.
+    #
+    # 전에는 IN-AE 가 /tmp/fl_models/global 에 떨군 .pt 를 같은 PC 에서
+    # 주워 읽었다. IN-AE 와 대시보드가 한 머신에 있을 때만 되는 지름길이다.
+    # 설계상 IN-AE 는 중앙 노드에서 돌기 때문에 그 디스크를 공유하지 않는다.
+    # 글로벌 모델은 이미 con 에 실려 cnt-global-model 로 배포되므로
+    # 디스크를 볼 이유가 없다.
+    cse_round, cse_state = _latest_global_from_cse(max_round)
+    if cse_state is not None:
+        return cse_round, cse_state
+
+    # 중앙에서 못 받았으면 로컬 파일로 떨어진다(같은 머신에서 돌릴 때).
     if not GLOBAL_MODEL_DIR.exists():
         return -1, None
 
@@ -466,6 +479,50 @@ def _find_latest_model(
     return latest_round, latest_path
 
 
+def _latest_global_from_cse(max_round: int | None = None):
+    """
+    중앙 CSE 의 cnt-global-model 에서 최신 글로벌 모델을 가져온다.
+
+    반환: (라운드, state_dict) 또는 (-1, None)
+
+    con 에 가중치가 fp16+gzip+base64 로 실려 있다. 조각으로 나뉘어 있으면
+    model_codec 이 fetch_chunk 로 나머지를 받아 온다.
+    """
+    path = om2m.in_path(f"{config.IN_AE_NAME}/cnt-global-model")
+    try:
+        meta = _parse_content_instance(
+            om2m.get_latest_content_instance(path)
+        )
+    except Exception:
+        return -1, None
+
+    if not meta or meta.get("type") != "global-model":
+        return -1, None
+
+    try:
+        model_round = int(meta.get("global_round", -1))
+    except (TypeError, ValueError):
+        return -1, None
+
+    if max_round is not None and model_round > max_round:
+        return -1, None
+
+    def fetch_chunk(name: str):
+        return _parse_content_instance(
+            om2m.get_latest_content_instance(
+                f"{meta.get('weights_chunk_container', '')}/{name}"
+            )
+        )
+
+    try:
+        state = model_codec.decode_state_dict(meta, fetch_chunk=fetch_chunk)
+    except Exception as e:
+        print(f"  ⚠ 글로벌 모델 복원 실패 ({type(e).__name__}: {e})")
+        return -1, None
+
+    return (model_round, state) if state is not None else (-1, None)
+
+
 # ════════════════════════════════════════════════════════
 # 모델 로드
 # ════════════════════════════════════════════════════════
@@ -481,9 +538,11 @@ def _load_model(
         seq_len=ae_config.seq_len,
     )
 
-    state_dict = torch.load(
-        model_path,
-        map_location="cpu",
+    # CSE 에서 받아 온 경우에는 이미 state_dict 다. 파일 경로면 읽는다.
+    state_dict = (
+        model_path
+        if isinstance(model_path, dict)
+        else torch.load(model_path, map_location="cpu")
     )
 
     model.load_state_dict(
@@ -1118,16 +1177,13 @@ def _parse_content_instance(
 # ════════════════════════════════════════════════════════
 
 def _poll_thread() -> None:
-    fl_control_path = (
-        f"{config.CSE_NAME}/"
-        f"{config.IN_AE_NAME}/"
-        "cnt-fl-control"
+    # IN-AE 의 컨테이너는 중앙 IN-CSE 에 있다. config.CSE_NAME 은 사업장
+    # MN-CSE 이름이라, 그걸로 경로를 만들면 없는 리소스를 찾게 된다.
+    fl_control_path = om2m.in_path(
+        f"{config.IN_AE_NAME}/cnt-fl-control"
     )
-
-    local_updates_path = (
-        f"{config.CSE_NAME}/"
-        f"{config.IN_AE_NAME}/"
-        "cnt-local-updates"
+    local_updates_path = om2m.in_path(
+        f"{config.IN_AE_NAME}/cnt-local-updates"
     )
 
     previous_snapshot: dict = {}
@@ -1317,6 +1373,12 @@ def _poll_thread() -> None:
 # ════════════════════════════════════════════════════════
 
 def main() -> None:
+    # 대시보드는 양쪽을 다 본다.
+    #   사업장 MN-CSE  판정 / 네트워크 상태 / 관측
+    #   중앙 IN-CSE    라운드 상태 / 사업장별 제출 / 공통 모델
+    om2m.set_endpoint(*config.mn_endpoint("mn1"))
+    om2m.set_in_endpoint(*config.in_endpoint())
+
     GLOBAL_MODEL_DIR.mkdir(
         parents=True,
         exist_ok=True,
@@ -1324,7 +1386,8 @@ def main() -> None:
 
     print()
     print("=== FL Dashboard Server ===")
-    print(f"  oneM2M: {config.BASE_URL}")
+    print(f"  사업장 CSE: {om2m.base_url()}/{om2m.cse_name()}")
+    print(f"  중앙 CSE  : {config.in_endpoint()[0]}/{om2m.in_cse_name()}")
     print(f"  PKL: {PKL_DIR}")
     print(f"  Global model: {GLOBAL_MODEL_DIR}")
     print(f"  Run marker: {RUN_MARKER_PATH}")

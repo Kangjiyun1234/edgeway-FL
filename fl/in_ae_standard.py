@@ -1140,7 +1140,13 @@ class INAECoordinator:
         self._subscribe_dropbox()
 
         # ACP 검증
-        self._verify_acp()
+        if getattr(config, "VERIFY_ACP", True):
+            self._verify_acp()
+        else:
+            print("\n=== ACP 접근 제어 검증 — 건너뜀 (FL_VERIFY_ACP=0) ===")
+            print("  이 진단은 사업장 MN-CSE 에 직접 접속한다.")
+            print("  IN-AE 가 중앙에서 돌면 그쪽이 방화벽 뒤라 닿지 않는다.")
+            print("  연합학습 동작과는 무관하다.\n")
 
         # Round 1 command를 놓치지 않도록 MN-AE 구독이 모두 준비될 때까지 대기
         if not self._wait_for_mn_command_subscriptions():
