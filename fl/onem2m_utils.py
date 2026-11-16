@@ -203,7 +203,8 @@ def _next_request_id() -> str:
     return f"{os.getpid()}-{time.time_ns()}-{next(_RI_COUNTER)}"
 
 
-def _headers(ty: Optional[int] = None, body: bool = False) -> Dict[str, str]:
+def _headers(ty: Optional[int] = None, body: bool = False,
+             origin: Optional[str] = None) -> Dict[str, str]:
     """
     요청 헤더를 만든다.
 
@@ -211,10 +212,21 @@ def _headers(ty: Optional[int] = None, body: bool = False) -> Dict[str, str]:
     body=True면 ty 없는 본문 요청(UPDATE)이므로 Content-Type만 붙인다.
     둘 다 아니면 Content-Type을 넣지 않는다. RETRIEVE나 DELETE에
     Content-Type을 실으면 CSE가 요청을 거부한다.
+
+    origin을 주면 이 요청에만 그 신원을 쓴다. 평소에는 프로세스 전역
+    originator()로 충분하지만, 전역 신원으로는 아예 불가능한 요청이 있다.
+    <pollingChannel> 생성이 그렇다. ACME는 부모 AE 본인만 허용하고
+    관리자(CAdmin)조차 거부한다.
+
+        acme/resources/AE.py:103-106
+        if childResource.ty == ResourceTypes.PCH:
+            # Check correct originator. Even the ADMIN is not allowed that
+            if self.aei != originator:
+                raise ORIGINATOR_HAS_NO_PRIVILEGE(...)
     """
     h = config.HEADERS.copy()
     h["X-M2M-RI"] = _next_request_id()
-    h["X-M2M-Origin"] = originator()
+    h["X-M2M-Origin"] = origin or originator()
     if ty is not None:
         h["Content-Type"] = f"application/json;ty={ty}"
     elif body:

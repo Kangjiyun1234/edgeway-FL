@@ -286,18 +286,47 @@ NOTIFY_HOST = os.getenv(
 
 # 알림을 어떤 경로로 받을지.
 #
-#   "direct"  CSE가 우리 HTTP 서버를 직접 호출한다. CSE가 AE에 닿을 수 있을 때.
+#   "direct"  CSE가 우리 HTTP 서버를 직접 호출한다. 구독의 nu 는 URL 이고
+#             AE 에 poa 가 박혀 있어야 한다. CSE가 AE에 닿을 수 있을 때.
 #   "pch"     oneM2M <pollingChannel>(m2m:pch, ty=15)로 받는다. AE가 CSE에
 #             길게 걸어 두고 CSE가 그 응답으로 알림을 내려보낸다. TS-0001이
 #             요청 도달 불가(request-unreachable) AE를 위해 정의한 방식이다.
 #
 # 구독도 알림도 그대로다. 전달 방향만 뒤집힌다.
-# 클라우드 CSE와 방화벽 뒤 엣지 AE라는 배치에서는 polling 이어야 한다.
-NOTIFY_MODE = os.getenv("FL_NOTIFY_MODE", "direct").strip().lower()
+#
+# [왜 하나가 아니라 둘인가]
+# 전에는 플래그 하나로 모든 알림 경로를 정했다. 그런데 우리 배치는 경로마다
+# 조건이 다르다.
+#
+#   로봇 → MN-CSE → MN-AE     사업장 내부. CSE가 우리를 부를 수 있다  → direct
+#   IN-CSE → MN-AE / IN-AE    방화벽 너머. 부를 수 없다               → pch
+#
+# 한 플래그로 둘 다 정하면 원격 때문에 pch 를 켜는 순간 방화벽과 아무 상관없는
+# 사업장 안의 텔레메트리 구독까지 같이 죽는다(poa 를 안 박게 되므로). 반대로
+# 로컬 때문에 direct 로 두면 원격 구독이 전부 타임아웃이다.
+#
+# 조건이 다르면 프로토콜도 달라야 한다. 그래서 둘로 나눈다.
+NOTIFY_LOCAL = os.getenv(
+    "FL_NOTIFY_LOCAL", os.getenv("FL_NOTIFY_MODE", "direct")
+).strip().lower()
+
+NOTIFY_REMOTE = os.getenv(
+    "FL_NOTIFY_REMOTE", os.getenv("FL_NOTIFY_MODE", "pch")
+).strip().lower()
 
 
-def use_pch() -> bool:
-    return NOTIFY_MODE == "pch"
+def local_notify_mode() -> str:
+    """사업장 안 MN-CSE 로부터 받는 알림의 전달 방식."""
+    return NOTIFY_LOCAL
+
+
+def remote_notify_mode() -> str:
+    """클라우드 IN-CSE 로부터 받는 알림의 전달 방식."""
+    return NOTIFY_REMOTE
+
+
+def remote_uses_pch() -> bool:
+    return NOTIFY_REMOTE == "pch"
 
 NUM_CLIENTS = 3
 GLOBAL_ROUNDS = 10

@@ -48,6 +48,10 @@ class INAECoordinator:
             om2m.set_originator(ORIGIN_IN_AE)
         self.in_cse_name = om2m.cse_name()
 
+        # IN-AE 의 리소스는 전부 IN-CSE 에 있다. 경로가 하나라 원격뿐이다.
+        self.notify_target = None
+        self.pch_receiver = None
+
         self.fl_control_path   = f"{self.in_cse_name}/{config.IN_AE_NAME}/cnt-fl-control"
         self.global_model_path = f"{self.in_cse_name}/{config.IN_AE_NAME}/cnt-global-model"
         self.dropbox_root      = f"{self.in_cse_name}/{config.IN_AE_NAME}/cnt-local-updates"
@@ -358,36 +362,33 @@ class INAECoordinator:
         """
         알림을 어느 경로로 받을지 정한다.
 
-        direct  : CSE가 우리 HTTP 서버를 직접 호출한다. 구독의 nu 는 URL.
-        polling : <pollingChannel> 로 받는다. 구독의 nu 는 AE-ID 이고,
-                  CSE가 그 AE 앞으로 알림을 쌓아 두면 우리가 길게 건 GET 의
-                  응답으로 받아 간다. 받은 알림은 위에서 띄운 로컬 Flask 로
-                  그대로 넘기므로 알림 처리 코드는 바뀌지 않는다.
+        IN-AE 가 구독하는 것은 전부 클라우드 IN-CSE 안에 있다(드롭박스).
+        그 CSE 는 캠퍼스 방화벽 뒤의 우리를 호출하지 못하므로 기본이 pch 다.
+        MN-AE 와 달리 IN-AE 는 그 CSE 에 정식 등록된 AE 라서
+        <pollingChannel> 을 가질 자격이 있다.
+
+        direct 로 두면 구독 생성이 CSE 쪽 검증 요청에서 멈췄다가
+        우리 read timeout 으로 끝난다. 복구용으로만 쓴다.
         """
         port = self.notification_port
-        if not config.use_pch():
+        ae_path = f"{om2m.cse_name()}/{config.IN_AE_NAME}"
+
+        if config.remote_notify_mode() != "pch":
             # rr=true 만으로는 부족하다. poa 로 수신 주소를 알려야
             # CSE가 알림 대상을 검증할 수 있다.
-            ae_path = f"{om2m.cse_name()}/{config.IN_AE_NAME}"
             poa = f"http://{config.NOTIFY_HOST}:{port}"
             om2m.set_point_of_access(ae_path, [poa], reachable=True)
-
             self.notify_target = f"{poa}/notify"
             return
 
-        ae_path = f"{om2m.cse_name()}/{config.IN_AE_NAME}"
-        print("\n  oneM2M <pollingChannel> 준비 (IN-AE)")
-        onem2m_pch.ensure_channel(ae_path)
-        onem2m_pch.set_request_unreachable(ae_path)
-
-        self.pch_receiver = onem2m_pch.PchReceiver(
-            ae_path,
-            origin=ORIGIN_IN_AE,
-            handler=onem2m_pch.relay_to_local(
-                f"http://127.0.0.1:{port}/notify"),
-        )
-        self.pch_receiver.start()
-        self.notify_target = ORIGIN_IN_AE
+        self.pch_receiver = onem2m_pch.setup(
+            ae_path, f"http://127.0.0.1:{port}/notify", label="IN-AE")
+        if not self.pch_receiver:
+            self.notify_target = None
+            print("    ⚠ IN-AE 는 알림을 받을 수 없다. 드롭박스 구독을 "
+                  "만들지 않는다.")
+            return
+        self.notify_target = self.pch_receiver.origin
 
     # -----------------------
     # ACP 검증
@@ -552,6 +553,10 @@ class INAECoordinator:
 
     def _subscribe_dropbox(self):
         print("\n  Subscribe drop-box per-node containers (net=3 CIN create)...")
+        if not self.notify_target:
+            print("    ✗ 알림 경로가 없어 구독을 만들지 않는다. "
+                  "만들어도 CSE 가 검증하지 못한다.")
+            return
         for node, cnt_path in self.dropbox_by_node.items():
             sub_name = f"sub_in_dropbox_{node}"
             om2m.delete_subscription(cnt_path, sub_name)

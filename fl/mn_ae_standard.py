@@ -109,6 +109,15 @@ class MNAETrainer:
         self.data_event = threading.Event()
         self.data_notifications = 0
 
+        # 알림 경로는 둘이고 조건이 서로 다르다. 한 변수로 묶으면
+        # 한쪽 설정이 다른 쪽을 망가뜨린다.
+        #   local  : 사업장 MN-CSE. 로봇 텔레메트리 알림.
+        #   remote : 클라우드 IN-CSE. 라운드 명령 알림.
+        self.local_notify_target = None
+        self.remote_notify_target = None
+        self.local_pch = None
+        self.pch_receiver = None
+
         self.job_event = threading.Event()
         self.job_lock = threading.Lock()
         self.latest_job_command = None
@@ -281,54 +290,52 @@ class MNAETrainer:
 
     def _setup_notify_path(self):
         """
-        알림을 어느 경로로 받을지 정한다.
+        알림을 어느 경로로 받을지 정한다. 경로는 둘이고 조건이 다르다.
 
-        direct : CSE가 우리 HTTP 서버를 직접 호출한다. 구독의 nu 는 URL.
-        pch    : oneM2M <pollingChannel>(m2m:pch)로 받는다. 구독의 nu 는
-                 AE-ID 이고, CSE가 그 AE 앞으로 알림을 쌓아 두면 우리가
-                 길게 건 GET 의 응답으로 받아 간다.
+          로컬  사업장 MN-CSE -> 우리.  로봇 텔레메트리 알림이 이 길로 온다.
+                같은 사업장 안이라 CSE 가 우리를 직접 부를 수 있다.
+                AE 에 poa 를 박고 구독의 nu 에 URL 을 준다.
 
-        받은 알림은 위에서 띄운 로컬 Flask 로 그대로 넘긴다. 구독 검증,
-        net 판정, 라운드 명령 해석은 이미 거기에 있고 검증된 코드다.
-        전달 경로만 바뀌고 처리 로직은 손대지 않는다.
+          원격  클라우드 IN-CSE -> 우리.  라운드 명령(cnt-fl-control)이 이 길.
+                캠퍼스 방화벽이 인바운드를 버리므로 CSE 가 우리를 못 부른다.
+                <pollingChannel> 로 받고 구독의 nu 에 AE-ID 를 준다.
 
-        MN-AE는 클라우드 IN-CSE의 cnt-fl-control 을 구독한다. 그 CSE가
-        캠퍼스 방화벽 뒤의 우리를 호출하지 못하므로 pch 가 필요하다.
-        <pollingChannel>은 사업장 CSE가 아니라 구독을 건 CSE에 둬야 한다.
+        전에는 플래그 하나가 둘 다 정했다. 그래서 원격 때문에 pch 를 켜면
+        poa 를 박는 코드가 direct 분기 안에만 있어서 같이 건너뛰었고,
+        방화벽과 아무 상관없는 사업장 안의 텔레메트리 구독까지 죽었다.
+        이제 로컬 설정은 원격이 무엇이든 그대로 돈다.
         """
         port = self.notification_port
-        origin = self.ae_id
+        poa = f"http://{config.NOTIFY_HOST}:{port}"
+        local_notify = f"http://127.0.0.1:{port}/notify"
 
-        if not config.use_pch():
-            # CSE가 우리를 호출하려면 주소를 알아야 한다. rr=true 만 켜고
-            # poa 를 비워 두면 CSE가 알림 대상을 검증하지 못해 구독이 거부된다
-            # ("Verification request failed for: CMN-AE-1").
-            #
-            # MN-CSE는 같은 머신에서 돌지만 컨테이너 안이라 127.0.0.1 로는
+        # ── 로컬: 사업장 MN-CSE ──────────────────────────
+        local_ae = f"{self.mn_cse_name}/{self.ae_name}"
+        if config.local_notify_mode() == "pch":
+            self.local_pch = onem2m_pch.setup(
+                local_ae, local_notify, label=f"{self.ae_name} / 로컬")
+            self.local_notify_target = (
+                self.local_pch.origin if self.local_pch else None)
+        else:
+            # rr=true 만 켜고 poa 를 비워 두면 CSE 가 알림 대상을 검증하지
+            # 못해 구독이 거부된다("Verification request failed for: ...").
+            # MN-CSE 는 같은 머신이지만 컨테이너 안이라 127.0.0.1 로는
             # 우리에게 못 온다. 호스트 주소를 알려줘야 한다.
-            ae_path = f"{self.mn_cse_name}/{self.ae_name}"
-            poa = f"http://{config.NOTIFY_HOST}:{port}"
-            om2m.set_point_of_access(ae_path, [poa], reachable=True)
+            om2m.set_point_of_access(local_ae, [poa], reachable=True)
+            self.local_notify_target = f"{poa}/notify"
 
-            self.notify_target = f"{poa}/notify"
-            return
-
-        in_cse = config.in_endpoint()[1]
-        ae_path = om2m.in_path(self.ae_name)
-
-        print(f"\n  oneM2M <pollingChannel> 준비 ({self.ae_name})")
-        print(f"    대상 CSE: {in_cse} (구독을 건 곳)")
-        onem2m_pch.ensure_channel(ae_path)
-        onem2m_pch.set_request_unreachable(ae_path)
-
-        self.pch_receiver = onem2m_pch.PchReceiver(
-            ae_path,
-            origin=origin,
-            handler=onem2m_pch.relay_to_local(
-                f"http://127.0.0.1:{port}/notify"),
-        )
-        self.pch_receiver.start()
-        self.notify_target = origin
+        # ── 원격: 클라우드 IN-CSE ────────────────────────
+        if config.remote_notify_mode() == "pch":
+            self.pch_receiver = onem2m_pch.setup(
+                om2m.in_path(self.ae_name), local_notify,
+                label=f"{self.ae_name} / 원격")
+            self.remote_notify_target = (
+                self.pch_receiver.origin if self.pch_receiver else None)
+            if not self.pch_receiver:
+                print(f"    ⚠ {self.ae_name} 은 IN-CSE 로부터 알림을 받을 수 "
+                      f"없다. 라운드 명령 구독이 실패할 것이다.")
+        else:
+            self.remote_notify_target = f"{poa}/notify"
 
     def _is_expected_command(self, command: dict | None, round_num: int) -> bool:
         if not isinstance(command, dict):
@@ -435,11 +442,11 @@ class MNAETrainer:
         if not getattr(config, "FL_SENSOR_FROM_CSE", True):
             return 0
 
-        notify_url = self.notify_target
-        if not notify_url.startswith("http"):
-            # pch 모드에서는 nu 가 AE-ID 다. 텔레메트리는 로컬 알림이므로
-            # 그대로 써도 CSE가 poa 로 풀어 준다.
-            notify_url = self.notify_target
+        # 텔레메트리는 사업장 안에서 오는 알림이다. 원격 경로와 무관하다.
+        notify_url = self.local_notify_target
+        if not notify_url:
+            print(f"    ⚠ 로컬 알림 경로가 없다 — 구독을 걸지 않는다.")
+            return 0
 
         ok = 0
         print(f"\n  [{self.node_name}] 로봇 텔레메트리 구독")
@@ -474,13 +481,19 @@ class MNAETrainer:
         return ok
 
     def _subscribe_to_fl_control(self):
+        """라운드 명령 구독. 대상은 클라우드 IN-CSE 라 원격 경로를 쓴다."""
+        if not self.remote_notify_target:
+            print(f"  ✗ {self.node_name}: IN-CSE 로부터 알림을 받을 경로가 "
+                  f"없어 구독을 만들지 않는다.")
+            return None
+
         sub_name = f"sub_{self.node_name}"
         om2m.delete_subscription(self.fl_control_path, sub_name)
         time.sleep(0.2)
         res = om2m.create_subscription(
             parent_path=self.fl_control_path,
             subscription_name=sub_name,
-            notification_uri=self.notify_target,
+            notification_uri=self.remote_notify_target,
             event_types=[3],
             use_nct=None,
         )
