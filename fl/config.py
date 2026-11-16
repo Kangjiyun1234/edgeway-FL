@@ -359,6 +359,30 @@ def mn_ae_id(node: str) -> str:
     """mn1 -> CMN-AE-1"""
     return f"C{mn_ae_name(node)}"
 
+
+# ── 분석 앱(판정) ────────────────────────────────────────
+#
+# 설계서에서 사업장 안의 앱은 분석 / 운행 / 학습으로 나뉜다. 학습 앱이 MN-AE 고,
+# 판정은 분석 앱의 일이다. 지금은 모델을 들고 있는 MN-AE 가 계산까지 하지만,
+# 리소스는 분석 앱 신원으로 남긴다. 나중에 분석 앱을 별도 프로세스로 떼어내도
+# 리소스 트리와 구독하는 쪽 코드가 바뀌지 않는다.
+#
+# 판정 결과는 사업장 밖으로 나가지 않으므로 MN-CSE 에 둔다.
+ANALYSIS_AE_PREFIX = os.getenv("FL_ANALYSIS_AE_PREFIX", "ANALYSIS-AE")
+VERDICT_CNT = os.getenv("FL_VERDICT_CNT", "cnt-verdict")
+VERDICT_MNI = int(os.getenv("FL_VERDICT_MNI", "500"))
+VERDICT_ENABLED = os.getenv("FL_VERDICT", "1") not in ("0", "false", "False")
+
+
+def analysis_ae_name(node: str) -> str:
+    """mn1 -> ANALYSIS-AE-1"""
+    return f"{ANALYSIS_AE_PREFIX}-{node[2:]}"
+
+
+def analysis_ae_id(node: str) -> str:
+    """mn1 -> CANALYSIS-AE-1"""
+    return f"C{analysis_ae_name(node)}"
+
 # X-M2M-RI(Request Identifier)는 TS-0009 HTTP 바인딩에서 모든 요청에 필수다.
 # 요청마다 고유값이어야 하므로 여기 고정값을 두지 않고
 # onem2m_utils._headers() 에서 매번 생성한다.

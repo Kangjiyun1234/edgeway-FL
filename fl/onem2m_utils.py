@@ -400,6 +400,7 @@ def create_content_instance(
     content: Any,
     labels: Optional[List[str]] = None,
     resource_name: Optional[str] = None,
+    origin: Optional[str] = None,
 ) -> Optional[Dict]:
     """
     resource_name을 주면 CIN의 rn을 직접 지정한다.
@@ -426,7 +427,8 @@ def create_content_instance(
     payload: Dict[str, Any] = {"m2m:cin": cin_obj}
 
     try:
-        r = _request_with_retry("post", url, json=payload, headers=_headers(4), timeout=45)
+        r = _request_with_retry("post", url, json=payload,
+                                headers=_headers(4, origin=origin), timeout=45)
         if r.status_code == 201:
             return r.json()
         print(f"✗ CIN create failed: {r.status_code} - {r.text}")

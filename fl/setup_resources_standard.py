@@ -323,6 +323,77 @@ def setup_in_resources(nodes: List[str], acps: Dict[str, str]) -> None:
 # MN-CSE 리소스
 # ════════════════════════════════════════════════════════
 
+def robot_ae_ids(cse: str, node: str) -> List[str]:
+    """
+    이 사업장 로봇 AE 들의 AE-ID 를 읽는다.
+
+    추측하지 않고 CSE 에 물어본다. 로봇 AE 는 Isaac Sim 이 만들고 AE-ID 는
+    CSE 가 배정하므로, 이름으로 유추하면 틀린다. ACP 의 acor 에 들어갈 값이라
+    한 글자만 달라도 아이작심이 구독을 못 건다.
+    """
+    ids: List[str] = []
+    for robot in config.robot_names(node):
+        res = om2m.get_resource(f"{cse}/{robot}")
+        aei = ((res or {}).get("m2m:ae") or {}).get("aei")
+        if aei:
+            ids.append(aei)
+    return ids
+
+
+def setup_analysis_ae(node: str, cse: str) -> None:
+    """
+    분석 앱 AE 와 판정 결과 컨테이너를 만든다.
+
+    구조
+      <MN-CSE>/ANALYSIS-AE-i/cnt-verdict/<cin>
+
+    권한
+      분석 앱   전권 (자기 리소스)
+      로봇 AE   RETRIEVE + NOTIFY + DISCOVERY  -> 구독해서 판정을 받는다
+      학습 앱   RETRIEVE + DISCOVERY           -> 대시보드가 읽는다
+
+    로봇에 CREATE 를 주지 않는 것이 요점이다. 판정은 분석 앱만 쓴다.
+    """
+    ae_name = config.analysis_ae_name(node)
+    ae_id = config.analysis_ae_id(node)
+
+    if not create_fl_ae(ae_name, ae_id):
+        print(f"  ✗ {ae_name} 생성 실패 — 판정 컨테이너를 건너뛴다")
+        return
+    time.sleep(SETTLE)
+
+    robots = robot_ae_ids(cse, node)
+    if robots:
+        print(f"  로봇 AE-ID: {', '.join(robots)}")
+    else:
+        print(f"  ⚠ 로봇 AE-ID 를 못 읽었다. 아이작심이 아직 안 올라왔으면 "
+              f"로봇에게 읽기 권한이 안 붙는다.")
+
+    pv = [
+        {"acor": [config.ORIGINATOR, ae_id], "acop": ACOP_ALL},
+        {"acor": [origin_mn(node)],
+         "acop": ACOP_RETRIEVE | ACOP_DISCOVERY},
+    ]
+    if robots:
+        pv.append({"acor": robots,
+                   "acop": ACOP_RETRIEVE | ACOP_NOTIFY | ACOP_DISCOVERY})
+
+    acp_ri = om2m.create_acp(
+        cse, f"acp-verdict-{node}", pv,
+        [{"acor": [config.ORIGINATOR, ae_id], "acop": ACOP_ALL}],
+    )
+    print(f"  {'✓' if acp_ri else '✗'} acp-verdict-{node}")
+    time.sleep(SETTLE)
+
+    om2m.create_container(
+        f"{cse}/{ae_name}", config.VERDICT_CNT,
+        mni=config.VERDICT_MNI,
+        acpi=[acp_ri] if acp_ri else None,
+    )
+    print(f"  ✓ {ae_name}/{config.VERDICT_CNT}  (mni={config.VERDICT_MNI})")
+    time.sleep(SETTLE)
+
+
 def setup_mn_resources(node: str) -> Dict[str, bool]:
     """
     한 사업장 분. MEP의 MN-CSE에 바인딩하고
@@ -362,6 +433,8 @@ def setup_mn_resources(node: str) -> Dict[str, bool]:
     )
     print("  ✓ cnt-net-status  (mni=100)")
     time.sleep(SETTLE)
+
+    setup_analysis_ae(node, cse)
 
     return robots
 

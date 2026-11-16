@@ -27,6 +27,7 @@ import config
 import model_codec
 import onem2m_utils as om2m
 import onem2m_pch
+import verdict
 from edge_node import AEEdgeNode
 
 # "이번 라운드는 학습할 수 없다. 다만 노드를 죽일 일은 아니다"를 나타내는 신호.
@@ -117,6 +118,18 @@ class MNAETrainer:
         self.remote_notify_target = None
         self.local_pch = None
         self.pch_receiver = None
+
+        # 판정(분석 앱). 결과는 사업장 밖으로 안 나가므로 MN-CSE 에 남긴다.
+        # 쓰는 신원은 MN-AE 가 아니라 분석 앱이다. 설계서에서 둘은 다른 앱이고
+        # ACP 도 역할별로 나뉜다.
+        self.analysis_ae_id = config.analysis_ae_id(self.node_name)
+        self.verdict_cnt_path = (
+            f"{self.mn_cse_name}/"
+            f"{config.analysis_ae_name(self.node_name)}/"
+            f"{config.VERDICT_CNT}"
+        )
+        # 이번 라운드에 읽은 윈도우. 판정은 학습이 끝난 뒤 이걸로 낸다.
+        self.last_windows = None
 
         self.job_event = threading.Event()
         self.job_lock = threading.Lock()
@@ -783,6 +796,15 @@ class MNAETrainer:
         #
         # 제외 nav(중단된 주행 등)도 오프라인 전처리와 같은 기준으로 뺀다.
         # 온라인과 오프라인이 다른 학습 집합을 쓰면 비교가 안 된다.
+        # 판정에 쓸 윈도우를 남겨 둔다.
+        #
+        # 학습 대상(정상)만 추리기 전의 '이동 중인 윈도우 전부'가 대상이다.
+        # 이상을 찾는 것이 목적인데 정상만 보면 찾을 것이 없다.
+        cts = got.get("ct")
+        if cts is not None and len(cts) == len(mv):
+            cts = cts[mv] if mv.any() else cts
+        self.last_windows = {"X": Xn, "C": C, "robot": robot, "ct": cts}
+
         navs = got.get("nav")
         if navs is not None and len(navs) == len(mv):
             navs = navs[mv] if mv.any() else navs
@@ -1197,6 +1219,46 @@ class MNAETrainer:
     # ---------------------------
     # Drop-box upload
     # ---------------------------
+    def _publish_verdicts(self, round_num: int,
+                          model_uri: str = None) -> int:
+        """
+        이번 라운드에 읽은 윈도우로 로봇별 이상 판정을 내고 CSE 에 올린다.
+
+        학습이 끝난 뒤에 부른다. 임계값이 이번 라운드 모델 기준으로
+        갱신돼 있어야 판정이 의미를 갖는다.
+
+        판정이 실패해도 라운드는 계속된다. 연합학습 본체가 부수 기능 때문에
+        멈추면 안 된다.
+        """
+        if not getattr(config, "VERDICT_ENABLED", True):
+            return 0
+
+        w = self.last_windows
+        if not w or w["X"] is None or len(w["X"]) == 0:
+            return 0
+
+        node = self.edge_node
+        threshold = getattr(node, "threshold", None)
+        if threshold is None:
+            return 0
+
+        try:
+            scores = node.compute_anomaly_scores(w["X"], w["C"])
+            return verdict.publish(
+                node_name=self.node_name,
+                cnt_path=self.verdict_cnt_path,
+                origin=self.analysis_ae_id,
+                scores=scores,
+                robots=w["robot"],
+                threshold=threshold,
+                round_num=round_num,
+                cts=w["ct"],
+                model_uri=model_uri,
+            )
+        except Exception as e:
+            print(f"  ⚠ {self.node_name}: 판정 실패 — {e}")
+            return 0
+
     def _upload_inference_result(
         self,
         round_num,
@@ -1551,6 +1613,9 @@ class MNAETrainer:
                 f"  val_loss={val_loss:.6f}"
                 f"  val_auroc={val_auroc:.4f}"
             )
+
+            # 학습이 끝나 임계값이 갱신된 뒤에 판정한다.
+            self._publish_verdicts(round_num)
 
             if self.upload_stagger_sec > 0:
                 time.sleep(self.upload_stagger_sec)
