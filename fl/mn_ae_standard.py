@@ -211,8 +211,17 @@ class MNAETrainer:
 
                 # CSE가 rep를 보내지 않은 경우에만
                 # NOTIFY를 계기로 최신 CIN을 한 번 조회
+                #
+                # 이 경로는 위험하다. /la 는 "지금 가장 최신"을 주므로,
+                # 이 알림이 가리킨 CIN 과 다른 것을 읽을 수 있다. 예를 들어
+                # FL_READY 알림을 처리하는 사이 FL_TRAINING 이 올라와 있으면
+                # FL_READY 를 FL_TRAINING 으로 읽는다. 그러면 job_event 를
+                # 미리 소모해 정작 진짜 명령을 기다리다 타임아웃이 난다.
+                # 언제 이 경로를 타는지 보이게 둔다.
                 if command is None:
                     command = self._get_current_job_state()
+                    print(f"  ⚠ {self.node_name}: 알림에 rep 가 없어 "
+                          f"/la 를 읽었다 (알림이 가리킨 CIN 과 다를 수 있다)")
 
                 if command:
                     state = str(command.get("jobState", ""))
@@ -241,10 +250,15 @@ class MNAETrainer:
                             self.latest_job_command = command
                             self.last_command_source = "NOTIFY"
 
+                        cin_ri = (
+                            ((sgn.get("nev") or {}).get("rep") or {})
+                            .get("m2m:cin", {})
+                            .get("ri", "?")
+                        )
                         print(
                             f"  [NOTIFY] {self.node_name} "
                             f"command received: "
-                            f"{state}, round={current_round}"
+                            f"{state}, round={current_round}, cin={cin_ri}"
                         )
 
                         self.job_event.set()
