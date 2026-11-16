@@ -30,6 +30,7 @@ lbl 에 로봇 이름과 판정이 들어가므로 특정 로봇 것만 디스�
   <cnt-verdict>?fu=1&ty=4&lbl=siteA_AMR_1
 """
 
+import math
 import os
 import time
 from typing import List, Optional, Sequence
@@ -64,6 +65,28 @@ def onset_indices(scores: Sequence[float], threshold: float,
     return hits
 
 
+def _pose_at(poses, i) -> Optional[dict]:
+    """
+    윈도우 i 의 좌표. 쓸 수 없는 값이면 None 을 준다.
+
+    pose_of 는 좌표가 비어 있을 때 NaN 을 돌려준다. NaN 을 그대로 실으면
+    json.dumps 가 표준이 아닌 NaN 토큰을 써서, 구독해 받는 쪽 JSON 파서가
+    깨진다. 그래서 유한한 값일 때만 싣는다.
+    """
+    if poses is None or i >= len(poses):
+        return None
+
+    try:
+        x, y = float(poses[i][0]), float(poses[i][1])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+    if not (math.isfinite(x) and math.isfinite(y)):
+        return None
+
+    return {"x": round(x, 3), "y": round(y, 3), "basis": "window_mean"}
+
+
 def publish(node_name: str,
             cnt_path: str,
             origin: str,
@@ -72,13 +95,18 @@ def publish(node_name: str,
             threshold: float,
             round_num: int,
             cts=None,
+            poses=None,
             model_uri: Optional[str] = None,
             k: Optional[int] = None) -> int:
     """
     로봇별로 판정을 내고 CIN 으로 올린다. 올린 건수를 돌려준다.
 
-    scores/robots/cts 는 같은 길이의 윈도우 단위 배열이다. 로봇마다 따로
+    scores/robots/cts/poses 는 같은 길이의 윈도우 단위 배열이다. 로봇마다 따로
     끊어서 보기 때문에, 한 로봇의 이상이 다른 로봇의 연속 판정에 섞이지 않는다.
+
+    poses 는 (N, 2) 의 (x, y) 다. 윈도우 하나가 주행 구간을 덮으므로 그
+    구간 샘플들의 평균 위치이고, 한 점으로 특정된 좌표가 아니다. 받는 쪽이
+    오해하지 않도록 CIN 에 basis="window_mean" 을 같이 적는다.
     """
     if threshold is None or not len(scores):
         return 0
@@ -109,6 +137,7 @@ def publish(node_name: str,
                 "window_index": i,
                 "observed_at": (str(cts[i]) if cts is not None
                                 and i < len(cts) else None),
+                "pose": _pose_at(poses, i),
                 "round": round_num,
                 "model": model_uri,
                 "timestamp": time.time(),

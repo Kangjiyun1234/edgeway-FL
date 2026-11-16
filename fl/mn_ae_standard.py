@@ -978,8 +978,17 @@ class MNAETrainer:
         cts = got.get("ct")
         if cts is not None and len(cts) == len(mv):
             cts = cts[mv] if mv.any() else cts
+
+        # 판정 CIN 에 "바닥 이상 위치"를 싣기 위해 윈도우별 좌표도 남긴다.
+        # pose_of 가 윈도우 안 샘플의 평균 (x, y) 로 만들어 둔 값이다.
+        # 정지 구간을 걸러낸 mv 마스크를 다른 배열과 똑같이 적용해야
+        # 인덱스가 어긋나 엉뚱한 로봇의 좌표가 붙지 않는다.
+        poses = got.get("pose")
+        if poses is not None and len(poses) == len(mv):
+            poses = poses[mv] if mv.any() else poses
+
         self.last_windows = {
-            "X": Xn, "C": C, "robot": robot, "ct": cts,
+            "X": Xn, "C": C, "robot": robot, "ct": cts, "pose": poses,
             # 대시보드가 이상 구간을 표시할 때 쓴다.
             # 이상 주입을 끈 실험에서는 전부 0 이다.
             "labels": (names != "normal").astype(np.int64),
@@ -1473,6 +1482,7 @@ class MNAETrainer:
                 threshold=threshold,
                 round_num=round_num,
                 cts=w["ct"],
+                poses=w.get("pose"),
                 model_uri=model_uri,
             )
         except Exception as e:
