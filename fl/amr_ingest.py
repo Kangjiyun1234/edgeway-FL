@@ -185,8 +185,22 @@ def fetch_new_windows(container_path: str,
     if not uril:
         return _empty()
 
+    # 오래된 쪽부터 limit 개를 집는다.
+    #
+    # 전에는 uril[-limit:] 로 '최신 limit 개'를 집었다. uril 은 오래된
+    # 것부터 오므로 그러면 앞쪽(오래된) 구간을 건너뛴다. 게다가 커서는
+    # 집은 것들의 max_ct 로 점프하므로, 건너뛴 구간은 영영 못 받는다.
+    #
+    # 실측: siteA 의 telemetry 에 윈도우가 418개 있었는데 mn1 은 238개만
+    # 가져갔다. 180개가 이렇게 사라졌고, 그래서 라운드 5에서 50개를 못
+    # 채우고 멈췄다.
+    #
+    # 앞에서부터 집으면 커서가 조금씩만 전진하고 나머지는 다음 조회에
+    # 그대로 남는다. 버려지는 것이 없다.
+    #
+    # (fetch_latest_windows 는 '최근 N개'가 목적이라 [-limit:] 이 맞다.)
     cins = []
-    for u in uril[-limit:]:
+    for u in uril[:limit]:
         res = om2m.get_resource(u.lstrip("/"))
         if res and "m2m:cin" in res:
             cins.append(res)
