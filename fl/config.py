@@ -90,7 +90,7 @@ NODE_DATA_FILES = {
 
 # 사업장 이름과 로봇 대수 (prepare_data_amr.py 와 일치해야 한다)
 SITE_OF_NODE = {"mn1": "siteA", "mn2": "siteB", "mn3": "siteC"}
-ROBOTS_PER_NODE = {"mn1": 4, "mn2": 2, "mn3": 4}
+ROBOTS_PER_NODE = {"mn1": 4, "mn2": 2, "mn3": 2}
 
 # Isaac Sim이 로봇 AE 아래에 만드는 컨테이너 이름.
 # 센서 데이터는 MN-AE가 아니라 로봇 AE 아래에 쌓인다.

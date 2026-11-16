@@ -349,86 +349,127 @@ class INAECoordinator:
     # ACP 검증
     # -----------------------
     def _verify_acp(self):
-        """시작 시 ACP 접근 제어 검증 로그 출력"""
+        """
+        ACP가 의도대로 걸렸는지 점검한다.
+
+        리소스마다 사는 CSE가 다르다. IN-AE의 제어·모델·드롭박스는 클라우드
+        IN-CSE에, MN-AE의 캐시는 각 사업장 MN-CSE에 있다. 그래서 점검할 때마다
+        해당 CSE로 바인딩을 옮긴다. 끝나면 IN-CSE로 되돌린다.
+
+        404(리소스 없음)와 403(접근 거부)은 다른 문제다. 전자는 설정이 덜 된
+        것이고 후자가 정책 문제다. 섞어서 보고하면 진단이 안 된다.
+        """
         print("\n=== ACP 접근 제어 검증 ===")
-        cse = om2m.cse_name()
-        cin = {"m2m:cin": {"con": "acp-verify-test"}}
 
-        def check(method, path, origin, data=None, expect_ok=True):
-            h = {
-                "X-M2M-RI":     f"acp-verify-{time.time_ns()}",
-                "X-M2M-RVI":    "2a",
-                "X-M2M-Origin": origin,
-                "Content-Type": "application/json;ty=4",
-            }
-            url = f"{om2m.base_url()}/{path}"
+        in_cse = config.in_endpoint()[1]
+
+        def bind(node=None):
+            """node가 None이면 IN-CSE, 아니면 그 사업장 MN-CSE로."""
+            if node is None:
+                om2m.set_endpoint(*config.in_endpoint())
+                return in_cse
+            base, cse = config.mn_endpoint(node)
+            om2m.set_endpoint(base, cse)
+            return cse
+
+        def probe(path, origin, node=None):
+            """
+            RETRIEVE 한 번. (status_code, 본문 일부)를 돌려준다.
+
+            헤더는 om2m._headers()를 쓴다. 직접 만들면 Content-Type 같은 것이
+            어긋나고, 그러면 ACP가 아니라 요청 형식 때문에 실패한다.
+            """
+            bind(node)
+            h = om2m._headers()
+            h["X-M2M-Origin"] = origin
+            # 이 점검은 원래 RVI 2a 로 보냈다. IN-AE 가 srv=["2a","3"] 으로
+            # 등록돼 있어 둘 다 유효하다. 바꿀 이유가 없으므로 그대로 둔다.
+            h["X-M2M-RVI"] = "2a"
+            url = om2m._url(path)
             try:
-                r = om2m._request_with_retry(
-                    method, url, headers=h, json=data, timeout=5)
-                blocked = "no privilege" in r.text or r.status_code == 403
-                allowed = r.status_code in [200, 201]
-                short_path = path.replace(f"{cse}/", "")
-
-                if expect_ok:
-                    ok = allowed
-                    label = "✓ 허용" if ok else "✗ 차단됨(버그)"
-                else:
-                    ok = blocked
-                    label = "✓ 차단" if ok else "✗ 허용됨(버그)"
-
-                print(f"    {label}  [{method.upper():4s}] {short_path}  (Origin={origin})")
+                r = om2m._request_with_retry("get", url, headers=h, timeout=5)
+                return r.status_code, r.text[:120]
             except Exception as e:
-                print(f"    ✗ 오류: {e}")
+                return None, f"{type(e).__name__}: {e}"
 
-        # 1. acpi 필드 확인
+        def check(label, path, origin, expect_allow, node=None):
+            code, body = probe(path, origin, node)
+            short = path.split("/", 1)[-1]
+
+            if code is None:
+                print(f"    ⚠ 확인 못함  {short}  (Origin={origin})  {body}")
+                return
+            if code == 404:
+                # 정책이 아니라 리소스가 없는 것이다. 버그로 보고하지 않는다.
+                print(f"    ⚠ 리소스 없음  {short}  (Origin={origin})")
+                return
+
+            allowed = code in (200, 201)
+            blocked = code == 403 or "no privilege" in body
+
+            if expect_allow:
+                mark = "✓ 허용" if allowed else f"✗ 차단됨(버그) HTTP {code}"
+            else:
+                mark = "✓ 차단" if blocked else f"✗ 허용됨(버그) HTTP {code}"
+            print(f"    {mark}  {short}  (Origin={origin})")
+
+        # ── [1] acpi 연결 확인 ──────────────────────────
         print("\n  [1] acpi 연결 확인")
-        check_paths = [
-            f"{cse}/{config.IN_AE_NAME}/cnt-fl-control",
-            f"{cse}/{config.IN_AE_NAME}/cnt-global-model",
-            f"{cse}/{config.IN_AE_NAME}/cnt-local-updates",
+        ae = config.IN_AE_NAME
+
+        in_paths = [
+            (f"{in_cse}/{ae}/cnt-fl-control", None),
+            (f"{in_cse}/{ae}/cnt-global-model", None),
+            (f"{in_cse}/{ae}/cnt-local-updates", None),
         ]
-        for i in range(1, config.NUM_CLIENTS + 1):
-            check_paths += [
-                f"{cse}/MN-AE-{i}/cnt-sensor-data",
-                f"{cse}/MN-AE-{i}/cnt-local-model",
-                f"{cse}/{config.IN_AE_NAME}/cnt-local-updates/cnt-mn{i}",
-            ]
-        h_admin = config.HEADERS.copy()
-        for path in check_paths:
-            r = om2m._request_with_retry(
-                "get", f"{om2m.base_url()}/{path}",
-                headers=h_admin, timeout=5)
-            if r.status_code == 200:
-                acpi = r.json().get("m2m:cnt", {}).get("acpi", [])
-                short = path.replace(f"{cse}/", "")
-                status = "✓" if acpi else "⚠ acpi 없음"
-                print(f"    {status}  {short}  acpi={acpi}")
+        for i, node in enumerate(config.ALL_NODES, start=1):
+            in_paths.append((f"{in_cse}/{ae}/cnt-local-updates/cnt-{node}", None))
+            mn_cse = config.mn_endpoint(node)[1]
+            in_paths.append((f"{mn_cse}/MN-AE-{i}/cnt-local-model", node))
+            in_paths.append((f"{mn_cse}/MN-AE-{i}/cnt-net-status", node))
 
-        # 2. 차단 케이스
+        for path, node in in_paths:
+            bind(node)
+            res = om2m.get_resource(path)
+            short = path.split("/", 1)[-1]
+            if res is None:
+                print(f"    ⚠ 없음  {short}")
+                continue
+            acpi = res.get("m2m:cnt", {}).get("acpi", [])
+            print(f"    {'✓' if acpi else '⚠ acpi 없음'}  {short}  acpi={acpi}")
+
+        # ── [2] 차단돼야 하는 접근 ──────────────────────
+        # 한 사업장이 다른 사업장의 것을 들여다보려는 시도.
         print("\n  [2] 차단돼야 하는 접근")
-        check("get",  f"{cse}/MN-AE-2/cnt-sensor-data",                "CMN-AE-1", expect_ok=False)
-        check("get",  f"{cse}/{config.IN_AE_NAME}/cnt-local-updates/cnt-mn2", "CMN-AE-1", data=cin, expect_ok=False)
-        # cnt-fl-control에 POST 테스트 CIN을 만들면 ACP 오설정 시 실제
-        # FL command 알림으로 전파될 수 있으므로 여기서는 수행하지 않음.
-        check("get",  f"{cse}/MN-AE-1/cnt-local-model",                "CMN-AE-2", expect_ok=False)
-        check("get",  f"{cse}/{config.IN_AE_NAME}/cnt-local-updates/cnt-mn1", "CMN-AE-3", data=cin, expect_ok=False)
-        check("get",  f"{cse}/{config.IN_AE_NAME}/cnt-local-updates/cnt-mn1", "CMN-AE-1", data=cin, expect_ok=False)
+        mn_a = config.mn_endpoint("mn1")[1]
+        mn_b = config.mn_endpoint("mn2")[1]
 
-        # 3. 허용 케이스
+        # 원래 MN-AE-2/cnt-sensor-data 를 봤는데 그 컨테이너는 없어졌다.
+        # 텔레메트리가 로봇 AE 아래로 갔고 거기엔 우리 ACP 가 없다.
+        # 같은 의도(남의 사업장 것은 못 본다)를 cnt-net-status 로 확인한다.
+        check("", f"{mn_b}/MN-AE-2/cnt-net-status", "CMN-AE-1", False, "mn2")
+        check("", f"{in_cse}/{ae}/cnt-local-updates/cnt-mn2", "CMN-AE-1", False)
+        check("", f"{mn_a}/MN-AE-1/cnt-local-model", "CMN-AE-2", False, "mn1")
+        check("", f"{in_cse}/{ae}/cnt-local-updates/cnt-mn1", "CMN-AE-3", False)
+        check("", f"{in_cse}/{ae}/cnt-local-updates/cnt-mn1", "CMN-AE-1", False)
+
+        # ── [3] 허용돼야 하는 접근 ──────────────────────
         print("\n  [3] 허용돼야 하는 접근")
-        check("get",  f"{cse}/{config.IN_AE_NAME}/cnt-fl-control",     "CMN-AE-1", expect_ok=True)
-        check("get",  f"{cse}/{config.IN_AE_NAME}/cnt-global-model",   "CMN-AE-2", expect_ok=True)
-        check("get",  f"{cse}/MN-AE-3/cnt-sensor-data",                "CMN-AE-3", expect_ok=True)
-        check("get",  f"{cse}/MN-AE-3/cnt-local-model",                "CMN-AE-3", data=cin, expect_ok=True)
-        # 실제 cnt-fl-control에 테스트 CIN을 만들면 MN-AE에 불필요한
-        # NOTIFY가 발생하므로 허용 검증은 RETRIEVE로만 수행함.
-        check("get",  f"{cse}/{config.IN_AE_NAME}/cnt-fl-control",     "CIN-AE",   expect_ok=True)
-        check("get",  f"{cse}/{config.IN_AE_NAME}/cnt-local-updates/cnt-mn1", "CIN-AE", expect_ok=True)
+        mn_c = config.mn_endpoint("mn3")[1]
+
+        check("", f"{in_cse}/{ae}/cnt-fl-control", "CMN-AE-1", True)
+        check("", f"{in_cse}/{ae}/cnt-global-model", "CMN-AE-2", True)
+        # 원래 MN-AE-3/cnt-sensor-data 자리. 위와 같은 이유로 옮긴다.
+        check("", f"{mn_c}/MN-AE-3/cnt-net-status", "CMN-AE-3", True, "mn3")
+        check("", f"{mn_c}/MN-AE-3/cnt-local-model", "CMN-AE-3", True, "mn3")
+        check("", f"{in_cse}/{ae}/cnt-fl-control", "CIN-AE", True)
+        check("", f"{in_cse}/{ae}/cnt-local-updates/cnt-mn1", "CIN-AE", True)
+
+        # 점검이 끝나면 반드시 IN-CSE로 되돌린다.
+        # 여기서 빠뜨리면 이후 라운드 명령이 엉뚱한 CSE로 간다.
+        bind(None)
         print()
 
-    # -----------------------
-    # oneM2M resource prep
-    # -----------------------
     @staticmethod
     def _read_acpi(path: str) -> list:
         res = om2m.get_resource(path)

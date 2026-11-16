@@ -281,7 +281,7 @@ def fetch_round_windows(
     """
     한 라운드분 CIN을 모아 학습 입력으로 만든다.
 
-    container_path: 보통 "{CSE}/MN-AE-n/cnt-sensor-data"
+    container_path: 보통 "{MN-CSE}/{로봇 AE}/telemetry"
     반환 dict:
         signals (N, C, T) / cond (N, D) / robot / pose / cond_name / n_raw
 

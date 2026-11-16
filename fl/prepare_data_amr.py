@@ -68,7 +68,7 @@ ANOMALY_NAV = {"over_bump"}          # 평가 정답으로 쓸 nav
 NODES = ["mn1", "mn2", "mn3"]
 SITE_OF_NODE = {"mn1": "siteA", "mn2": "siteB", "mn3": "siteC"}
 NODE_OF_SITE = {v: k for k, v in SITE_OF_NODE.items()}
-EXPECTED_ROBOTS = {"mn1": 4, "mn2": 2, "mn3": 4}
+EXPECTED_ROBOTS = {"mn1": 4, "mn2": 2, "mn3": 2}
 
 VAL_RATIO = float(os.getenv("AMR_VAL_RATIO", "0.2"))
 
