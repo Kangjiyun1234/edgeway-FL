@@ -56,6 +56,34 @@ reset_previous_run() {
   echo
   echo "[0/5] 지난 실행 정리"
 
+  # 포트를 잡고 있는 지난 실행을 먼저 내린다.
+  # 이걸 안 하면 7000(대시보드) 6000(IN-AE) 5001-5003(MN-AE) 이
+  # 전부 "Address already in use" 로 bind 실패한다. 그러면 대시보드는
+  # 뜨지 않고, MN-AE 는 구독은 걸지만 알림 받을 서버가 없어 폴링만
+  # 하며, 옛 프로세스가 살아 있는 채로 같은 드롭박스에 같이 올려
+  # 라운드가 어긋난다.
+  #
+  # 우리가 띄운 것만 이름으로 지목해 죽인다. 이 스크립트가 띄울
+  # 자식들은 아직 없으므로 자기 자신을 죽이지 않는다.
+  local killed=0
+  for pat in "fl/dashboard_server.py" "fl/in_ae_standard.py" "fl/mn_ae_standard.py"
+  do
+    if pkill -TERM -f "$pat" 2>/dev/null; then
+      killed=1
+    fi
+  done
+
+  if [ "$killed" = "1" ]; then
+    sleep 2
+    for pat in "fl/dashboard_server.py" "fl/in_ae_standard.py" "fl/mn_ae_standard.py"
+    do
+      pkill -KILL -f "$pat" 2>/dev/null || true
+    done
+    echo "  ✓ 지난 실행 프로세스 종료"
+  else
+    echo "  ✓ 남아 있는 프로세스 없음"
+  fi
+
   rm -rf "${base}/global" "${base}/local" "${base}/cache"
   mkdir -p "${base}/global" "${base}/local" "${base}/cache"
 
