@@ -84,6 +84,10 @@ class MNAETrainer:
         # 로봇별로 어디까지 읽었는지. 라운드마다 그 뒤만 읽는다.
         # 비워 두면 첫 라운드는 최근 분량을 받는다.
         self.telemetry_cursor = {}
+
+        # 이번 수집에서 읽은 지점. 데이터가 쓸 만한지 확인한 뒤에
+        # telemetry_cursor 로 옮긴다.
+        self._pending_cursor = None
         self.telemetry_paths = [
             f"{mn_cse}/{rb}/{config.ROBOT_TELEMETRY_CNT}"
             for rb in self.robot_names
@@ -634,7 +638,78 @@ class MNAETrainer:
 
             time.sleep(poll)
 
-    def _load_sensor_data_for_round(self, round_num: int, max_attempts: int = 3):
+    def _load_sensor_data_for_round(self, round_num: int,
+                                    max_attempts: int = 3):
+        """
+        이 라운드에 쓸 데이터를 만든다. 쓸 만해질 때까지 기다린다.
+
+        [왜 기다리나]
+        예전에는 정상 주행 구간이 없으면 이 라운드를 통째로 건너뛰었다.
+        건너뛴 노드는 아무것도 올리지 않고 다음 라운드로 가버리는데,
+        IN-AE 는 그 노드의 업로드를 기다리느라 수집 타임아웃(600초)을
+        통째로 버린다. 로그에서 mn1 이 Round 2 를 빠지자 IN-AE 가 (1/2)
+        에서 10분을 멈춰 있던 것이 이 때문이다.
+
+        빠질 일이 아니다. 로봇은 계속 돌고 있으니 조금 더 기다리면 정상
+        주행 구간이 생긴다. 다른 노드와 같은 라운드에 참여하는 것이 맞다.
+
+        [예산]
+        IN-AE 의 수집 타임아웃보다 먼저 끝나야 의미가 있다. 기본값은
+        FL_COLLECTION_NOTIFY_TIMEOUT 에서 60초를 뺀 값이고,
+        FL_SENSOR_ROUND_MAX_WAIT_SEC 로 따로 줄 수 있다.
+        그 안에 끝내 못 만들면 그때는 어쩔 수 없이 SKIP_ROUND 다.
+        """
+        in_timeout = float(os.getenv("FL_COLLECTION_NOTIFY_TIMEOUT", "600"))
+        budget = float(os.getenv(
+            "FL_SENSOR_ROUND_MAX_WAIT_SEC",
+            str(max(60.0, in_timeout - 60.0))))
+        poll = float(os.getenv("FL_SENSOR_ROUND_POLL_SEC", "2.0"))
+
+        deadline = time.time() + budget
+        attempt = 0
+        next_log = 0.0
+
+        while True:
+            attempt += 1
+            data = self._collect_round_data_once(
+                round_num, hard_deadline=deadline)
+
+            if data is None:
+                # 텔레메트리가 아예 비었다. 기다려서 될 일이 아니다.
+                return None
+
+            if data is not SKIP_ROUND:
+                # 여기까지 와야 읽은 지점을 확정한다.
+                if self._pending_cursor is not None:
+                    self.telemetry_cursor = self._pending_cursor
+                return data
+
+            left = deadline - time.time()
+            if left <= 0:
+                print(f"    ✗ {budget:.0f}초 동안 학습할 수 있는 구간이 "
+                      f"생기지 않았다 (시도 {attempt}회).")
+                print(f"      로봇이 주행 중인지 확인하라. "
+                      f"이번 라운드는 빠진다.")
+                return SKIP_ROUND
+
+            now = time.time()
+            if now >= next_log:
+                print(f"    ⏳ 쓸 수 있는 구간이 없다. 라운드를 빠지지 않고 "
+                      f"기다린다 (시도 {attempt}회, 남은 {left:.0f}s)")
+                next_log = now + 15.0
+
+            # 새 텔레메트리가 올 때까지 기다렸다 다시 본다.
+            # 커서를 안 밀었으므로 다음 시도에는 지금 것 + 새로 온 것을
+            # 같이 받는다. 기다릴수록 양이 늘어난다.
+            if self.telemetry_subs:
+                self.data_event.wait(timeout=poll)
+                self.data_event.clear()
+            else:
+                time.sleep(poll)
+
+    def _collect_round_data_once(self, round_num: int,
+                                 hard_deadline: float = None):
+        """수집 1회 시도. 쓸 데이터를 못 만들면 SKIP_ROUND 를 준다."""
         """
         이번 라운드에 학습할 윈도우를 모은다.
 
@@ -682,6 +757,8 @@ class MNAETrainer:
         incremental = os.getenv("FL_SENSOR_INCREMENTAL", "1") != "0"
 
         deadline = time.time() + wait_total
+        if hard_deadline is not None:
+            deadline = min(deadline, hard_deadline)
         next_log = 0.0
         cursors = dict(self.telemetry_cursor)
 
@@ -703,7 +780,7 @@ class MNAETrainer:
                     print(f"    ⊘ 지난 라운드 이후 새 윈도우가 없다.")
                     print(f"      로봇이 주행 중인지, 라운드 간격이 너무 "
                           f"짧지 않은지 확인하라.")
-                    return SKIP_ROUND
+                    return SKIP_ROUND   # 바깥에서 다시 기다린다
                 if n == 0:
                     print(f"    ✗ {site} 로봇 텔레메트리가 비어 있다.")
                     print(f"      확인: {len(self.telemetry_paths)}개 컨테이너 "
@@ -728,10 +805,11 @@ class MNAETrainer:
             else:
                 time.sleep(poll)
 
-        # 쓰기로 한 데이터까지만 커서를 민다. 실패한 라운드의 데이터를
-        # 건너뛰지 않기 위해, 여기까지 온 뒤에 갱신한다.
-        if incremental:
-            self.telemetry_cursor = cursors
+        # 커서를 여기서 밀면 안 된다. 받은 윈도우가 전부 정지 구간이라
+        # 학습에 못 쓰는 경우가 있는데, 그때 커서를 밀어버리면 그 윈도우들이
+        # 영영 사라져서 다시 받아도 양이 늘지 않는다. 쓸 만하다고 확인된
+        # 뒤에 바깥에서 민다.
+        self._pending_cursor = cursors if incremental else None
 
         # 사업장 단위로 고르게 줄인다.
         if site_cap > 0 and len(got["signals"]) > site_cap:
