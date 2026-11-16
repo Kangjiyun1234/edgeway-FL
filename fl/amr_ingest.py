@@ -200,6 +200,39 @@ def fetch_new_windows(container_path: str,
     return got
 
 
+def merge_windows(acc: Optional[Dict[str, np.ndarray]],
+                  new: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """
+    라운드 중 여러 번에 걸쳐 받은 윈도우를 이어 붙인다.
+
+    [왜 필요한가]
+    로봇의 telemetry 컨테이너에는 mni(최대 보관 수)가 걸려 있다. Isaac Sim
+    쪽이 만든 컨테이너라 우리가 정하지 않는다. 새 CIN 이 들어오면 가장
+    오래된 것이 지워진다.
+
+    그래서 "50개 모일 때까지 기다렸다가 한 번에 긁는다"가 성립하지 않는다.
+    같은 커서로 다시 조회하면 그 사이 지워진 만큼 빠져서, 총량이
+    로봇 수 × mni 를 절대 못 넘는다. 로봇 4대 사업장은 57개로 50을
+    넘겼는데 2대 사업장이 31/33 에서 얼어붙었던 것이 이것이다.
+
+    받을 때마다 여기에 쌓고 커서를 전진시키면, 지워지기 전에 챙긴 것이
+    버퍼에 남는다.
+    """
+    if acc is None or not len(acc.get("signals", [])):
+        return new
+    if new is None or not len(new.get("signals", [])):
+        return acc
+
+    out = {
+        k: np.concatenate([acc[k], new[k]])
+        for k in ("signals", "cond", "robot", "pose",
+                  "cond_name", "nav", "ct")
+    }
+    out["max_ct"] = max(acc.get("max_ct", ""), new.get("max_ct", ""))
+    out["n_raw"] = int(acc.get("n_raw", 0)) + int(new.get("n_raw", 0))
+    return out
+
+
 def fetch_site_windows_since(container_paths: List[str],
                              cursors: Dict[str, str],
                              limit_per_robot: int = 300) -> tuple:

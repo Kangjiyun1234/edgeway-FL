@@ -85,9 +85,10 @@ class MNAETrainer:
         # 비워 두면 첫 라운드는 최근 분량을 받는다.
         self.telemetry_cursor = {}
 
-        # 이번 수집에서 읽은 지점. 데이터가 쓸 만한지 확인한 뒤에
-        # telemetry_cursor 로 옮긴다.
-        self._pending_cursor = None
+        # 이번 라운드에 모은 윈도우. telemetry 컨테이너의 mni 때문에
+        # 한 번에 다 긁을 수 없어서, 받을 때마다 여기에 쌓는다.
+        self._round_buffer = None
+        self._round_buffer_round = None
         self.telemetry_paths = [
             f"{mn_cse}/{rb}/{config.ROBOT_TELEMETRY_CNT}"
             for rb in self.robot_names
@@ -713,9 +714,8 @@ class MNAETrainer:
                 return None
 
             if data is not SKIP_ROUND:
-                # 여기까지 와야 읽은 지점을 확정한다.
-                if self._pending_cursor is not None:
-                    self.telemetry_cursor = self._pending_cursor
+                # 이 라운드에 쓸 데이터가 정해졌다. 버퍼를 비운다.
+                self._round_buffer = None
                 return data
 
             left = deadline - time.time()
@@ -799,12 +799,26 @@ class MNAETrainer:
         if hard_deadline is not None:
             deadline = min(deadline, hard_deadline)
         next_log = 0.0
-        cursors = dict(self.telemetry_cursor)
+
+        # 라운드가 바뀌면 버퍼를 비운다. 같은 라운드 안에서 재시도할 때는
+        # 그대로 두어, 이미 챙긴 윈도우를 다시 받지 않아도 되게 한다.
+        if self._round_buffer_round != round_num:
+            self._round_buffer = None
+            self._round_buffer_round = round_num
 
         while True:
             if incremental:
-                got, cursors = amr_ingest.fetch_site_windows_since(
+                fresh, cursors = amr_ingest.fetch_site_windows_since(
                     self.telemetry_paths, self.telemetry_cursor, per_robot)
+
+                # 받은 즉시 커서를 민다. 안 밀면 다음 조회가 같은 구간을
+                # 다시 받는데, telemetry 컨테이너는 mni 때문에 그 사이
+                # 오래된 CIN 을 지운다. 그래서 총량이 로봇 수 × mni 에서
+                # 멈춘다. 지워지기 전에 챙겨 버퍼에 쌓는 것이 맞다.
+                self.telemetry_cursor = cursors
+                self._round_buffer = amr_ingest.merge_windows(
+                    self._round_buffer, fresh)
+                got = self._round_buffer
             else:
                 got = amr_ingest.fetch_site_windows(
                     self.telemetry_paths, per_robot)
@@ -844,11 +858,9 @@ class MNAETrainer:
             else:
                 time.sleep(poll)
 
-        # 커서를 여기서 밀면 안 된다. 받은 윈도우가 전부 정지 구간이라
-        # 학습에 못 쓰는 경우가 있는데, 그때 커서를 밀어버리면 그 윈도우들이
-        # 영영 사라져서 다시 받아도 양이 늘지 않는다. 쓸 만하다고 확인된
-        # 뒤에 바깥에서 민다.
-        self._pending_cursor = cursors if incremental else None
+        # 커서는 위 루프에서 받을 때마다 이미 밀었다.
+        # 받은 윈도우가 쓸 수 없는 것이어도 버퍼에 남아 있으므로,
+        # 재시도할 때 다시 받을 필요가 없다.
 
         # 사업장 단위로 고르게 줄인다.
         if site_cap > 0 and len(got["signals"]) > site_cap:
