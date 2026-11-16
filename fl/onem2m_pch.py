@@ -261,6 +261,11 @@ class PchReceiver(threading.Thread):
         self._stop = threading.Event()
         self.received = 0
         self.errors = 0
+        self.respond_errors = 0
+        # 이미 처리한 rqi. 같은 알림이 다시 내려오는지 판별한다.
+        # 처리 자체는 멱등이라 막지 않고, 보이게만 한다.
+        self._seen_rqi: set[str] = set()
+        self.duplicates = 0
 
     def stop(self) -> None:
         self._stop.set()
@@ -291,13 +296,25 @@ class PchReceiver(threading.Thread):
             }
         }
         try:
-            om2m._request_with_retry(
+            r = om2m._request_with_retry(
                 "post", om2m._url(self.pcu_path),
                 json=rsp, headers=om2m._headers(body=True, origin=self.origin),
                 timeout=10,
             )
         except Exception as e:
+            self.respond_errors += 1
             print(f"  ⚠ [{self.origin}] 응답 프리미티브 전송 실패: {e}")
+            return
+
+        # 상태 코드를 반드시 본다. 전에는 예외만 잡고 넘겨서, CSE 가 응답을
+        # 거절해도 우리는 몰랐다. CSE 입장에서는 그 알림이 미결로 남아
+        # 같은 알림을 다시 내려보낸다. 중복 알림의 원인이 된다.
+        #   ACME: PCH_PCU.handleNotifyRequest()
+        #         m2m:rsp 가 없거나 검증에 실패하면 BAD_REQUEST
+        if r.status_code not in (200, 201, 204):
+            self.respond_errors += 1
+            print(f"  ⚠ [{self.origin}] 응답 프리미티브 거절됨 "
+                  f"{r.status_code}: {r.text[:200]}")
 
     def _handle(self, body: dict) -> None:
         rqp = body.get("m2m:rqp") or {}
@@ -307,6 +324,16 @@ class PchReceiver(threading.Thread):
             return
 
         self.received += 1
+
+        rqi = str(rqp.get("rqi") or "")
+        if rqi and rqi in self._seen_rqi:
+            self.duplicates += 1
+            print(f"  ⚠ [{self.origin}] 같은 알림이 다시 왔다 "
+                  f"(rqi={rqi}, 누적 {self.duplicates}건). "
+                  f"직전 응답이 CSE 에 닿지 않았다는 뜻이다.")
+        elif rqi:
+            self._seen_rqi.add(rqi)
+
         try:
             self.handler(pc)
         except Exception as e:
@@ -352,7 +379,8 @@ class PchReceiver(threading.Thread):
             time.sleep(PCH_BACKOFF_SEC)
 
         print(f"  [{self.origin}] pollingChannel 수신 종료 "
-              f"(받은 알림 {self.received}개, 오류 {self.errors}회)")
+              f"(받은 알림 {self.received}개, 중복 {self.duplicates}건, "
+              f"응답 거절 {self.respond_errors}건, 폴링 오류 {self.errors}회)")
 
 
 def notification_target(ae_id: str) -> str:
