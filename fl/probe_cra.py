@@ -44,6 +44,21 @@ last = om2m.get_latest_content_instance(path)
 cursor = ((last or {}).get("m2m:cin") or {}).get("ct")
 print(f"  커서로 쓸 ct = {cursor}")
 
+# 컨테이너가 없거나 비어 있으면 아래 조회는 전부 0 이 된다.
+# 그걸 "cra 가 안 듣는다" 로 읽으면 엉뚱한 곳을 고치게 된다.
+if not cnt:
+    print("\n  ✗ telemetry 컨테이너를 읽지 못했다.")
+    print("    로봇 AE 가 없거나 시나리오가 내려갔다.")
+    print("    Isaac Sim 을 켜고 다시 돌려라. 지금은 판정할 수 없다.")
+    sys.exit(1)
+
+if not cursor:
+    print("\n  ✗ 컨테이너에 CIN 이 하나도 없다 (cni="
+          f"{cnt.get('cni')}).")
+    print("    Isaac Sim 이 아직 발행을 안 하고 있다.")
+    print("    발행이 시작된 뒤에 다시 돌려라. 지금은 판정할 수 없다.")
+    sys.exit(1)
+
 print("\n  10초 기다려 새 CIN 을 쌓는다 ...")
 time.sleep(10)
 

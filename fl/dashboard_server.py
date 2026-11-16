@@ -877,6 +877,16 @@ def _reload_scores_if_needed() -> None:
     if not new_scores:
         # 아무 노드도 점수를 못 줬다. 기존 패널을 지우지 말고 그대로 두고,
         # scores_round 도 올리지 않아 다음 tick 에 다시 시도한다.
+        #
+        # 다만 모델을 읽은 사실은 여기서 기록해야 한다. 안 하면
+        # has_new_model 이 계속 참이라, 점수가 빈 동안 매 tick 마다
+        # 213KB 글로벌 모델을 CSE 에서 내려받아 gzip+base64 를 풀고
+        # torch 로 적재한다. 그 CPU 때문에 Flask 가 요청을 못 받아
+        # 대시보드가 "Connecting..." 에서 멈춘다.
+        if model is not None:
+            with _shared_lock:
+                _shared["model_round"] = model_round
+
         print(
             "  ⚠ [Scores] 읽을 점수가 없다 "
             "(PKL 없음 + 드롭박스 비어 있음). 기존 값 유지."
