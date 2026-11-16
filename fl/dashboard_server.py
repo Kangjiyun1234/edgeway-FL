@@ -186,6 +186,10 @@ _shared: dict = {
     # 현재 Dashboard가 반영한 global model round
     "model_round": -1,
 
+    # CSE 드롭박스 점수를 반영한 FL round.
+    # 글로벌 모델 없이도 라운드마다 패널을 갱신하기 위한 표식이다.
+    "scores_round": -1,
+
     "summary_sent": False,
 
     "anomaly_start_round": ANOMALY_START_ROUND,
@@ -650,6 +654,52 @@ def _compute_threshold(
 # 글로벌 모델 변경 시 score 재계산
 # ════════════════════════════════════════════════════════
 
+def _node_scores_from_cse(node: str):
+    """
+    드롭박스 CIN 에서 노드의 윈도우별 점수를 읽는다.
+
+    MN-AE 가 라운드마다 window_scores / window_labels / threshold 를
+    업로드한다. CSE 모드에는 PKL 파일이 없으므로 이쪽을 쓴다.
+
+    반환: (scores, labels, threshold) 또는 None
+    """
+    path = om2m.in_path(
+        f"{config.IN_AE_NAME}/cnt-local-updates/cnt-{node}"
+    )
+
+    try:
+        content = _parse_content_instance(
+            om2m.get_latest_content_instance(path)
+        )
+    except Exception as error:
+        print(f"    ⚠ {node} 드롭박스 조회 실패: {error}")
+        return None
+
+    if not content:
+        return None
+
+    raw = content.get("window_scores")
+    if not raw:
+        return None
+
+    scores = np.asarray(raw, dtype=np.float32)
+
+    raw_labels = content.get("window_labels")
+    if raw_labels is not None and len(raw_labels) == len(scores):
+        labels = np.asarray(raw_labels, dtype=np.int64)
+    else:
+        # 이상 주입을 끈 실험에서는 라벨이 전부 정상이다.
+        labels = np.zeros(len(scores), dtype=np.int64)
+
+    threshold = content.get("threshold")
+    try:
+        threshold = float(threshold) if threshold is not None else None
+    except (TypeError, ValueError):
+        threshold = None
+
+    return scores, labels, threshold
+
+
 def _reload_scores_if_needed() -> None:
     """
     새로운 글로벌 모델이 생성되면:
@@ -673,27 +723,46 @@ def _reload_scores_if_needed() -> None:
         max_round=current_fl_round,
     )
 
-    if (
-        model_round <= current_model_round
-        or model_path is None
-    ):
-        return
+    with _shared_lock:
+        current_scores_round = _shared["scores_round"]
 
-    print(
-        "  [Scores] "
-        f"새 글로벌 모델 R{model_round} 감지"
+    has_new_model = (
+        model_round > current_model_round
+        and model_path is not None
     )
+    # 글로벌 모델이 아직 없어도(Round 1) MN-AE 가 올린 점수는 있다.
+    has_new_round = current_fl_round > current_scores_round
 
-    try:
-        model = _load_model(
-            model_path,
-        )
-    except Exception as error:
-        print(
-            "  ✗ 글로벌 모델 로드 실패: "
-            f"{error}"
-        )
+    if not has_new_model and not has_new_round:
         return
+
+    model = None
+
+    if has_new_model:
+        print(
+            "  [Scores] "
+            f"새 글로벌 모델 R{model_round} 감지"
+        )
+        try:
+            model = _load_model(
+                model_path,
+            )
+        except Exception as error:
+            print(
+                "  ✗ 글로벌 모델 로드 실패: "
+                f"{error}"
+            )
+            model = None
+
+    if model is None and not has_new_round:
+        return
+
+    if model is None:
+        print(
+            "  [Scores] "
+            f"R{current_fl_round} — 글로벌 모델 없이 "
+            "CSE 드롭박스 점수로 갱신"
+        )
 
     new_thresholds: dict[str, float] = {}
     new_scores: dict[str, np.ndarray] = {}
@@ -705,9 +774,35 @@ def _reload_scores_if_needed() -> None:
             / f"{node}.pkl"
         )
 
-        if not pkl_path.exists():
+        # PKL 로 직접 채점하려면 글로벌 모델이 있어야 한다.
+        if not pkl_path.exists() or model is None:
+            # CSE 모드. MN-AE 가 올린 점수를 그대로 쓴다.
+            from_cse = _node_scores_from_cse(node)
+
+            if from_cse is None:
+                print(
+                    f"  ⚠ {node}: PKL 도 CSE 점수도 없다 "
+                    f"({pkl_path.name})"
+                )
+                continue
+
+            cse_scores, cse_labels, cse_threshold = from_cse
+
+            if cse_threshold is None:
+                # 임계값을 못 받았으면 받은 점수로 임시 산출한다.
+                # 모델이 수렴하기 전 초반 라운드에서 생길 수 있다.
+                cse_threshold = float(
+                    cse_scores.mean()
+                    + config.THRESHOLD_N_SIGMA * cse_scores.std()
+                )
+
+            new_scores[node] = cse_scores
+            new_labels[node] = cse_labels
+            new_thresholds[node] = round(cse_threshold, 4)
+
             print(
-                f"  ⚠ PKL 파일 없음: {pkl_path}"
+                f"    {node}: n={len(cse_scores)}, "
+                f"threshold={cse_threshold:.4f} (CSE 드롭박스)"
             )
             continue
 
@@ -779,6 +874,15 @@ def _reload_scores_if_needed() -> None:
             f"threshold={threshold:.4f}"
         )
 
+    if not new_scores:
+        # 아무 노드도 점수를 못 줬다. 기존 패널을 지우지 말고 그대로 두고,
+        # scores_round 도 올리지 않아 다음 tick 에 다시 시도한다.
+        print(
+            "  ⚠ [Scores] 읽을 점수가 없다 "
+            "(PKL 없음 + 드롭박스 비어 있음). 기존 값 유지."
+        )
+        return
+
     with _shared_lock:
         # 핵심 수정:
         # 글로벌 모델이 바뀌더라도 기존 스트림 진행 위치를 유지한다.
@@ -797,9 +901,12 @@ def _reload_scores_if_needed() -> None:
             current_score_idx
         )
 
-        _shared["model_round"] = (
-            model_round
-        )
+        if model is not None:
+            _shared["model_round"] = (
+                model_round
+            )
+
+        _shared["scores_round"] = current_fl_round
 
         _shared["summary_sent"] = False
 

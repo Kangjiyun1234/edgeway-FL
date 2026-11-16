@@ -838,7 +838,12 @@ class MNAETrainer:
         cts = got.get("ct")
         if cts is not None and len(cts) == len(mv):
             cts = cts[mv] if mv.any() else cts
-        self.last_windows = {"X": Xn, "C": C, "robot": robot, "ct": cts}
+        self.last_windows = {
+            "X": Xn, "C": C, "robot": robot, "ct": cts,
+            # 대시보드가 이상 구간을 표시할 때 쓴다.
+            # 이상 주입을 끈 실험에서는 전부 0 이다.
+            "labels": (names != "normal").astype(np.int64),
+        }
 
         navs = got.get("nav")
         if navs is not None and len(navs) == len(mv):
@@ -1254,6 +1259,46 @@ class MNAETrainer:
     # ---------------------------
     # Drop-box upload
     # ---------------------------
+    def _window_scores_block(self) -> dict:
+        """
+        이번 라운드 윈도우들의 복원오차와 임계값.
+
+        대시보드는 원래 /tmp 의 PKL 파일을 읽어 직접 점수를 계산했다.
+        데이터 출처가 CSE(Isaac Sim 텔레메트리)로 바뀌면서 그 파일이
+        없어졌고, 노드 패널이 빈칸이 됐다. 이미 계산해 둔 점수를
+        드롭박스 CIN 에 같이 실어 보내면 대시보드는 그리기만 하면 된다.
+
+        판정(verdict)과 달리 FL_VERDICT 와 무관하게 항상 싣는다.
+        점수 계산이 실패해도 업로드는 계속돼야 하므로 빈 dict 를 준다.
+        """
+        w = getattr(self, "last_windows", None)
+        if not w or w.get("X") is None or len(w["X"]) == 0:
+            return {}
+
+        node = getattr(self, "edge_node", None)
+        if node is None:
+            return {}
+
+        try:
+            scores = node.compute_anomaly_scores(w["X"], w["C"])
+        except Exception as e:
+            print(f"    ⚠ 윈도우 점수 계산 실패(업로드는 계속): {e}")
+            return {}
+
+        thr = getattr(node, "threshold", None)
+        labels = w.get("labels")
+        robots = w.get("robot")
+
+        block = {
+            "window_scores": [round(float(v), 6) for v in scores],
+            "threshold": (float(thr) if thr is not None else None),
+        }
+        if labels is not None and len(labels) == len(scores):
+            block["window_labels"] = [int(v) for v in labels]
+        if robots is not None and len(robots) == len(scores):
+            block["window_robots"] = [str(v) for v in robots]
+        return block
+
     def _publish_verdicts(self, round_num: int,
                           model_uri: str = None) -> int:
         """
@@ -1330,6 +1375,9 @@ class MNAETrainer:
             "timestamp": time.time(),
         }
 
+        # 가중치는 안 올리지만 대시보드 그래프는 떠야 한다.
+        payload.update(self._window_scores_block())
+
         result = om2m.create_content_instance(
             self.dropbox_cnt_path,
             payload
@@ -1369,6 +1417,10 @@ class MNAETrainer:
             "num_samples": num_samples,
             "timestamp": time.time(),
         }
+
+        # 대시보드 그래프용 윈도우별 점수. 50 윈도우면 500 바이트 정도라
+        # 가중치 크기 제한(FL_MAX_CIN_BYTES)에 영향을 주지 않는다.
+        payload.update(self._window_scores_block())
 
         # 실제 가중치를 con 안에 실어 보낸다.
         # 이것이 있어야 MN을 다른 머신에 올려도 FL이 성립한다.

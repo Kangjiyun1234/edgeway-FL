@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>FL Bearing Fault Detection</title>
+<title>AMR 바닥 이상 점검 — 연합학습</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -292,7 +292,7 @@
 <div class="fault-banner" id="fault-banner">
   <span class="banner-icon">⚠</span>
   <div class="banner-main">
-    <div class="banner-title" id="banner-title">Bearing Fault Detected — mn3</div>
+    <div class="banner-title" id="banner-title">바닥 이상 감지 — 사업장 C</div>
     <div class="banner-detail" id="banner-detail">Anomaly confirmed</div>
   </div>
   <button class="banner-close" id="banner-close" title="닫기">✕</button>
@@ -320,8 +320,8 @@
   <!-- 헤더 -->
   <div class="topbar">
     <div>
-      <div class="logo-title">Bearing Fault Detection</div>
-      <div class="logo-sub">Federated Learning · oneM2M · Conv1DAE</div>
+      <div class="logo-title">AMR 바닥 이상 점검</div>
+      <div class="logo-sub">Federated Learning · oneM2M · ETSI MEC · CVAE1D</div>
     </div>
     <div class="round-pill">
       <div class="pill-dot" id="pill-dot"></div>
@@ -339,24 +339,24 @@
           <span class="node-name">mn1</span>
           <span class="node-badge ok" id="nb-mn1">Normal</span>
         </div>
-        <div class="node-role">Normal Support · 1800 rpm</div>
-        <div class="node-stat" id="ns-mn1">Bearing1_1</div>
+        <div class="node-role">사업장 A · 로봇 4대 · 집계 참여</div>
+        <div class="node-stat" id="ns-mn1">대기 중</div>
       </div>
       <div class="node ok" id="nd-mn2">
         <div class="node-header">
           <span class="node-name">mn2</span>
           <span class="node-badge ok" id="nb-mn2">Normal</span>
         </div>
-        <div class="node-role">Normal Support · 1650 rpm</div>
-        <div class="node-stat" id="ns-mn2">Bearing2_2</div>
+        <div class="node-role">사업장 B · 로봇 2대 · 집계 참여</div>
+        <div class="node-stat" id="ns-mn2">대기 중</div>
       </div>
       <div class="node ok" id="nd-mn3">
         <div class="node-header">
           <span class="node-name">mn3</span>
           <span class="node-badge ok" id="nb-mn3">Monitoring</span>
         </div>
-        <div class="node-role">Fault-Transition · 1500 rpm</div>
-        <div class="node-stat" id="ns-mn3">Bearing3_2 · live stream</div>
+        <div class="node-role">사업장 C · 로봇 2대 · 로컬 전용(FedAvg 미기여)</div>
+        <div class="node-stat" id="ns-mn3">대기 중</div>
       </div>
     </div>
   </div>
@@ -839,7 +839,7 @@ function handleSummary(evt) {
 
     const roleTag = isFaultNode
       ? `<span style="font-size:10px;color:var(--warn);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Fault Transition</span>`
-      : `<span style="font-size:10px;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Normal Support</span>`;
+      : `<span style="font-size:10px;color:var(--text3);font-weight:600;letter-spacing:.05em;">정상</span>`;
 
     let rows = `
       <div class="summary-node-name">${node} ${roleTag}</div>
