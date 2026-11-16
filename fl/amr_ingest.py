@@ -81,6 +81,10 @@ def _empty() -> Dict[str, np.ndarray]:
         "cond_name": np.asarray([]),
         "nav": np.asarray([]),
         "ct": np.asarray([]),
+        # 로봇이 측정한 시각(epoch 초). 사업장 전체 정렬 키다.
+        "t_wall": np.zeros(0, np.float64),
+        # 로봇별 순번. 빠진 윈도우를 찾는 데 쓴다.
+        "seq": np.zeros(0, np.int64),
         "max_ct": "",
         "n_raw": 0,
     }
@@ -158,7 +162,8 @@ def balance_across_robots(got: Dict[str, np.ndarray],
     keep = np.sort(np.concatenate(keep)) if keep else np.array([], dtype=np.int64)
 
     out = dict(got)
-    for k in ("signals", "cond", "robot", "pose", "cond_name", "nav", "ct"):
+    for k in ("signals", "cond", "robot", "pose", "cond_name", "nav",
+              "ct", "t_wall", "seq"):
         if k in out and len(out[k]) == n:
             out[k] = out[k][keep]
     return out
@@ -180,8 +185,22 @@ def fetch_new_windows(container_path: str,
     if not uril:
         return _empty()
 
+    # 오래된 쪽부터 limit 개를 집는다.
+    #
+    # 전에는 uril[-limit:] 로 '최신 limit 개'를 집었다. uril 은 오래된
+    # 것부터 오므로 그러면 앞쪽(오래된) 구간을 건너뛴다. 게다가 커서는
+    # 집은 것들의 max_ct 로 점프하므로, 건너뛴 구간은 영영 못 받는다.
+    #
+    # 실측: siteA 의 telemetry 에 윈도우가 418개 있었는데 mn1 은 238개만
+    # 가져갔다. 180개가 이렇게 사라졌고, 그래서 라운드 5에서 50개를 못
+    # 채우고 멈췄다.
+    #
+    # 앞에서부터 집으면 커서가 조금씩만 전진하고 나머지는 다음 조회에
+    # 그대로 남는다. 버려지는 것이 없다.
+    #
+    # (fetch_latest_windows 는 '최근 N개'가 목적이라 [-limit:] 이 맞다.)
     cins = []
-    for u in uril[-limit:]:
+    for u in uril[:limit]:
         res = om2m.get_resource(u.lstrip("/"))
         if res and "m2m:cin" in res:
             cins.append(res)
@@ -193,11 +212,145 @@ def fetch_new_windows(container_path: str,
         keep = got["ct"] > since_ct
         if not keep.all():
             for k in ("signals", "cond", "robot", "pose", "cond_name",
-                      "nav", "ct"):
+                      "nav", "ct", "t_wall", "seq"):
                 got[k] = got[k][keep]
             got["max_ct"] = max([c for c in got["ct"].tolist() if c],
                                 default=since_ct)
     return got
+
+
+ARRAY_KEYS = ("signals", "cond", "robot", "pose",
+              "cond_name", "nav", "ct", "t_wall", "seq")
+
+
+def _reindex(got: Dict[str, np.ndarray], idx) -> Dict[str, np.ndarray]:
+    """같은 길이의 배열들을 한꺼번에 같은 순서/선택으로 다시 만든다."""
+    n = len(got["signals"])
+    out = dict(got)
+    for k in ARRAY_KEYS:
+        if k in out and len(out[k]) == n:
+            out[k] = out[k][idx]
+    return out
+
+
+def sort_by_time(got: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """
+    사업장 전체를 시간순으로 줄 세운다.
+
+    [왜 필요한가]
+    fetch_site_windows_since 는 로봇별로 받아 이어 붙이므로, 버퍼는
+    [AMR_1 전부][AMR_2 전부] 처럼 로봇 단위로 묶여 있다. 그대로 앞에서
+    자르면 로봇 하나만 몰아서 가져가게 된다.
+
+    [왜 t_wall 인가]
+    ct 는 CSE 에 '도착한' 시각이다. 한 로봇의 발행이 밀렸다 몰아서 올라오면
+    그 로봇의 오래된 데이터가 다른 로봇의 최신 데이터보다 뒤에 온다.
+    t_wall 은 로봇이 '측정한' 시각이라 밀려도 순서가 안 바뀐다.
+    t_wall 이 없는 배포를 위해 ct 로 되돌아간다.
+    """
+    n = len(got["signals"])
+    if n <= 1:
+        return got
+
+    tw = got.get("t_wall")
+    if tw is not None and len(tw) == n and np.isfinite(tw).all():
+        order = np.argsort(tw, kind="stable")
+    else:
+        order = np.argsort(got["ct"], kind="stable")
+
+    return _reindex(got, order)
+
+
+def take_head(got: Dict[str, np.ndarray], n: int):
+    """
+    앞에서 n개를 떼고 나머지를 돌려준다.
+
+    버리지 않는다. 남은 것은 다음 라운드가 이어서 쓴다. 그래서 라운드마다
+    정확히 n개가 되고, 한 시점에 생긴 이상이 여러 라운드로 흩어지지 않는다.
+
+    반환: (앞 n개, 나머지)
+    """
+    total = len(got["signals"])
+    if n <= 0:
+        return _empty(), got
+    if total <= n:
+        return got, _empty()
+
+    idx = np.arange(total)
+    head = _reindex(got, idx[:n])
+    tail = _reindex(got, idx[n:])
+
+    head["max_ct"] = max([c for c in head["ct"].tolist() if c], default="")
+    tail["max_ct"] = max([c for c in tail["ct"].tolist() if c], default="")
+    head["n_raw"] = n
+    tail["n_raw"] = total - n
+    return head, tail
+
+
+def robot_counts(got: Dict[str, np.ndarray]) -> Dict[str, int]:
+    """로봇별 윈도우 수. 한 로봇이 독식하는지 로그로 보기 위한 것."""
+    robots = got.get("robot")
+    if robots is None or not len(robots):
+        return {}
+    uniq, cnt = np.unique(robots, return_counts=True)
+    return {str(r): int(c) for r, c in zip(uniq, cnt)}
+
+
+def seq_gaps(got: Dict[str, np.ndarray]) -> Dict[str, int]:
+    """
+    로봇별로 빠진 윈도우 수를 센다.
+
+    seq 는 로봇이 매기는 순번이라 로봇 안에서만 의미가 있다. 연속이어야
+    하는데 뛰면 그 사이가 유실된 것이다. 지금까지는 윈도우가 조용히
+    사라져도 알 방법이 없었다.
+    """
+    robots, seqs = got.get("robot"), got.get("seq")
+    if robots is None or seqs is None or not len(seqs):
+        return {}
+
+    out = {}
+    for r in sorted(set(robots.tolist())):
+        v = np.sort(seqs[robots == r])
+        v = v[v >= 0]
+        if len(v) < 2:
+            continue
+        missing = int((np.diff(v) - 1).clip(min=0).sum())
+        if missing:
+            out[str(r)] = missing
+    return out
+
+
+def merge_windows(acc: Optional[Dict[str, np.ndarray]],
+                  new: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """
+    라운드 중 여러 번에 걸쳐 받은 윈도우를 이어 붙인다.
+
+    [왜 필요한가]
+    로봇의 telemetry 컨테이너에는 mni(최대 보관 수)가 걸려 있다. Isaac Sim
+    쪽이 만든 컨테이너라 우리가 정하지 않는다. 새 CIN 이 들어오면 가장
+    오래된 것이 지워진다.
+
+    그래서 "50개 모일 때까지 기다렸다가 한 번에 긁는다"가 성립하지 않는다.
+    같은 커서로 다시 조회하면 그 사이 지워진 만큼 빠져서, 총량이
+    로봇 수 × mni 를 절대 못 넘는다. 로봇 4대 사업장은 57개로 50을
+    넘겼는데 2대 사업장이 31/33 에서 얼어붙었던 것이 이것이다.
+
+    받을 때마다 여기에 쌓고 커서를 전진시키면, 지워지기 전에 챙긴 것이
+    버퍼에 남는다.
+    """
+    if acc is None or not len(acc.get("signals", [])):
+        return new
+    if new is None or not len(new.get("signals", [])):
+        return acc
+
+    out = {
+        k: np.concatenate([acc[k], new[k]])
+        for k in ("signals", "cond", "robot", "pose",
+                  "cond_name", "nav", "ct", "t_wall", "seq")
+    }
+    out["max_ct"] = max(acc.get("max_ct", ""), new.get("max_ct", ""))
+    out["n_raw"] = int(acc.get("n_raw", 0)) + int(new.get("n_raw", 0))
+    return out
 
 
 def fetch_site_windows_since(container_paths: List[str],
@@ -230,6 +383,8 @@ def fetch_site_windows_since(container_paths: List[str],
         "cond_name": np.concatenate([p["cond_name"] for p in parts]),
         "nav": np.concatenate([p["nav"] for p in parts]),
         "ct": np.concatenate([p["ct"] for p in parts]),
+        "t_wall": np.concatenate([p["t_wall"] for p in parts]),
+        "seq": np.concatenate([p["seq"] for p in parts]),
         "max_ct": max([p["max_ct"] for p in parts], default=""),
         "n_raw": sum(p["n_raw"] for p in parts),
     }
@@ -322,7 +477,9 @@ def fetch_round_windows(
 def build_from_cins(cins: List[Dict]) -> Dict[str, np.ndarray]:
     """CIN 목록 -> 학습 입력. 라벨에서 조건과 상태를 읽는다."""
     sigs, conds, robots, poses, names, navs = [], [], [], [], [], []
-    cts = []   # CIN 생성시각. 다음 라운드의 커서로 쓴다.
+    cts = []      # CIN 생성시각. 다음 라운드의 커서로 쓴다.
+    twalls = []   # 로봇이 측정한 시각. 정렬은 이걸로 한다.
+    seqs = []     # 로봇별 순번. 유실 확인용.
 
     for cin in cins:
         con = _con_of(cin)
@@ -350,6 +507,16 @@ def build_from_cins(cins: List[Dict]) -> Dict[str, np.ndarray]:
         navs.append(meta["nav"] or "idle")
         cts.append(str(cin.get("m2m:cin", {}).get("ct", "")))
 
+        # 없으면 NaN / -1. 정렬하는 쪽에서 ct 로 되돌아간다.
+        try:
+            twalls.append(float(meta.get("t_wall")))
+        except (TypeError, ValueError):
+            twalls.append(float("nan"))
+        try:
+            seqs.append(int(meta.get("seq")))
+        except (TypeError, ValueError):
+            seqs.append(-1)
+
     if not sigs:
         out = _empty()
         out["n_raw"] = len(cins)
@@ -363,6 +530,8 @@ def build_from_cins(cins: List[Dict]) -> Dict[str, np.ndarray]:
         "cond_name": np.asarray(names),
         "nav": np.asarray(navs),
         "ct": np.asarray(cts),
+        "t_wall": np.asarray(twalls, dtype=np.float64),
+        "seq": np.asarray(seqs, dtype=np.int64),
         "max_ct": max([c for c in cts if c], default=""),
         "n_raw": len(cins),
     }

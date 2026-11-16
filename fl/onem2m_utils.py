@@ -597,6 +597,24 @@ def discover_cins_after(container_path: str,
 
     # ct의 쉼표 뒤(마이크로초)는 cra가 받지 않는 구현이 있어 떼어낸다.
     stamp = str(since_ct).split(",")[0]
+
+    # ACME 는 lim 을 cra 보다 '먼저', 그것도 오래된 것부터 적용한다.
+    # 그래서 lim 이 컨테이너의 cni 보다 작으면 앞쪽(오래된) lim 개만
+    # 후보가 되고, cra 로 거르면 하나도 안 남는다.
+    #
+    #   cni=71 일 때  lim=50  -> 0건
+    #                 lim=100 -> 4건   (실측)
+    #
+    # lim 을 크게 고정하면 응답이 쓸데없이 커지므로, 컨테이너의 cni 를
+    # 읽어 그만큼만 넉넉히 잡는다. GET 한 번이 늘지만 응답은 작다.
+    cnt = get_resource(container_path)
+    cni = ((cnt or {}).get("m2m:cnt") or {}).get("cni")
+    try:
+        need = int(cni) + 50
+    except (TypeError, ValueError):
+        need = 0
+    lim = max(lim, need)
+
     url = _url(f"{container_path}?fu=1&ty=4&lim={lim}&cra={stamp}")
     try:
         r = _request_with_retry("get", url, headers=_headers(), timeout=15)

@@ -63,20 +63,28 @@ class INAECoordinator:
             or [f"mn{i}" for i in range(1, config.NUM_CLIENTS + 1)]
         )
 
-        # 집계 대기 대상은 '학습에 참여하는 노드'만이다.
-        self.cold_start_nodes = list(getattr(config, "COLD_START_NODES", []))
+        # 집계 대기 대상은 'FedAvg에 가중치를 올리는 노드'만이다.
+        # 관측 전용(cold start)과 로컬 전용(local only) 둘 다 빼야 한다.
+        # 예전에는 cold start만 뺐는데 그 목록이 보통 비어 있어서,
+        # 로컬 전용 mn3가 집계 대기 수에 남아 3번째 가중치를
+        # 영원히 기다리다 라운드가 멈췄다.
+        self.non_contributing_nodes = list(
+            getattr(config, "NON_CONTRIBUTING_NODES", None)
+            or getattr(config, "COLD_START_NODES", [])
+        )
         self.training_nodes = [
-            n for n in self.node_names if n not in self.cold_start_nodes
+            n for n in self.node_names
+            if n not in self.non_contributing_nodes
         ]
         self.expected_nodes = len(self.training_nodes)
 
-        # cold start 노드의 추론 결과는 따로 모은다(대시보드/로그용).
+        # 미기여 노드의 추론 결과는 따로 모은다(대시보드/로그용).
         self.cold_start_results = {}
 
-        if self.cold_start_nodes:
+        if self.non_contributing_nodes:
             print(
-                f"  [cold start] 학습 참여: {self.training_nodes} / "
-                f"학습 미참여(추론만): {self.cold_start_nodes}"
+                f"  [FedAvg] 집계 참여: {self.training_nodes} / "
+                f"미기여(추론 결과만 올림): {self.non_contributing_nodes}"
             )
         self.dropbox_by_node = {
             node: f"{self.dropbox_root}/cnt-{node}" for node in self.node_names
@@ -279,7 +287,9 @@ class INAECoordinator:
                     .replace("_", "-")
                 )
 
-                if update_type != "fl-update":
+                # fl-update   : 가중치 포함, FedAvg 대상
+                # fl-inference : 지표만, 미기여 노드(관측 전용/로컬 전용)
+                if update_type not in ("fl-update", "fl-inference"):
                     print(
                         f"  ⚠ {fired_node}: "
                         f"unexpected type={update_type!r}"
@@ -307,15 +317,17 @@ class INAECoordinator:
                     return resp
 
                 with self.collection_lock:
-                    if fired_node in self.cold_start_nodes:
-                        # 학습 미참여 노드의 추론 결과.
-                        # FedAvg 대상이 아니므로 집계 대기 수에 넣지 않는다.
+                    if (update_type == "fl-inference"
+                            or fired_node
+                            in self.non_contributing_nodes):
+                        # 가중치 없는 업로드. FedAvg 대상이 아니므로
+                        # 집계 대기 수에 넣지 않는다.
                         self.cold_start_results[fired_node] = result_data
                         print(
-                            f"  [COLD-START/NOTIFY] "
+                            f"  [NO-AGG/NOTIFY] "
                             f"{fired_node} Round {cin_round} "
                             f"val_auroc={result_data.get('val_auroc')} "
-                            f"(학습 미참여, FedAvg 제외)"
+                            f"(FedAvg 미기여)"
                         )
                     else:
                         self.collected_results[

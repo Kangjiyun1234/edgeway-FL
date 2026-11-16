@@ -34,13 +34,141 @@ trap cleanup EXIT INT TERM
 
 FROM_CSE="${FL_SENSOR_FROM_CSE:-1}"
 
+# ------------------------------------------------------------
+# 지난 실행 흔적 정리
+#
+# 이걸 안 하면 대시보드가 초기화되지 않는다. /tmp/fl_models/global 에
+# 남은 지난 실행의 global_roundN.pt 를 주워 읽고, 실행 표식(run marker)이
+# 갱신되지 않아 "이 표식보다 오래된 모델은 무시" 하는 걸름망도 안 걸린다.
+# 그래서 새로 띄워도 지난 판의 라운드와 수치가 그대로 보인다.
+#
+# clean_fl.sh 는 쓰지 않는다. 그쪽은 전처리 PKL 이 있어야 시작하는데
+# CSE 모드에는 그 파일이 없어서 바로 멈춘다. 또 프로세스를 죽이는 일까지
+# 하므로 기동 스크립트 안에서 부를 것이 아니다.
+#
+# 지우는 것: 지난 실행의 글로벌/로컬 모델과 캐시
+# 남기는 것: 전처리 PKL (FL_PKL_DIR). 오프라인 모드에서 쓴다.
+# ------------------------------------------------------------
+reset_previous_run() {
+  local base="${FL_MODEL_BASE_DIR:-/tmp/fl_models}"
+  local marker="${FL_DEMO_RUN_MARKER:-${base}/.demo_run_started}"
+
+  echo
+  echo "[0/5] 지난 실행 정리"
+
+  # 포트를 잡고 있는 지난 실행을 먼저 내린다.
+  # 이걸 안 하면 7000(대시보드) 6000(IN-AE) 5001-5003(MN-AE) 이
+  # 전부 "Address already in use" 로 bind 실패한다. 그러면 대시보드는
+  # 뜨지 않고, MN-AE 는 구독은 걸지만 알림 받을 서버가 없어 폴링만
+  # 하며, 옛 프로세스가 살아 있는 채로 같은 드롭박스에 같이 올려
+  # 라운드가 어긋난다.
+  #
+  # 우리가 띄운 것만 이름으로 지목해 죽인다. 이 스크립트가 띄울
+  # 자식들은 아직 없으므로 자기 자신을 죽이지 않는다.
+  local killed=0
+  for pat in "fl/dashboard_server.py" "fl/in_ae_standard.py" "fl/mn_ae_standard.py"
+  do
+    if pkill -TERM -f "$pat" 2>/dev/null; then
+      killed=1
+    fi
+  done
+
+  if [ "$killed" = "1" ]; then
+    sleep 2
+    for pat in "fl/dashboard_server.py" "fl/in_ae_standard.py" "fl/mn_ae_standard.py"
+    do
+      pkill -KILL -f "$pat" 2>/dev/null || true
+    done
+    echo "  ✓ 지난 실행 프로세스 종료 (이름 기준)"
+  fi
+
+  # 이름으로 못 잡는 것이 남는다. 다른 경로에서 띄웠거나, 부모가 먼저
+  # 죽어 고아가 된 프로세스는 cmdline 이 달라 pkill -f 를 피해 간다.
+  # 그런데 우리에게 필요한 건 "그 포트가 비어 있는 것" 하나뿐이다.
+  # 그러니 이름이 아니라 포트를 기준으로 비운다.
+  local busy=0
+  for port in 7000 6000 5001 5002 5003
+  do
+    local pid
+    pid="$(ss -ltnpH "sport = :${port}" 2>/dev/null \
+           | grep -oP 'pid=\K[0-9]+' | head -1 || true)"
+    if [ -n "${pid:-}" ]; then
+      echo "  · 포트 ${port} 를 PID ${pid} 가 잡고 있다 -> 내린다"
+      kill -TERM "$pid" 2>/dev/null || true
+      busy=1
+    fi
+  done
+
+  if [ "$busy" = "1" ]; then
+    sleep 2
+    for port in 7000 6000 5001 5002 5003
+    do
+      local pid
+      pid="$(ss -ltnpH "sport = :${port}" 2>/dev/null \
+             | grep -oP 'pid=\K[0-9]+' | head -1 || true)"
+      [ -n "${pid:-}" ] && kill -KILL "$pid" 2>/dev/null || true
+    done
+  fi
+
+  if [ "$killed" = "0" ] && [ "$busy" = "0" ]; then
+    echo "  ✓ 남아 있는 프로세스 없음"
+  else
+    echo "  ✓ 포트 7000/6000/5001-5003 비움"
+  fi
+
+  rm -rf "${base}/global" "${base}/local" "${base}/cache"
+  mkdir -p "${base}/global" "${base}/local" "${base}/cache"
+
+  mkdir -p "$(dirname "${marker}")"
+  : > "${marker}"
+
+  echo "  ✓ 모델/캐시 비움: ${base}"
+  echo "  ✓ 실행 표식 갱신: ${marker}"
+}
+
+if [ "${FL_RESET_ON_START:-1}" = "1" ]; then
+  reset_previous_run
+fi
+
 start_dashboard() {
   echo
   echo "[2/5] 대시보드"
   python3 -u fl/dashboard_server.py &
   PIDS+=("$!")
-  echo "  -> http://localhost:7000   (PID ${PIDS[-1]})"
-  sleep 2
+  local pid="${PIDS[-1]}"
+  echo "  -> http://localhost:7000   (PID ${pid})"
+
+  # 띄워놓고 확인을 안 했다. 그래서 bind 에 실패해 죽어도 이 줄만
+  # 찍히고 넘어갔고, 왜 대시보드가 안 뜨는지 매번 로그를 뒤져야 했다.
+  # 최대 10초 기다리며 실제로 응답하는지 본다.
+  local ok=0
+  for _ in 1 2 3 4 5 6 7 8 9 10
+  do
+    sleep 1
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break            # 프로세스가 죽었다. 더 기다릴 것 없다.
+    fi
+    if curl -sS -o /dev/null --max-time 2 "http://127.0.0.1:7000/" 2>/dev/null; then
+      ok=1
+      break
+    fi
+  done
+
+  if [ "$ok" = "1" ]; then
+    echo "  ✓ 대시보드 응답 확인"
+  else
+    echo
+    echo "  ✗ 대시보드가 뜨지 않았다."
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "    프로세스는 살아 있는데 7000 이 응답하지 않는다."
+    else
+      echo "    프로세스가 죽었다. 바로 위에 찍힌 파이썬 오류를 보라."
+      echo "    'Address already in use' 면 7000 을 다른 것이 잡고 있다:"
+      echo "      ss -ltnp | grep 7000"
+    fi
+    echo "    FL 자체는 계속 진행한다."
+    echo
+  fi
 }
 
 # ── 1. 데이터 경로 준비 ─────────────────────────────────
@@ -82,15 +210,23 @@ fi
 
 echo
 echo "[4/5] MN-AE 기동 (사업장 3곳)"
-python3 -u fl/mn_ae_standard.py 0 5001 &
+
+# 셋이 한 터미널에 찍으면 줄이 뒤섞여 어느 노드 것인지 알기 어렵다.
+# 줄 앞에 노드 이름을 박아 두었지만, 한 노드만 따로 보고 싶을 때를 위해
+# 파일로도 나눠 남긴다. 터미널 출력은 tee 로 그대로 둔다.
+RUN_LOG_DIR="logs/run_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$RUN_LOG_DIR"
+echo "  노드별 로그: $RUN_LOG_DIR/"
+
+python3 -u fl/mn_ae_standard.py 0 5001 2>&1 | tee "$RUN_LOG_DIR/mn1.log" &
 PIDS+=("$!")
 echo "  MN-AE-1 (siteA / mep-a) PID: ${PIDS[-1]}"
 
-python3 -u fl/mn_ae_standard.py 1 5002 &
+python3 -u fl/mn_ae_standard.py 1 5002 2>&1 | tee "$RUN_LOG_DIR/mn2.log" &
 PIDS+=("$!")
 echo "  MN-AE-2 (siteB / mep-b) PID: ${PIDS[-1]}"
 
-python3 -u fl/mn_ae_standard.py 2 5003 &
+python3 -u fl/mn_ae_standard.py 2 5003 2>&1 | tee "$RUN_LOG_DIR/mn3.log" &
 PIDS+=("$!")
 echo "  MN-AE-3 (siteC / mep-c) PID: ${PIDS[-1]}"
 
@@ -115,7 +251,7 @@ echo "[5/5] IN-AE"
 #
 # 나중에 중앙 노드에 자리가 생기면 FL_START_IN_AE=0 으로 끄고 거기서 띄운다.
 if [ "${FL_START_IN_AE:-1}" = "1" ]; then
-  python3 -u fl/in_ae_standard.py &
+  python3 -u fl/in_ae_standard.py 2>&1 | tee "$RUN_LOG_DIR/in_ae.log" &
   PIDS+=("$!")
   echo "  IN-AE PID: ${PIDS[-1]}  (중앙 CSE 는 원격, 알림은 pollingChannel)"
 else
@@ -125,6 +261,7 @@ fi
 echo
 echo "============================================================"
 echo "  전부 기동됨.   대시보드: http://localhost:7000"
+echo "  노드별 로그:   $RUN_LOG_DIR/{mn1,mn2,mn3,in_ae}.log"
 echo "  Ctrl+C 로 전체 종료"
 echo "============================================================"
 echo

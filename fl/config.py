@@ -335,7 +335,8 @@ def remote_uses_pch() -> bool:
     return NOTIFY_REMOTE == "pch"
 
 NUM_CLIENTS = 3
-GLOBAL_ROUNDS = 10
+# 연합학습 라운드 수. 실험할 때 줄이거나 늘린다.
+GLOBAL_ROUNDS = int(os.getenv("FL_GLOBAL_ROUNDS", "10"))
 
 ORIGINATOR = os.getenv("FL_ORIGINATOR", "CAdmin")
 

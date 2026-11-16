@@ -84,6 +84,15 @@ class MNAETrainer:
         # 로봇별로 어디까지 읽었는지. 라운드마다 그 뒤만 읽는다.
         # 비워 두면 첫 라운드는 최근 분량을 받는다.
         self.telemetry_cursor = {}
+
+        # 이번 라운드에 모은 윈도우. telemetry 컨테이너의 mni 때문에
+        # 한 번에 다 긁을 수 없어서, 받을 때마다 여기에 쌓는다.
+        self._round_buffer = None
+        self._round_buffer_round = None
+
+        # 이번 라운드가 쓰고 남길 몫. 라운드가 실제로 성립한 뒤에
+        # _round_buffer 로 옮긴다.
+        self._pending_leftover = None
         self.telemetry_paths = [
             f"{mn_cse}/{rb}/{config.ROBOT_TELEMETRY_CNT}"
             for rb in self.robot_names
@@ -634,7 +643,113 @@ class MNAETrainer:
 
             time.sleep(poll)
 
-    def _load_sensor_data_for_round(self, round_num: int, max_attempts: int = 3):
+    def _seed_telemetry_cursor(self) -> None:
+        """
+        이미 쌓여 있는 텔레메트리를 건너뛰고, FL 시작 후에 들어온 것부터 읽는다.
+
+        [왜]
+        커서가 비어 있으면 fetch 가 "최근 N개"를 긁어 온다. 그래서 Round 1
+        만 Isaac Sim 이 그때까지 올려둔 걸 통째로 가져갔다. 로그에서 mn1 이
+        Round 1 에 341개를 먹고 Round 2 에는 37개밖에 안 남았던 것이 이것
+        때문이다. 라운드마다 조건이 같아야 비교가 되므로, Round 1 도 다른
+        라운드처럼 FL 이 시작된 뒤에 쌓인 것만 받아야 한다.
+
+        각 로봇 컨테이너의 지금 마지막 ct 를 커서로 놓는다. 비어 있는
+        컨테이너는 커서를 두지 않는다. 어차피 거기는 지금부터가 처음이다.
+        """
+        seeded, empty = 0, 0
+
+        for path in self.telemetry_paths:
+            try:
+                cin = om2m.get_latest_content_instance(path)
+            except Exception as e:
+                print(f"    ⚠ {path} 마지막 ct 조회 실패(건너뜀): {e}")
+                continue
+
+            ct = ((cin or {}).get("m2m:cin") or {}).get("ct")
+            if ct:
+                self.telemetry_cursor[path] = ct
+                seeded += 1
+            else:
+                empty += 1
+
+        print(f"  ⏱ 쌓여 있던 텔레메트리는 건너뛴다 "
+              f"(커서 설정 {seeded}개 / 비어 있음 {empty}개). "
+              f"지금부터 쌓이는 것만 학습한다.")
+
+    def _load_sensor_data_for_round(self, round_num: int,
+                                    max_attempts: int = 3):
+        """
+        이 라운드에 쓸 데이터를 만든다. 쓸 만해질 때까지 기다린다.
+
+        [왜 기다리나]
+        예전에는 정상 주행 구간이 없으면 이 라운드를 통째로 건너뛰었다.
+        건너뛴 노드는 아무것도 올리지 않고 다음 라운드로 가버리는데,
+        IN-AE 는 그 노드의 업로드를 기다리느라 수집 타임아웃(600초)을
+        통째로 버린다. 로그에서 mn1 이 Round 2 를 빠지자 IN-AE 가 (1/2)
+        에서 10분을 멈춰 있던 것이 이 때문이다.
+
+        빠질 일이 아니다. 로봇은 계속 돌고 있으니 조금 더 기다리면 정상
+        주행 구간이 생긴다. 다른 노드와 같은 라운드에 참여하는 것이 맞다.
+
+        [예산]
+        IN-AE 의 수집 타임아웃보다 먼저 끝나야 의미가 있다. 기본값은
+        FL_COLLECTION_NOTIFY_TIMEOUT 에서 60초를 뺀 값이고,
+        FL_SENSOR_ROUND_MAX_WAIT_SEC 로 따로 줄 수 있다.
+        그 안에 끝내 못 만들면 그때는 어쩔 수 없이 SKIP_ROUND 다.
+        """
+        in_timeout = float(os.getenv("FL_COLLECTION_NOTIFY_TIMEOUT", "600"))
+        budget = float(os.getenv(
+            "FL_SENSOR_ROUND_MAX_WAIT_SEC",
+            str(max(60.0, in_timeout - 60.0))))
+        poll = float(os.getenv("FL_SENSOR_ROUND_POLL_SEC", "2.0"))
+
+        deadline = time.time() + budget
+        attempt = 0
+        next_log = 0.0
+
+        while True:
+            attempt += 1
+            data = self._collect_round_data_once(
+                round_num, hard_deadline=deadline)
+
+            if data is None:
+                # 텔레메트리가 아예 비었다. 기다려서 될 일이 아니다.
+                return None
+
+            if data is not SKIP_ROUND:
+                # 라운드가 성립했다. 이제서야 쓴 만큼을 버퍼에서 덜어낸다.
+                # 실패했다면 버퍼는 손대지 않은 채로 남아 재시도가
+                # 같은 윈도우를 다시 본다.
+                self._round_buffer = self._pending_leftover
+                return data
+
+            left = deadline - time.time()
+            if left <= 0:
+                print(f"    ✗ {budget:.0f}초 동안 학습할 수 있는 구간이 "
+                      f"생기지 않았다 (시도 {attempt}회).")
+                print(f"      로봇이 주행 중인지 확인하라. "
+                      f"이번 라운드는 빠진다.")
+                return SKIP_ROUND
+
+            now = time.time()
+            if now >= next_log:
+                print(f"    ⏳ 쓸 수 있는 구간이 없다. 라운드를 빠지지 않고 "
+                      f"기다린다 (시도 {attempt}회, 남은 {left:.0f}s)")
+                next_log = now + 15.0
+
+            # 새 텔레메트리가 올 때까지 기다렸다 다시 본다.
+            # 커서를 안 밀었으므로 다음 시도에는 지금 것 + 새로 온 것을
+            # 같이 받는다. 기다릴수록 양이 늘어난다.
+            if self.telemetry_subs:
+                self.data_event.wait(timeout=poll)
+                self.data_event.clear()
+            else:
+                time.sleep(poll)
+
+    def _collect_round_data_once(self, round_num: int,
+                                 hard_deadline: float = None):
+        """수집 1회 시도. 쓸 데이터를 못 만들면 SKIP_ROUND 를 준다."""
         """
         이번 라운드에 학습할 윈도우를 모은다.
 
@@ -656,14 +771,16 @@ class MNAETrainer:
         if not getattr(config, "FL_SENSOR_FROM_CSE", True):
             return self._load_sensor_data_from_pkl(round_num)
 
-        want_min   = int(os.getenv("FL_SENSOR_MIN_WINDOWS", "40"))
+        # 라운드마다 사업장당 이만큼 모일 때까지 기다린다.
+        # 상한(site_cap)과 같은 값이어야 라운드마다 정확히 같은 양이 된다.
+        want_min   = int(os.getenv("FL_SENSOR_MIN_WINDOWS", "50"))
 
         # 사업장 단위 상한. 로봇 수가 사업장마다 다르므로(A 4대, B 2대)
         # 로봇당 상한만 두면 사업장 총량이 2배 차이 나고, FedAvg가 샘플 수로
         # 가중하기 때문에 로봇이 많은 사업장이 더 큰 영향력을 갖는다.
         # 사업장별 기여를 맞추려면 여기서 사업장 단위로 자른다.
         # 0으로 두면 자르지 않는다(예전 동작).
-        site_cap = int(os.getenv("FL_SENSOR_MAX_WINDOWS_PER_SITE", "600"))
+        site_cap = int(os.getenv("FL_SENSOR_MAX_WINDOWS_PER_SITE", "50"))
 
         # 로봇별 조회 상한은 사업장 상한에서 역산한다. 넉넉히 받아 두고
         # 합친 뒤에 고르게 줄이는 편이, 로봇 하나가 쉬고 있을 때도
@@ -673,7 +790,10 @@ class MNAETrainer:
                              if site_cap > 0 else 300)
         per_robot = int(os.getenv("FL_SENSOR_CIN_LIMIT_PER_ROBOT",
                                   str(default_per_robot)))
-        wait_total = float(os.getenv("FL_SENSOR_ROUND_WAIT_SEC", "90"))
+        # 하한이 찰 때까지 기다린다. 실제 상한은 바깥에서 넘겨주는
+        # hard_deadline(라운드 예산)이므로 여기 기본값은 그보다 크게 둔다.
+        # 예전 기본 90초는 50개가 쌓이기 전에 깨어나 모자란 채로 진행했다.
+        wait_total = float(os.getenv("FL_SENSOR_ROUND_WAIT_SEC", "3600"))
         poll       = float(os.getenv("FL_SENSOR_ROUND_POLL_SEC", "2.0"))
 
         # 라운드마다 "최근 N개"를 다시 긁으면 간격이 짧을 때 같은 데이터를
@@ -682,13 +802,35 @@ class MNAETrainer:
         incremental = os.getenv("FL_SENSOR_INCREMENTAL", "1") != "0"
 
         deadline = time.time() + wait_total
+        if hard_deadline is not None:
+            deadline = min(deadline, hard_deadline)
         next_log = 0.0
-        cursors = dict(self.telemetry_cursor)
+
+        # 버퍼는 라운드가 바뀌어도 비우지 않는다.
+        # 이번 라운드가 쓰고 남긴 윈도우를 다음 라운드가 이어서 쓴다.
+        # 그래야 라운드마다 정확히 같은 양이 되고, 버려지는 것이 없다.
+        self._round_buffer_round = round_num
+
+        n_fresh = 0        # 직전 조회에서 새로 받은 수
+        n_fetched = 0      # 이 라운드에 조회로 받은 누계
+        n_polls = 0
 
         while True:
             if incremental:
-                got, cursors = amr_ingest.fetch_site_windows_since(
+                fresh, cursors = amr_ingest.fetch_site_windows_since(
                     self.telemetry_paths, self.telemetry_cursor, per_robot)
+                n_fresh = len(fresh["signals"])
+                n_fetched += n_fresh
+                n_polls += 1
+
+                # 받은 즉시 커서를 민다. 안 밀면 다음 조회가 같은 구간을
+                # 다시 받는데, telemetry 컨테이너는 mni 때문에 그 사이
+                # 오래된 CIN 을 지운다. 그래서 총량이 로봇 수 × mni 에서
+                # 멈춘다. 지워지기 전에 챙겨 버퍼에 쌓는 것이 맞다.
+                self.telemetry_cursor = cursors
+                self._round_buffer = amr_ingest.merge_windows(
+                    self._round_buffer, fresh)
+                got = self._round_buffer
             else:
                 got = amr_ingest.fetch_site_windows(
                     self.telemetry_paths, per_robot)
@@ -703,7 +845,7 @@ class MNAETrainer:
                     print(f"    ⊘ 지난 라운드 이후 새 윈도우가 없다.")
                     print(f"      로봇이 주행 중인지, 라운드 간격이 너무 "
                           f"짧지 않은지 확인하라.")
-                    return SKIP_ROUND
+                    return SKIP_ROUND   # 바깥에서 다시 기다린다
                 if n == 0:
                     print(f"    ✗ {site} 로봇 텔레메트리가 비어 있다.")
                     print(f"      확인: {len(self.telemetry_paths)}개 컨테이너 "
@@ -715,8 +857,12 @@ class MNAETrainer:
 
             if now >= next_log:
                 via = "구독" if self.telemetry_subs else "주기 조회"
-                print(f"    ⏳ 윈도우 {n}/{want_min} 수집 중 "
-                      f"({via}, 남은 {deadline - now:.0f}s)")
+                # 새로 받은 수(+N)를 같이 찍는다. 계속 +0 이면 CSE 가
+                # 커서 이후 CIN 을 안 주는 것이고, +N 인데 왼쪽 숫자가
+                # 안 늘면 쌓는 쪽이 잘못된 것이다. 로그만 보고 가려진다.
+                print(f"    [{self.node_name}] ⏳ 윈도우 {n}/{want_min} 수집 중 "
+                      f"(직전 +{n_fresh}, 조회누계 {n_fetched}, "
+                      f"{n_polls}회, {via}, 남은 {deadline - now:.0f}s)")
                 next_log = now + 5.0
 
             # 구독이 걸려 있으면 알림이 깨울 때까지 기다린다.
@@ -728,29 +874,63 @@ class MNAETrainer:
             else:
                 time.sleep(poll)
 
-        # 쓰기로 한 데이터까지만 커서를 민다. 실패한 라운드의 데이터를
-        # 건너뛰지 않기 위해, 여기까지 온 뒤에 갱신한다.
-        if incremental:
-            self.telemetry_cursor = cursors
+        # 커서는 위 루프에서 받을 때마다 이미 밀었다.
+        # 받은 윈도우가 쓸 수 없는 것이어도 버퍼에 남아 있으므로,
+        # 재시도할 때 다시 받을 필요가 없다.
 
-        # 사업장 단위로 고르게 줄인다.
-        if site_cap > 0 and len(got["signals"]) > site_cap:
+        # 시간순으로 줄 세우고 앞에서 want_min 개만 떼어 쓴다.
+        #
+        # 버퍼는 로봇별로 받아 이어 붙인 것이라 [AMR_1 전부][AMR_2 전부]
+        # 처럼 묶여 있다. 정렬 없이 앞에서 자르면 로봇 하나만 가져간다.
+        # 정렬 키는 t_wall(로봇이 측정한 시각)이고, 없으면 ct 로 떨어진다.
+        #
+        # 남은 것은 버리지 않고 버퍼에 둔다. 다음 라운드가 그 뒤를 본다.
+        # 예전에는 전 구간에서 linspace 로 뽑고 나머지를 버렸는데, 그러면
+        # 한 시점에 생긴 이상이 여러 라운드로 흩어지고 데이터도 사라졌다.
+        take = want_min if want_min > 0 else len(got["signals"])
+        if len(got["signals"]) > take:
             before = len(got["signals"])
-            got = amr_ingest.balance_across_robots(got, site_cap)
-            print(f"    ⓘ 사업장 상한 적용: {before} -> "
-                  f"{len(got['signals'])}개 (로봇별 균등)")
+            got = amr_ingest.sort_by_time(got)
+            got, leftover = amr_ingest.take_head(got, take)
+            # 여기서 바로 버퍼를 줄이면 안 된다. 아래 _build_round_data
+            # 에서 정상 구간이 하나도 없어 SKIP_ROUND 가 나면 방금 뗀
+            # 윈도우가 사라진다. 라운드가 성립한 뒤에 바깥에서 옮긴다.
+            self._pending_leftover = leftover
+            print(f"    [{self.node_name}] ⓘ 시간순 {before}개 중 앞 "
+                  f"{len(got['signals'])}개 사용, "
+                  f"{len(leftover['signals'])}개는 다음 라운드로")
+        else:
+            got = amr_ingest.sort_by_time(got)
+            self._pending_leftover = None
 
         if self.telemetry_subs:
-            print(f"    ⓘ 이번 수집까지 받은 알림 {self.data_notifications}건 "
+            print(f"    [{self.node_name}] ⓘ 이번 수집까지 받은 알림 "
+                  f"{self.data_notifications}건 "
                   f"(구독 {len(self.telemetry_subs)}개)")
 
         robots_seen = sorted(set(got["robot"].tolist()))
-        print(f"    ✓ 윈도우 {len(got['signals'])}개 / 로봇 {len(robots_seen)}대 "
+        print(f"    [{self.node_name}] ✓ 윈도우 {len(got['signals'])}개 "
+              f"/ 로봇 {len(robots_seen)}대 "
               f"(CIN {got['n_raw']}개"
               f"{', 증분' if incremental else ', 최근 N개'})")
         if len(robots_seen) < len(self.robot_names):
             missing = [r for r in self.robot_names if r not in robots_seen]
             print(f"    ⚠ 데이터가 없는 로봇: {', '.join(missing)}")
+
+        # 로봇별 몫을 강제로 맞추지 않는다. 실제 주행량이 그대로 반영되는
+        # 것이 맞다. 다만 한 로봇이 독식하면 그 라운드는 그 로봇의 경로만
+        # 학습하므로, 나중에 손실이 이상할 때 원인을 알 수 있게 찍어둔다.
+        counts = amr_ingest.robot_counts(got)
+        if counts:
+            print(f"    [{self.node_name}] ⓘ 로봇별: "
+                  + "  ".join(f"{r.split('_')[-1]}={c}"
+                              for r, c in sorted(counts.items())))
+
+        gaps = amr_ingest.seq_gaps(got)
+        if gaps:
+            print(f"    [{self.node_name}] ⚠ 윈도우 유실(seq 기준): "
+                  + "  ".join(f"{r.split('_')[-1]}={n}개"
+                              for r, n in sorted(gaps.items())))
 
         return self._build_round_data_from_cse(got)
 
@@ -838,7 +1018,21 @@ class MNAETrainer:
         cts = got.get("ct")
         if cts is not None and len(cts) == len(mv):
             cts = cts[mv] if mv.any() else cts
-        self.last_windows = {"X": Xn, "C": C, "robot": robot, "ct": cts}
+
+        # 판정 CIN 에 "바닥 이상 위치"를 싣기 위해 윈도우별 좌표도 남긴다.
+        # pose_of 가 윈도우 안 샘플의 평균 (x, y) 로 만들어 둔 값이다.
+        # 정지 구간을 걸러낸 mv 마스크를 다른 배열과 똑같이 적용해야
+        # 인덱스가 어긋나 엉뚱한 로봇의 좌표가 붙지 않는다.
+        poses = got.get("pose")
+        if poses is not None and len(poses) == len(mv):
+            poses = poses[mv] if mv.any() else poses
+
+        self.last_windows = {
+            "X": Xn, "C": C, "robot": robot, "ct": cts, "pose": poses,
+            # 대시보드가 이상 구간을 표시할 때 쓴다.
+            # 이상 주입을 끈 실험에서는 전부 0 이다.
+            "labels": (names != "normal").astype(np.int64),
+        }
 
         navs = got.get("nav")
         if navs is not None and len(navs) == len(mv):
@@ -1254,6 +1448,46 @@ class MNAETrainer:
     # ---------------------------
     # Drop-box upload
     # ---------------------------
+    def _window_scores_block(self) -> dict:
+        """
+        이번 라운드 윈도우들의 복원오차와 임계값.
+
+        대시보드는 원래 /tmp 의 PKL 파일을 읽어 직접 점수를 계산했다.
+        데이터 출처가 CSE(Isaac Sim 텔레메트리)로 바뀌면서 그 파일이
+        없어졌고, 노드 패널이 빈칸이 됐다. 이미 계산해 둔 점수를
+        드롭박스 CIN 에 같이 실어 보내면 대시보드는 그리기만 하면 된다.
+
+        판정(verdict)과 달리 FL_VERDICT 와 무관하게 항상 싣는다.
+        점수 계산이 실패해도 업로드는 계속돼야 하므로 빈 dict 를 준다.
+        """
+        w = getattr(self, "last_windows", None)
+        if not w or w.get("X") is None or len(w["X"]) == 0:
+            return {}
+
+        node = getattr(self, "edge_node", None)
+        if node is None:
+            return {}
+
+        try:
+            scores = node.compute_anomaly_scores(w["X"], w["C"])
+        except Exception as e:
+            print(f"    ⚠ 윈도우 점수 계산 실패(업로드는 계속): {e}")
+            return {}
+
+        thr = getattr(node, "threshold", None)
+        labels = w.get("labels")
+        robots = w.get("robot")
+
+        block = {
+            "window_scores": [round(float(v), 6) for v in scores],
+            "threshold": (float(thr) if thr is not None else None),
+        }
+        if labels is not None and len(labels) == len(scores):
+            block["window_labels"] = [int(v) for v in labels]
+        if robots is not None and len(robots) == len(scores):
+            block["window_robots"] = [str(v) for v in robots]
+        return block
+
     def _publish_verdicts(self, round_num: int,
                           model_uri: str = None) -> int:
         """
@@ -1288,6 +1522,7 @@ class MNAETrainer:
                 threshold=threshold,
                 round_num=round_num,
                 cts=w["ct"],
+                poses=w.get("pose"),
                 model_uri=model_uri,
             )
         except Exception as e:
@@ -1330,6 +1565,9 @@ class MNAETrainer:
             "timestamp": time.time(),
         }
 
+        # 가중치는 안 올리지만 대시보드 그래프는 떠야 한다.
+        payload.update(self._window_scores_block())
+
         result = om2m.create_content_instance(
             self.dropbox_cnt_path,
             payload
@@ -1337,7 +1575,8 @@ class MNAETrainer:
 
         if result:
             print(
-                f"  ✓ inference result -> {self.dropbox_cnt_path} "
+                f"  [{self.node_name}] ✓ inference result -> "
+                f"{self.dropbox_cnt_path} "
                 f"(round {round_num}, 가중치 없음)"
             )
 
@@ -1369,6 +1608,10 @@ class MNAETrainer:
             "num_samples": num_samples,
             "timestamp": time.time(),
         }
+
+        # 대시보드 그래프용 윈도우별 점수. 50 윈도우면 500 바이트 정도라
+        # 가중치 크기 제한(FL_MAX_CIN_BYTES)에 영향을 주지 않는다.
+        payload.update(self._window_scores_block())
 
         # 실제 가중치를 con 안에 실어 보낸다.
         # 이것이 있어야 MN을 다른 머신에 올려도 FL이 성립한다.
@@ -1464,6 +1707,11 @@ class MNAETrainer:
         # 로봇이 올라온 뒤에 구독을 건다. 없는 컨테이너에는 못 건다.
         self._subscribe_to_telemetry()
 
+        # 이미 쌓여 있던 텔레메트리는 버리고 지금부터 받는다.
+        # FL_SENSOR_SEED_CURSOR=0 이면 예전처럼 쌓인 것을 가져간다.
+        if os.getenv("FL_SENSOR_SEED_CURSOR", "1") != "0":
+            self._seed_telemetry_cursor()
+
         for round_num in range(1, config.GLOBAL_ROUNDS + 1):
             print("\n" + "─" * 50)
             print(f"[{self.node_name}] wait Round {round_num}")
@@ -1490,8 +1738,11 @@ class MNAETrainer:
             data_dict = self._load_sensor_data_for_round(round_num)
 
             if data_dict is SKIP_ROUND:
-                # 정상 주행이 없는 라운드. 이상 데이터로 학습하느니 빠진다.
-                # IN-AE에는 수집 타임아웃이 있어 나머지 노드로 집계가 진행된다.
+                # 여기까지 왔다는 건 라운드 예산(기본 540초) 내내 기다렸는데도
+                # 학습할 수 있는 구간이 끝내 안 생겼다는 뜻이다. 로봇이 아예
+                # 안 움직이는 상태라 코드가 더 할 수 있는 게 없다.
+                # 평소에는 _load_sensor_data_for_round 가 데이터가 모일 때까지
+                # 기다리므로 여기로 오지 않는다.
                 print(
                     f"  ⊘ Round {round_num}: 학습 가능한 정상 구간이 없어 "
                     f"이번 라운드는 빠진다 ({self.node_name})"
@@ -1660,7 +1911,7 @@ class MNAETrainer:
                 # 공통 모델을 받아 자기 데이터로 보정하는 사업장이다.
                 # 중앙은 이 노드를 FedAvg와 집계 대기에서 제외한다.
                 print(
-                    f"  ◐ 로컬 전용: 가중치 미전송 "
+                    f"  [{self.node_name}] ◐ 로컬 전용: 가중치 미전송 "
                     f"(지표만 보고, 임계값={self.edge_node.threshold})"
                 )
                 upload_result = self._upload_inference_result(
