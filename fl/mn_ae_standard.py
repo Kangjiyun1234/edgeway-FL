@@ -638,6 +638,40 @@ class MNAETrainer:
 
             time.sleep(poll)
 
+    def _seed_telemetry_cursor(self) -> None:
+        """
+        이미 쌓여 있는 텔레메트리를 건너뛰고, FL 시작 후에 들어온 것부터 읽는다.
+
+        [왜]
+        커서가 비어 있으면 fetch 가 "최근 N개"를 긁어 온다. 그래서 Round 1
+        만 Isaac Sim 이 그때까지 올려둔 걸 통째로 가져갔다. 로그에서 mn1 이
+        Round 1 에 341개를 먹고 Round 2 에는 37개밖에 안 남았던 것이 이것
+        때문이다. 라운드마다 조건이 같아야 비교가 되므로, Round 1 도 다른
+        라운드처럼 FL 이 시작된 뒤에 쌓인 것만 받아야 한다.
+
+        각 로봇 컨테이너의 지금 마지막 ct 를 커서로 놓는다. 비어 있는
+        컨테이너는 커서를 두지 않는다. 어차피 거기는 지금부터가 처음이다.
+        """
+        seeded, empty = 0, 0
+
+        for path in self.telemetry_paths:
+            try:
+                cin = om2m.get_latest_content_instance(path)
+            except Exception as e:
+                print(f"    ⚠ {path} 마지막 ct 조회 실패(건너뜀): {e}")
+                continue
+
+            ct = ((cin or {}).get("m2m:cin") or {}).get("ct")
+            if ct:
+                self.telemetry_cursor[path] = ct
+                seeded += 1
+            else:
+                empty += 1
+
+        print(f"  ⏱ 쌓여 있던 텔레메트리는 건너뛴다 "
+              f"(커서 설정 {seeded}개 / 비어 있음 {empty}개). "
+              f"지금부터 쌓이는 것만 학습한다.")
+
     def _load_sensor_data_for_round(self, round_num: int,
                                     max_attempts: int = 3):
         """
@@ -731,14 +765,16 @@ class MNAETrainer:
         if not getattr(config, "FL_SENSOR_FROM_CSE", True):
             return self._load_sensor_data_from_pkl(round_num)
 
-        want_min   = int(os.getenv("FL_SENSOR_MIN_WINDOWS", "40"))
+        # 라운드마다 사업장당 이만큼 모일 때까지 기다린다.
+        # 상한(site_cap)과 같은 값이어야 라운드마다 정확히 같은 양이 된다.
+        want_min   = int(os.getenv("FL_SENSOR_MIN_WINDOWS", "50"))
 
         # 사업장 단위 상한. 로봇 수가 사업장마다 다르므로(A 4대, B 2대)
         # 로봇당 상한만 두면 사업장 총량이 2배 차이 나고, FedAvg가 샘플 수로
         # 가중하기 때문에 로봇이 많은 사업장이 더 큰 영향력을 갖는다.
         # 사업장별 기여를 맞추려면 여기서 사업장 단위로 자른다.
         # 0으로 두면 자르지 않는다(예전 동작).
-        site_cap = int(os.getenv("FL_SENSOR_MAX_WINDOWS_PER_SITE", "600"))
+        site_cap = int(os.getenv("FL_SENSOR_MAX_WINDOWS_PER_SITE", "50"))
 
         # 로봇별 조회 상한은 사업장 상한에서 역산한다. 넉넉히 받아 두고
         # 합친 뒤에 고르게 줄이는 편이, 로봇 하나가 쉬고 있을 때도
@@ -748,7 +784,10 @@ class MNAETrainer:
                              if site_cap > 0 else 300)
         per_robot = int(os.getenv("FL_SENSOR_CIN_LIMIT_PER_ROBOT",
                                   str(default_per_robot)))
-        wait_total = float(os.getenv("FL_SENSOR_ROUND_WAIT_SEC", "90"))
+        # 하한이 찰 때까지 기다린다. 실제 상한은 바깥에서 넘겨주는
+        # hard_deadline(라운드 예산)이므로 여기 기본값은 그보다 크게 둔다.
+        # 예전 기본 90초는 50개가 쌓이기 전에 깨어나 모자란 채로 진행했다.
+        wait_total = float(os.getenv("FL_SENSOR_ROUND_WAIT_SEC", "3600"))
         poll       = float(os.getenv("FL_SENSOR_ROUND_POLL_SEC", "2.0"))
 
         # 라운드마다 "최근 N개"를 다시 긁으면 간격이 짧을 때 같은 데이터를
@@ -1594,6 +1633,11 @@ class MNAETrainer:
         # 로봇이 올라온 뒤에 구독을 건다. 없는 컨테이너에는 못 건다.
         self._subscribe_to_telemetry()
 
+        # 이미 쌓여 있던 텔레메트리는 버리고 지금부터 받는다.
+        # FL_SENSOR_SEED_CURSOR=0 이면 예전처럼 쌓인 것을 가져간다.
+        if os.getenv("FL_SENSOR_SEED_CURSOR", "1") != "0":
+            self._seed_telemetry_cursor()
+
         for round_num in range(1, config.GLOBAL_ROUNDS + 1):
             print("\n" + "─" * 50)
             print(f"[{self.node_name}] wait Round {round_num}")
@@ -1620,8 +1664,11 @@ class MNAETrainer:
             data_dict = self._load_sensor_data_for_round(round_num)
 
             if data_dict is SKIP_ROUND:
-                # 정상 주행이 없는 라운드. 이상 데이터로 학습하느니 빠진다.
-                # IN-AE에는 수집 타임아웃이 있어 나머지 노드로 집계가 진행된다.
+                # 여기까지 왔다는 건 라운드 예산(기본 540초) 내내 기다렸는데도
+                # 학습할 수 있는 구간이 끝내 안 생겼다는 뜻이다. 로봇이 아예
+                # 안 움직이는 상태라 코드가 더 할 수 있는 게 없다.
+                # 평소에는 _load_sensor_data_for_round 가 데이터가 모일 때까지
+                # 기다리므로 여기로 오지 않는다.
                 print(
                     f"  ⊘ Round {round_num}: 학습 가능한 정상 구간이 없어 "
                     f"이번 라운드는 빠진다 ({self.node_name})"

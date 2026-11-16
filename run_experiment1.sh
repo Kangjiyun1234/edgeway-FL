@@ -33,7 +33,9 @@ cd "$(dirname "$0")"
 
 export FL_SENSOR_MAX_WINDOWS_PER_SITE="${FL_SENSOR_MAX_WINDOWS_PER_SITE:-50}"
 export FL_SENSOR_MIN_WINDOWS="${FL_SENSOR_MIN_WINDOWS:-50}"
-export FL_SENSOR_ROUND_WAIT_SEC="${FL_SENSOR_ROUND_WAIT_SEC:-300}"
+# FL_SENSOR_ROUND_WAIT_SEC 은 걸지 않는다. 여기에 값을 주면 하한(50개)을
+# 못 채운 채로 그 시각에 깨어나 모자란 데이터로 진행한다. 기본값은
+# 라운드 예산(IN-AE 수집 타임아웃 -60초)까지 기다리게 돼 있다.
 export FL_VERDICT="${FL_VERDICT:-0}"
 export FL_GLOBAL_ROUNDS="${FL_GLOBAL_ROUNDS:-10}"
 
@@ -41,7 +43,7 @@ echo "============================================================"
 echo "  실험 1 — 이상 탐지 없이 10 라운드"
 echo "============================================================"
 echo "  사업장당 윈도우/라운드 : $FL_SENSOR_MIN_WINDOWS (쌓일 때까지 대기) ~ $FL_SENSOR_MAX_WINDOWS_PER_SITE"
-echo "  수집 대기 제한         : ${FL_SENSOR_ROUND_WAIT_SEC}s"
+echo "  수집 대기 제한         : 라운드 예산까지 (IN-AE 타임아웃 -60s)"
 echo "  판정                   : 끔 (FL_VERDICT=$FL_VERDICT)"
 echo "  라운드                 : $FL_GLOBAL_ROUNDS"
 echo "============================================================"

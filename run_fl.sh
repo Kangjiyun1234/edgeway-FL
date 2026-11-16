@@ -34,6 +34,42 @@ trap cleanup EXIT INT TERM
 
 FROM_CSE="${FL_SENSOR_FROM_CSE:-1}"
 
+# ------------------------------------------------------------
+# 지난 실행 흔적 정리
+#
+# 이걸 안 하면 대시보드가 초기화되지 않는다. /tmp/fl_models/global 에
+# 남은 지난 실행의 global_roundN.pt 를 주워 읽고, 실행 표식(run marker)이
+# 갱신되지 않아 "이 표식보다 오래된 모델은 무시" 하는 걸름망도 안 걸린다.
+# 그래서 새로 띄워도 지난 판의 라운드와 수치가 그대로 보인다.
+#
+# clean_fl.sh 는 쓰지 않는다. 그쪽은 전처리 PKL 이 있어야 시작하는데
+# CSE 모드에는 그 파일이 없어서 바로 멈춘다. 또 프로세스를 죽이는 일까지
+# 하므로 기동 스크립트 안에서 부를 것이 아니다.
+#
+# 지우는 것: 지난 실행의 글로벌/로컬 모델과 캐시
+# 남기는 것: 전처리 PKL (FL_PKL_DIR). 오프라인 모드에서 쓴다.
+# ------------------------------------------------------------
+reset_previous_run() {
+  local base="${FL_MODEL_BASE_DIR:-/tmp/fl_models}"
+  local marker="${FL_DEMO_RUN_MARKER:-${base}/.demo_run_started}"
+
+  echo
+  echo "[0/5] 지난 실행 정리"
+
+  rm -rf "${base}/global" "${base}/local" "${base}/cache"
+  mkdir -p "${base}/global" "${base}/local" "${base}/cache"
+
+  mkdir -p "$(dirname "${marker}")"
+  : > "${marker}"
+
+  echo "  ✓ 모델/캐시 비움: ${base}"
+  echo "  ✓ 실행 표식 갱신: ${marker}"
+}
+
+if [ "${FL_RESET_ON_START:-1}" = "1" ]; then
+  reset_previous_run
+fi
+
 start_dashboard() {
   echo
   echo "[2/5] 대시보드"
