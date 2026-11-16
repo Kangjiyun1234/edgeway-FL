@@ -806,10 +806,17 @@ class MNAETrainer:
             self._round_buffer = None
             self._round_buffer_round = round_num
 
+        n_fresh = 0        # 직전 조회에서 새로 받은 수
+        n_fetched = 0      # 이 라운드에 조회로 받은 누계
+        n_polls = 0
+
         while True:
             if incremental:
                 fresh, cursors = amr_ingest.fetch_site_windows_since(
                     self.telemetry_paths, self.telemetry_cursor, per_robot)
+                n_fresh = len(fresh["signals"])
+                n_fetched += n_fresh
+                n_polls += 1
 
                 # 받은 즉시 커서를 민다. 안 밀면 다음 조회가 같은 구간을
                 # 다시 받는데, telemetry 컨테이너는 mni 때문에 그 사이
@@ -845,8 +852,12 @@ class MNAETrainer:
 
             if now >= next_log:
                 via = "구독" if self.telemetry_subs else "주기 조회"
+                # 새로 받은 수(+N)를 같이 찍는다. 계속 +0 이면 CSE 가
+                # 커서 이후 CIN 을 안 주는 것이고, +N 인데 왼쪽 숫자가
+                # 안 늘면 쌓는 쪽이 잘못된 것이다. 로그만 보고 가려진다.
                 print(f"    ⏳ 윈도우 {n}/{want_min} 수집 중 "
-                      f"({via}, 남은 {deadline - now:.0f}s)")
+                      f"(직전 +{n_fresh}, 조회누계 {n_fetched}, "
+                      f"{n_polls}회, {via}, 남은 {deadline - now:.0f}s)")
                 next_log = now + 5.0
 
             # 구독이 걸려 있으면 알림이 깨울 때까지 기다린다.
