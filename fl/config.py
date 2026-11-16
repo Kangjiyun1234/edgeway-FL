@@ -284,10 +284,51 @@ NOTIFY_HOST = os.getenv(
     "127.0.0.1",
 )
 
+# 알림을 어떤 경로로 받을지.
+#
+#   "direct"  CSE가 우리 HTTP 서버를 직접 호출한다. CSE가 AE에 닿을 수 있을 때.
+#   "pch"     oneM2M <pollingChannel>(m2m:pch, ty=15)로 받는다. AE가 CSE에
+#             길게 걸어 두고 CSE가 그 응답으로 알림을 내려보낸다. TS-0001이
+#             요청 도달 불가(request-unreachable) AE를 위해 정의한 방식이다.
+#
+# 구독도 알림도 그대로다. 전달 방향만 뒤집힌다.
+# 클라우드 CSE와 방화벽 뒤 엣지 AE라는 배치에서는 polling 이어야 한다.
+NOTIFY_MODE = os.getenv("FL_NOTIFY_MODE", "direct").strip().lower()
+
+
+def use_pch() -> bool:
+    return NOTIFY_MODE == "pch"
+
 NUM_CLIENTS = 3
 GLOBAL_ROUNDS = 10
 
 ORIGINATOR = os.getenv("FL_ORIGINATOR", "CAdmin")
+
+# 각 AE가 자기 AE-ID 로 CSE에 요청할지.
+#
+# 꺼져 있으면 모두 ORIGINATOR(기본 CAdmin)로 나간다. 관리자 신원은 ACP를
+# 전부 통과하므로 정책이 걸려 있어도 실제로는 아무것도 막지 못한다.
+#
+# 켜면 MN-AE-1 은 CMN-AE-1, IN-AE 는 CIN-AE 로 요청한다. 그래야 ACP가
+# 실제로 작동하고 "사업장 간 격리"가 말뿐이 아니게 된다.
+#
+# 다만 정책에 구멍이 있으면 그 순간부터 동작이 막힌다. 로봇 AE 쪽 ACP가
+# 들어온 뒤에 켜라. setup_resources_standard.py --verify 로 먼저 확인할 것.
+USE_AE_IDENTITY = os.getenv("FL_USE_AE_IDENTITY", "0") == "1"
+
+# AE-ID. ACP의 acor 와 X-M2M-Origin 에 쓰는 값이다.
+# 한 곳에서 정해야 ACP와 실제 요청이 어긋나지 않는다.
+IN_AE_ID = os.getenv("FL_IN_AE_ID", "CIN-AE")
+
+
+def mn_ae_name(node: str) -> str:
+    """mn1 -> MN-AE-1"""
+    return f"MN-AE-{node[2:]}"
+
+
+def mn_ae_id(node: str) -> str:
+    """mn1 -> CMN-AE-1"""
+    return f"C{mn_ae_name(node)}"
 
 # X-M2M-RI(Request Identifier)는 TS-0009 HTTP 바인딩에서 모든 요청에 필수다.
 # 요청마다 고유값이어야 하므로 여기 고정값을 두지 않고

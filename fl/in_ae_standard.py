@@ -23,8 +23,12 @@ import torch
 from flask import Flask, request, make_response
 
 import config
+
+# IN-AE 의 AE-ID. ACP의 acor 와 X-M2M-Origin 에 쓰는 값이다.
+ORIGIN_IN_AE = config.IN_AE_ID
 import model_codec
 import onem2m_utils as om2m
+import onem2m_pch
 from aggregator import Aggregator
 from model_cvae import CVAE1D
 
@@ -38,6 +42,10 @@ class INAECoordinator:
         # IN-AE는 중앙 CSE에 붙는다. 사업장 CSE는 각 MN-AE가 담당한다.
         om2m.set_endpoint(*config.in_endpoint())
         om2m.set_in_endpoint(*config.in_endpoint())
+
+        # 켜져 있으면 IN-AE 자신의 AE-ID 로 요청한다.
+        if config.USE_AE_IDENTITY:
+            om2m.set_originator(ORIGIN_IN_AE)
         self.in_cse_name = om2m.cse_name()
 
         self.fl_control_path   = f"{self.in_cse_name}/{config.IN_AE_NAME}/cnt-fl-control"
@@ -344,6 +352,42 @@ class INAECoordinator:
         th.start()
         time.sleep(1)
         print(f"  ✓ IN-AE Notification server on port {self.notification_port}")
+        self._setup_notify_path()
+
+    def _setup_notify_path(self):
+        """
+        알림을 어느 경로로 받을지 정한다.
+
+        direct  : CSE가 우리 HTTP 서버를 직접 호출한다. 구독의 nu 는 URL.
+        polling : <pollingChannel> 로 받는다. 구독의 nu 는 AE-ID 이고,
+                  CSE가 그 AE 앞으로 알림을 쌓아 두면 우리가 길게 건 GET 의
+                  응답으로 받아 간다. 받은 알림은 위에서 띄운 로컬 Flask 로
+                  그대로 넘기므로 알림 처리 코드는 바뀌지 않는다.
+        """
+        port = self.notification_port
+        if not config.use_pch():
+            # rr=true 만으로는 부족하다. poa 로 수신 주소를 알려야
+            # CSE가 알림 대상을 검증할 수 있다.
+            ae_path = f"{om2m.cse_name()}/{config.IN_AE_NAME}"
+            poa = f"http://{config.NOTIFY_HOST}:{port}"
+            om2m.set_point_of_access(ae_path, [poa], reachable=True)
+
+            self.notify_target = f"{poa}/notify"
+            return
+
+        ae_path = f"{om2m.cse_name()}/{config.IN_AE_NAME}"
+        print("\n  oneM2M <pollingChannel> 준비 (IN-AE)")
+        onem2m_pch.ensure_channel(ae_path)
+        onem2m_pch.set_request_unreachable(ae_path)
+
+        self.pch_receiver = onem2m_pch.PchReceiver(
+            ae_path,
+            origin=ORIGIN_IN_AE,
+            handler=onem2m_pch.relay_to_local(
+                f"http://127.0.0.1:{port}/notify"),
+        )
+        self.pch_receiver.start()
+        self.notify_target = ORIGIN_IN_AE
 
     # -----------------------
     # ACP 검증
@@ -516,7 +560,7 @@ class INAECoordinator:
             res = om2m.create_subscription(
                 parent_path=cnt_path,
                 subscription_name=sub_name,
-                notification_uri=f"http://{config.NOTIFY_HOST}:{self.notification_port}/notify",
+                notification_uri=self.notify_target,
                 event_types=[3],
                 use_nct=None,
             )

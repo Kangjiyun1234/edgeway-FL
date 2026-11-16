@@ -56,7 +56,7 @@ import config
 import onem2m_utils as om2m
 
 
-ORIGIN_IN_AE = "CIN-AE"
+ORIGIN_IN_AE = config.IN_AE_ID
 
 ACOP_CREATE = 1
 ACOP_RETRIEVE = 2
@@ -71,7 +71,7 @@ SETTLE = 0.3  # CSE가 생성을 커밋할 시간
 
 def origin_mn(node: str) -> str:
     """MN-AE-i의 Originator. mn2 -> CMN-AE-2"""
-    return f"CMN-AE-{node[2:]}"
+    return config.mn_ae_id(node)
 
 
 def all_mn_origins(nodes: List[str]) -> List[str]:

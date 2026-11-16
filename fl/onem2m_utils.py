@@ -51,6 +51,31 @@ IN_PREFIX = "@in/"
 _VERBOSE_BIND = os.getenv("FL_VERBOSE_BIND", "0") == "1"
 
 
+_ORIGINATOR = None
+
+
+def set_originator(aeid: Optional[str]) -> None:
+    """
+    이 프로세스가 CSE에 보낼 X-M2M-Origin 을 정한다.
+
+    지금까지는 모든 요청이 config.ORIGINATOR(기본 CAdmin)로 나갔다.
+    관리자 신원은 ACP를 전부 통과하므로, 정책을 걸어 두어도 실제로는
+    아무것도 막히지 않았다. 사업장 간 격리가 설정만 돼 있고 발동하지
+    않는 상태였다.
+
+    각 AE가 자기 AE-ID(CMN-AE-1, CIN-AE …)로 요청해야 ACP가 의미를 갖는다.
+    None 을 주면 기본값으로 돌아간다.
+    """
+    global _ORIGINATOR
+    _ORIGINATOR = aeid
+    if aeid:
+        print(f"  [oneM2M] Originator -> {aeid}")
+
+
+def originator() -> str:
+    return _ORIGINATOR or config.ORIGINATOR
+
+
 def set_endpoint(base_url: str, cse_name: str) -> None:
     """이 프로세스의 기본 CSE를 지정한다."""
     global _BASE_URL, _CSE_NAME
@@ -189,6 +214,7 @@ def _headers(ty: Optional[int] = None, body: bool = False) -> Dict[str, str]:
     """
     h = config.HEADERS.copy()
     h["X-M2M-RI"] = _next_request_id()
+    h["X-M2M-Origin"] = originator()
     if ty is not None:
         h["Content-Type"] = f"application/json;ty={ty}"
     elif body:
@@ -276,6 +302,32 @@ def create_application(ae_name: str) -> Optional[Dict]:
     except Exception as e:
         print(f"✗ AE create error: {e}")
         return None
+
+
+def set_point_of_access(ae_path: str, poa: List[str],
+                        reachable: bool = True) -> bool:
+    """
+    AE의 pointOfAccess(poa)와 requestReachability(rr)를 갱신한다.
+
+    rr=true 는 "CSE가 나를 직접 호출해도 된다"는 선언인데, poa 가 비어 있으면
+    CSE는 어디로 가야 할지 모른다. 그 상태로 구독을 만들면 CSE가 알림 대상을
+    검증하지 못해 "Verification request failed" 로 거부한다.
+
+    AE 자신이 자기 수신 주소를 알고 있으므로, 기동 시점에 스스로 등록한다.
+    """
+    payload = {"m2m:ae": {"poa": poa, "rr": reachable}}
+    try:
+        r = _request_with_retry("put", _url(ae_path), json=payload,
+                                headers=_headers(body=True), timeout=10)
+    except Exception as e:
+        print(f"  ✗ poa 갱신 오류: {e}")
+        return False
+
+    if r.status_code in (200, 204):
+        print(f"  ✓ {strip_prefix(ae_path)} poa={poa}")
+        return True
+    print(f"  ✗ poa 갱신 실패: {r.status_code} {r.text[:160]}")
+    return False
 
 
 def delete_resource(resource_path: str) -> bool:

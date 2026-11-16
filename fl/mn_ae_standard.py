@@ -26,6 +26,7 @@ import amr_ingest
 import config
 import model_codec
 import onem2m_utils as om2m
+import onem2m_pch
 from edge_node import AEEdgeNode
 
 # "이번 라운드는 학습할 수 없다. 다만 노드를 죽일 일은 아니다"를 나타내는 신호.
@@ -58,6 +59,12 @@ class MNAETrainer:
         self.norm_std = None
 
         self.ae_name = f"MN-AE-{node_id + 1}"
+        self.ae_id = config.mn_ae_id(self.node_name)
+
+        # 켜져 있으면 이 사업장의 AE-ID 로 CSE에 요청한다. 그래야 ACP가
+        # 실제로 작동한다. 꺼져 있으면 기존처럼 CAdmin 으로 나간다.
+        if config.USE_AE_IDENTITY:
+            om2m.set_originator(self.ae_id)
 
         # 이 사업장의 MN-CSE에 바인딩한다. 사업장마다 MEP가 다르다.
         mn_base, mn_cse = config.mn_endpoint(self.node_name)
@@ -93,6 +100,15 @@ class MNAETrainer:
         )
 
         # NOTIFY 기반 round 시작
+        # 텔레메트리 구독으로 받은 알림을 구분하기 위한 구독 ri 집합.
+        # 라운드 명령 알림과 섞이면 안 된다.
+        self.telemetry_subs = set()
+
+        # 로봇이 새 윈도우를 올렸다는 신호. 수집 루프가 이걸 기다린다.
+        # 알림이 깨우므로 2초마다 CSE를 찔러볼 필요가 없다.
+        self.data_event = threading.Event()
+        self.data_notifications = 0
+
         self.job_event = threading.Event()
         self.job_lock = threading.Lock()
         self.latest_job_command = None
@@ -162,6 +178,20 @@ class MNAETrainer:
                     is_cin_created = False
 
                 if not is_cin_created:
+                    resp = make_response("", 200)
+                    resp.headers["X-M2M-RSC"] = "2000"
+                    return resp
+
+                # 텔레메트리 알림이면 "새 데이터 있음"만 세우고 끝낸다.
+                #
+                # 알림마다 CSE를 읽으러 가면 윈도우 수만큼 왕복이 생긴다.
+                # 여기서는 표시만 하고, 실제 읽기는 라운드 수집 때 한 번에
+                # 한다. 알림은 "언제 읽을지"를, cra 증분 조회는 "무엇을
+                # 읽을지"를 정한다.
+                sur = str(sgn.get("sur", "")).strip("/").split("/")[-1]
+                if sur in self.telemetry_subs:
+                    self.data_notifications += 1
+                    self.data_event.set()
                     resp = make_response("", 200)
                     resp.headers["X-M2M-RSC"] = "2000"
                     return resp
@@ -247,6 +277,58 @@ class MNAETrainer:
         th.start()
         time.sleep(1)
         print(f"  ✓ {self.node_name} Notification server on port {self.notification_port}")
+        self._setup_notify_path()
+
+    def _setup_notify_path(self):
+        """
+        알림을 어느 경로로 받을지 정한다.
+
+        direct : CSE가 우리 HTTP 서버를 직접 호출한다. 구독의 nu 는 URL.
+        pch    : oneM2M <pollingChannel>(m2m:pch)로 받는다. 구독의 nu 는
+                 AE-ID 이고, CSE가 그 AE 앞으로 알림을 쌓아 두면 우리가
+                 길게 건 GET 의 응답으로 받아 간다.
+
+        받은 알림은 위에서 띄운 로컬 Flask 로 그대로 넘긴다. 구독 검증,
+        net 판정, 라운드 명령 해석은 이미 거기에 있고 검증된 코드다.
+        전달 경로만 바뀌고 처리 로직은 손대지 않는다.
+
+        MN-AE는 클라우드 IN-CSE의 cnt-fl-control 을 구독한다. 그 CSE가
+        캠퍼스 방화벽 뒤의 우리를 호출하지 못하므로 pch 가 필요하다.
+        <pollingChannel>은 사업장 CSE가 아니라 구독을 건 CSE에 둬야 한다.
+        """
+        port = self.notification_port
+        origin = self.ae_id
+
+        if not config.use_pch():
+            # CSE가 우리를 호출하려면 주소를 알아야 한다. rr=true 만 켜고
+            # poa 를 비워 두면 CSE가 알림 대상을 검증하지 못해 구독이 거부된다
+            # ("Verification request failed for: CMN-AE-1").
+            #
+            # MN-CSE는 같은 머신에서 돌지만 컨테이너 안이라 127.0.0.1 로는
+            # 우리에게 못 온다. 호스트 주소를 알려줘야 한다.
+            ae_path = f"{self.mn_cse_name}/{self.ae_name}"
+            poa = f"http://{config.NOTIFY_HOST}:{port}"
+            om2m.set_point_of_access(ae_path, [poa], reachable=True)
+
+            self.notify_target = f"{poa}/notify"
+            return
+
+        in_cse = config.in_endpoint()[1]
+        ae_path = om2m.in_path(self.ae_name)
+
+        print(f"\n  oneM2M <pollingChannel> 준비 ({self.ae_name})")
+        print(f"    대상 CSE: {in_cse} (구독을 건 곳)")
+        onem2m_pch.ensure_channel(ae_path)
+        onem2m_pch.set_request_unreachable(ae_path)
+
+        self.pch_receiver = onem2m_pch.PchReceiver(
+            ae_path,
+            origin=origin,
+            handler=onem2m_pch.relay_to_local(
+                f"http://127.0.0.1:{port}/notify"),
+        )
+        self.pch_receiver.start()
+        self.notify_target = origin
 
     def _is_expected_command(self, command: dict | None, round_num: int) -> bool:
         if not isinstance(command, dict):
@@ -333,6 +415,64 @@ class MNAETrainer:
     # ---------------------------
     # oneM2M ops
     # ---------------------------
+    def _subscribe_to_telemetry(self) -> int:
+        """
+        이 사업장 로봇들의 telemetry 컨테이너에 구독을 건다.
+
+        설계 문서 9.8.5의 sub-sensor-data-X 에 해당한다. 로봇 AE(ADN-AE)는
+        Isaac Sim 이 만들고, 우리는 그 아래 컨테이너에 구독만 건다.
+
+        전 구간이 사업장 안이다. 로봇 -> MN-CSE -> MN-AE 모두 같은 네트워크라
+        캠퍼스 방화벽과 무관하게 직접 알림이 닿는다. 실제로 CSE 파드가
+        호스트의 5001 포트까지 도달하는 것을 확인했다.
+
+        알림은 "새 데이터가 들어왔다"는 신호로만 쓴다. 내용은 라운드 수집
+        때 cra 증분 조회로 한 번에 읽는다. 그래야 윈도우 하나당 왕복이
+        생기지 않는다.
+
+        반환: 성공한 구독 수
+        """
+        if not getattr(config, "FL_SENSOR_FROM_CSE", True):
+            return 0
+
+        notify_url = self.notify_target
+        if not notify_url.startswith("http"):
+            # pch 모드에서는 nu 가 AE-ID 다. 텔레메트리는 로컬 알림이므로
+            # 그대로 써도 CSE가 poa 로 풀어 준다.
+            notify_url = self.notify_target
+
+        ok = 0
+        print(f"\n  [{self.node_name}] 로봇 텔레메트리 구독")
+        for robot, tel_path in zip(self.robot_names, self.telemetry_paths):
+            if not om2m.resource_exists(tel_path):
+                print(f"    ⚠ {robot}: telemetry 없음 — 건너뜀")
+                continue
+
+            sub_name = f"sub-sensor-data-{self.node_name}"
+            om2m.delete_subscription(tel_path, sub_name)
+            time.sleep(0.1)
+
+            res = om2m.create_subscription(
+                parent_path=tel_path,
+                subscription_name=sub_name,
+                notification_uri=notify_url,
+                event_types=[3],
+                use_nct=1,
+            )
+            if not res:
+                print(f"    ✗ {robot}: 구독 실패")
+                continue
+
+            ri = (res.get("m2m:sub") or {}).get("ri")
+            if ri:
+                self.telemetry_subs.add(ri)
+            ok += 1
+            print(f"    ✓ {robot}")
+
+        if ok == 0:
+            print(f"    ⚠ 구독이 하나도 안 걸렸다. 수집은 주기 조회로 돈다.")
+        return ok
+
     def _subscribe_to_fl_control(self):
         sub_name = f"sub_{self.node_name}"
         om2m.delete_subscription(self.fl_control_path, sub_name)
@@ -340,9 +480,7 @@ class MNAETrainer:
         res = om2m.create_subscription(
             parent_path=self.fl_control_path,
             subscription_name=sub_name,
-            notification_uri=(
-                f"http://{config.NOTIFY_HOST}:{self.notification_port}/notify"
-            ),
+            notification_uri=self.notify_target,
             event_types=[3],
             use_nct=None,
         )
@@ -501,11 +639,19 @@ class MNAETrainer:
                 break
 
             if now >= next_log:
+                via = "구독" if self.telemetry_subs else "주기 조회"
                 print(f"    ⏳ 윈도우 {n}/{want_min} 수집 중 "
-                      f"(남은 {deadline - now:.0f}s)")
+                      f"({via}, 남은 {deadline - now:.0f}s)")
                 next_log = now + 5.0
 
-            time.sleep(poll)
+            # 구독이 걸려 있으면 알림이 깨울 때까지 기다린다.
+            # 주기적으로 CSE를 찌르지 않아도 새 데이터가 오는 순간 반응한다.
+            # 알림이 유실돼도 poll 초마다 한 번은 깨어나므로 멈추지 않는다.
+            if self.telemetry_subs:
+                self.data_event.wait(timeout=poll)
+                self.data_event.clear()
+            else:
+                time.sleep(poll)
 
         # 쓰기로 한 데이터까지만 커서를 민다. 실패한 라운드의 데이터를
         # 건너뛰지 않기 위해, 여기까지 온 뒤에 갱신한다.
@@ -518,6 +664,10 @@ class MNAETrainer:
             got = amr_ingest.balance_across_robots(got, site_cap)
             print(f"    ⓘ 사업장 상한 적용: {before} -> "
                   f"{len(got['signals'])}개 (로봇별 균등)")
+
+        if self.telemetry_subs:
+            print(f"    ⓘ 이번 수집까지 받은 알림 {self.data_notifications}건 "
+                  f"(구독 {len(self.telemetry_subs)}개)")
 
         robots_seen = sorted(set(got["robot"].tolist()))
         print(f"    ✓ 윈도우 {len(got['signals'])}개 / 로봇 {len(robots_seen)}대 "
@@ -1186,6 +1336,9 @@ class MNAETrainer:
         if not self._wait_for_robots():
             print(f"  ✗ {self.node_name}: 로봇 텔레메트리 없이는 학습할 수 없다")
             return
+
+        # 로봇이 올라온 뒤에 구독을 건다. 없는 컨테이너에는 못 건다.
+        self._subscribe_to_telemetry()
 
         for round_num in range(1, config.GLOBAL_ROUNDS + 1):
             print("\n" + "─" * 50)
