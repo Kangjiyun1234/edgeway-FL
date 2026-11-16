@@ -714,8 +714,8 @@ class MNAETrainer:
                 return None
 
             if data is not SKIP_ROUND:
-                # 이 라운드에 쓸 데이터가 정해졌다. 버퍼를 비운다.
-                self._round_buffer = None
+                # 버퍼는 take_head 가 이미 "쓴 만큼만" 덜어냈다.
+                # 남은 것은 다음 라운드 몫이므로 여기서 비우면 안 된다.
                 return data
 
             left = deadline - time.time()
@@ -800,11 +800,10 @@ class MNAETrainer:
             deadline = min(deadline, hard_deadline)
         next_log = 0.0
 
-        # 라운드가 바뀌면 버퍼를 비운다. 같은 라운드 안에서 재시도할 때는
-        # 그대로 두어, 이미 챙긴 윈도우를 다시 받지 않아도 되게 한다.
-        if self._round_buffer_round != round_num:
-            self._round_buffer = None
-            self._round_buffer_round = round_num
+        # 버퍼는 라운드가 바뀌어도 비우지 않는다.
+        # 이번 라운드가 쓰고 남긴 윈도우를 다음 라운드가 이어서 쓴다.
+        # 그래야 라운드마다 정확히 같은 양이 되고, 버려지는 것이 없다.
+        self._round_buffer_round = round_num
 
         n_fresh = 0        # 직전 조회에서 새로 받은 수
         n_fetched = 0      # 이 라운드에 조회로 받은 누계
@@ -855,7 +854,7 @@ class MNAETrainer:
                 # 새로 받은 수(+N)를 같이 찍는다. 계속 +0 이면 CSE 가
                 # 커서 이후 CIN 을 안 주는 것이고, +N 인데 왼쪽 숫자가
                 # 안 늘면 쌓는 쪽이 잘못된 것이다. 로그만 보고 가려진다.
-                print(f"    ⏳ 윈도우 {n}/{want_min} 수집 중 "
+                print(f"    [{self.node_name}] ⏳ 윈도우 {n}/{want_min} 수집 중 "
                       f"(직전 +{n_fresh}, 조회누계 {n_fetched}, "
                       f"{n_polls}회, {via}, 남은 {deadline - now:.0f}s)")
                 next_log = now + 5.0
@@ -873,24 +872,56 @@ class MNAETrainer:
         # 받은 윈도우가 쓸 수 없는 것이어도 버퍼에 남아 있으므로,
         # 재시도할 때 다시 받을 필요가 없다.
 
-        # 사업장 단위로 고르게 줄인다.
-        if site_cap > 0 and len(got["signals"]) > site_cap:
+        # 시간순으로 줄 세우고 앞에서 want_min 개만 떼어 쓴다.
+        #
+        # 버퍼는 로봇별로 받아 이어 붙인 것이라 [AMR_1 전부][AMR_2 전부]
+        # 처럼 묶여 있다. 정렬 없이 앞에서 자르면 로봇 하나만 가져간다.
+        # 정렬 키는 t_wall(로봇이 측정한 시각)이고, 없으면 ct 로 떨어진다.
+        #
+        # 남은 것은 버리지 않고 버퍼에 둔다. 다음 라운드가 그 뒤를 본다.
+        # 예전에는 전 구간에서 linspace 로 뽑고 나머지를 버렸는데, 그러면
+        # 한 시점에 생긴 이상이 여러 라운드로 흩어지고 데이터도 사라졌다.
+        take = want_min if want_min > 0 else len(got["signals"])
+        if len(got["signals"]) > take:
             before = len(got["signals"])
-            got = amr_ingest.balance_across_robots(got, site_cap)
-            print(f"    ⓘ 사업장 상한 적용: {before} -> "
-                  f"{len(got['signals'])}개 (로봇별 균등)")
+            got = amr_ingest.sort_by_time(got)
+            got, leftover = amr_ingest.take_head(got, take)
+            self._round_buffer = leftover
+            print(f"    [{self.node_name}] ⓘ 시간순 {before}개 중 앞 "
+                  f"{len(got['signals'])}개 사용, "
+                  f"{len(leftover['signals'])}개는 다음 라운드로")
+        else:
+            got = amr_ingest.sort_by_time(got)
+            self._round_buffer = None
 
         if self.telemetry_subs:
-            print(f"    ⓘ 이번 수집까지 받은 알림 {self.data_notifications}건 "
+            print(f"    [{self.node_name}] ⓘ 이번 수집까지 받은 알림 "
+                  f"{self.data_notifications}건 "
                   f"(구독 {len(self.telemetry_subs)}개)")
 
         robots_seen = sorted(set(got["robot"].tolist()))
-        print(f"    ✓ 윈도우 {len(got['signals'])}개 / 로봇 {len(robots_seen)}대 "
+        print(f"    [{self.node_name}] ✓ 윈도우 {len(got['signals'])}개 "
+              f"/ 로봇 {len(robots_seen)}대 "
               f"(CIN {got['n_raw']}개"
               f"{', 증분' if incremental else ', 최근 N개'})")
         if len(robots_seen) < len(self.robot_names):
             missing = [r for r in self.robot_names if r not in robots_seen]
             print(f"    ⚠ 데이터가 없는 로봇: {', '.join(missing)}")
+
+        # 로봇별 몫을 강제로 맞추지 않는다. 실제 주행량이 그대로 반영되는
+        # 것이 맞다. 다만 한 로봇이 독식하면 그 라운드는 그 로봇의 경로만
+        # 학습하므로, 나중에 손실이 이상할 때 원인을 알 수 있게 찍어둔다.
+        counts = amr_ingest.robot_counts(got)
+        if counts:
+            print(f"    [{self.node_name}] ⓘ 로봇별: "
+                  + "  ".join(f"{r.split('_')[-1]}={c}"
+                              for r, c in sorted(counts.items())))
+
+        gaps = amr_ingest.seq_gaps(got)
+        if gaps:
+            print(f"    [{self.node_name}] ⚠ 윈도우 유실(seq 기준): "
+                  + "  ".join(f"{r.split('_')[-1]}={n}개"
+                              for r, n in sorted(gaps.items())))
 
         return self._build_round_data_from_cse(got)
 
@@ -1535,7 +1566,8 @@ class MNAETrainer:
 
         if result:
             print(
-                f"  ✓ inference result -> {self.dropbox_cnt_path} "
+                f"  [{self.node_name}] ✓ inference result -> "
+                f"{self.dropbox_cnt_path} "
                 f"(round {round_num}, 가중치 없음)"
             )
 
@@ -1870,7 +1902,7 @@ class MNAETrainer:
                 # 공통 모델을 받아 자기 데이터로 보정하는 사업장이다.
                 # 중앙은 이 노드를 FedAvg와 집계 대기에서 제외한다.
                 print(
-                    f"  ◐ 로컬 전용: 가중치 미전송 "
+                    f"  [{self.node_name}] ◐ 로컬 전용: 가중치 미전송 "
                     f"(지표만 보고, 임계값={self.edge_node.threshold})"
                 )
                 upload_result = self._upload_inference_result(

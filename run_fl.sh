@@ -210,15 +210,23 @@ fi
 
 echo
 echo "[4/5] MN-AE 기동 (사업장 3곳)"
-python3 -u fl/mn_ae_standard.py 0 5001 &
+
+# 셋이 한 터미널에 찍으면 줄이 뒤섞여 어느 노드 것인지 알기 어렵다.
+# 줄 앞에 노드 이름을 박아 두었지만, 한 노드만 따로 보고 싶을 때를 위해
+# 파일로도 나눠 남긴다. 터미널 출력은 tee 로 그대로 둔다.
+RUN_LOG_DIR="logs/run_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$RUN_LOG_DIR"
+echo "  노드별 로그: $RUN_LOG_DIR/"
+
+python3 -u fl/mn_ae_standard.py 0 5001 2>&1 | tee "$RUN_LOG_DIR/mn1.log" &
 PIDS+=("$!")
 echo "  MN-AE-1 (siteA / mep-a) PID: ${PIDS[-1]}"
 
-python3 -u fl/mn_ae_standard.py 1 5002 &
+python3 -u fl/mn_ae_standard.py 1 5002 2>&1 | tee "$RUN_LOG_DIR/mn2.log" &
 PIDS+=("$!")
 echo "  MN-AE-2 (siteB / mep-b) PID: ${PIDS[-1]}"
 
-python3 -u fl/mn_ae_standard.py 2 5003 &
+python3 -u fl/mn_ae_standard.py 2 5003 2>&1 | tee "$RUN_LOG_DIR/mn3.log" &
 PIDS+=("$!")
 echo "  MN-AE-3 (siteC / mep-c) PID: ${PIDS[-1]}"
 
@@ -243,7 +251,7 @@ echo "[5/5] IN-AE"
 #
 # 나중에 중앙 노드에 자리가 생기면 FL_START_IN_AE=0 으로 끄고 거기서 띄운다.
 if [ "${FL_START_IN_AE:-1}" = "1" ]; then
-  python3 -u fl/in_ae_standard.py &
+  python3 -u fl/in_ae_standard.py 2>&1 | tee "$RUN_LOG_DIR/in_ae.log" &
   PIDS+=("$!")
   echo "  IN-AE PID: ${PIDS[-1]}  (중앙 CSE 는 원격, 알림은 pollingChannel)"
 else
@@ -253,6 +261,7 @@ fi
 echo
 echo "============================================================"
 echo "  전부 기동됨.   대시보드: http://localhost:7000"
+echo "  노드별 로그:   $RUN_LOG_DIR/{mn1,mn2,mn3,in_ae}.log"
 echo "  Ctrl+C 로 전체 종료"
 echo "============================================================"
 echo
