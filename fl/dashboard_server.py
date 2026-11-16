@@ -532,8 +532,11 @@ def _load_model(
 ) -> CVAE1D:
     ae_config = config.AE_CFG
 
+    # cond_dim 을 빠뜨리면 CVAE1D 기본값(11)로 만들어진다. 실제 설정은 8이라
+    # encoder.0.weight 의 입력 채널이 46 대신 49 가 되고 로드가 실패한다.
     model = CVAE1D(
         n_channels=ae_config.n_channels,
+        cond_dim=ae_config.cond_dim,
         latent_dim=ae_config.latent_dim,
         seq_len=ae_config.seq_len,
     )

@@ -114,6 +114,10 @@ class MNAETrainer:
         # 한쪽 설정이 다른 쪽을 망가뜨린다.
         #   local  : 사업장 MN-CSE. 로봇 텔레메트리 알림.
         #   remote : 클라우드 IN-CSE. 라운드 명령 알림.
+        # 이 프로세스가 뜬 시각. 이보다 먼저 발행된 라운드 명령은
+        # 지난 실행의 잔재이므로 따르지 않는다.
+        self.started_at = time.time()
+
         self.local_notify_target = None
         self.remote_notify_target = None
         self.local_pch = None
@@ -225,16 +229,22 @@ class MNAETrainer:
                 # CSE가 rep를 보내지 않은 경우에만
                 # NOTIFY를 계기로 최신 CIN을 한 번 조회
                 #
-                # 이 경로는 위험하다. /la 는 "지금 가장 최신"을 주므로,
-                # 이 알림이 가리킨 CIN 과 다른 것을 읽을 수 있다. 예를 들어
-                # FL_READY 알림을 처리하는 사이 FL_TRAINING 이 올라와 있으면
-                # FL_READY 를 FL_TRAINING 으로 읽는다. 그러면 job_event 를
-                # 미리 소모해 정작 진짜 명령을 기다리다 타임아웃이 난다.
-                # 언제 이 경로를 타는지 보이게 둔다.
+                # rep 가 없으면 그냥 무시한다. 전에는 /la 를 대신 읽었는데
+                # 그게 묵은 명령으로 라운드를 시작시켰다.
+                #
+                # cnt-fl-control 에는 지난 실행의 CIN 이 남아 있다. 기동 직후
+                # rep 없는 알림이 하나만 와도 /la 가 지난 실행의
+                # FL_TRAINING round=1 을 돌려주고, MN-AE 는 그것을 이번
+                # 라운드 명령으로 알고 학습을 시작한다. 실제로 그렇게 됐다.
+                # IN-AE 가 아직 라운드를 열기도 전에 학습하고 업로드했고,
+                # 그 업로드는 IN-AE 가 드롭박스를 비우면서 사라졌다.
+                #
+                # 알림을 놓친 경우는 _wait_for_round_command 의 타임아웃
+                # 폴백이 이미 처리한다. 그쪽은 라운드 번호를 대조하므로 안전하다.
                 if command is None:
-                    command = self._get_current_job_state()
-                    print(f"  ⚠ {self.node_name}: 알림에 rep 가 없어 "
-                          f"/la 를 읽었다 (알림이 가리킨 CIN 과 다를 수 있다)")
+                    resp = make_response("", 200)
+                    resp.headers["X-M2M-RSC"] = "2000"
+                    return resp
 
                 if command:
                     state = str(command.get("jobState", ""))
@@ -257,6 +267,9 @@ class MNAETrainer:
                             f"  ⚠ {self.node_name}: "
                             f"ignore command type={command_type!r}"
                         )
+
+                    elif self._is_stale_command(command):
+                        pass
 
                     elif state in ("FL_TRAINING", "FL_COMPLETED"):
                         with self.job_lock:
@@ -363,6 +376,26 @@ class MNAETrainer:
                       f"없다. 라운드 명령 구독이 실패할 것이다.")
         else:
             self.remote_notify_target = f"{poa}/notify"
+
+    def _is_stale_command(self, command: dict) -> bool:
+        """
+        이 프로세스가 뜨기 전에 발행된 명령인가.
+
+        cnt-fl-control 은 실행 사이에 비워지지 않는다. MN-AE 가 구독하고
+        있어서 컨테이너를 지웠다 다시 만들 수 없기 때문이다. 그래서 지난
+        실행의 FL_TRAINING round=1 이 그대로 남아 있고, 이번 실행의 것과
+        내용이 똑같아 보인다. 발행 시각으로 가른다.
+        """
+        try:
+            ts = float(command.get("timestamp", 0))
+        except (TypeError, ValueError):
+            return False
+        if ts <= 0 or ts >= self.started_at:
+            return False
+        print(f"  ⓘ {self.node_name}: 지난 실행의 명령 무시 "
+              f"(발행 {time.strftime('%H:%M:%S', time.localtime(ts))}, "
+              f"기동 {time.strftime('%H:%M:%S', time.localtime(self.started_at))})")
+        return True
 
     def _is_expected_command(self, command: dict | None, round_num: int) -> bool:
         if not isinstance(command, dict):
@@ -529,7 +562,9 @@ class MNAETrainer:
         return res
 
     def _ensure_local_model_container(self):
-        parent = f"{config.CSE_NAME}/{self.ae_name}"
+        # config.CSE_NAME 은 import 시점의 mn1 CSE 라 mn2/mn3 가 쓰면
+        # 남의 CSE 에 만들려 해서 404 가 난다. 자기 사업장 CSE 를 쓴다.
+        parent = f"{self.mn_cse_name}/{self.ae_name}"
         res = om2m.create_container(
             parent_path=parent, container_name=self.local_model_cnt, mni=20
         )
