@@ -1286,6 +1286,50 @@ def _parse_content_instance(
 # FL 상태 polling thread
 # ════════════════════════════════════════════════════════
 
+DASHBOARD_STARTED_AT = time.time()
+IGNORE_STALE_CONTROL = os.getenv("FL_DASH_IGNORE_STALE", "1") != "0"
+_stale_control_warned = False
+
+
+def _is_stale_control(content: dict) -> bool:
+    """
+    지난 실행이 남긴 라운드 명령인지 본다.
+
+    cnt-fl-control 은 라운드마다 CIN 을 덧붙이기만 하고 비우지 않는다.
+    그래서 새로 띄워도 IN-AE 가 첫 명령을 올리기 전까지는 지난 판의
+    마지막 상태가 그대로 보인다. "대시보드가 2라운드부터 시작"하는 것이
+    이것이다. run_fl.sh 에서 대시보드는 [2/5], IN-AE 는 [5/5] 라
+    그 틈이 수십 초다.
+
+    MN-AE 가 묵은 명령을 거를 때와 같은 기준을 쓴다. payload 의
+    timestamp 가 이 대시보드 기동 시각보다 이르면 지난 실행 것이다.
+    FL_DASH_IGNORE_STALE=0 으로 끄면 예전처럼 그대로 보여준다.
+    """
+    global _stale_control_warned
+
+    if not IGNORE_STALE_CONTROL:
+        return False
+
+    try:
+        ts = float(content.get("timestamp", 0))
+    except (TypeError, ValueError):
+        return False
+
+    if ts <= 0 or ts >= DASHBOARD_STARTED_AT:
+        return False
+
+    if not _stale_control_warned:
+        _stale_control_warned = True
+        print(
+            f"  ⓘ 지난 실행의 라운드 상태를 무시한다 "
+            f"(R{content.get('currentRound')} "
+            f"{content.get('jobState')}). "
+            f"IN-AE 가 새 명령을 올릴 때까지 대기한다."
+        )
+
+    return True
+
+
 def _poll_thread() -> None:
     # IN-AE 의 컨테이너는 중앙 IN-CSE 에 있다. config.CSE_NAME 은 사업장
     # MN-CSE 이름이라, 그걸로 경로를 만들면 없는 리소스를 찾게 된다.
@@ -1307,6 +1351,10 @@ def _poll_thread() -> None:
                     )
                 )
             )
+
+            if control_content and _is_stale_control(control_content):
+                # 지난 실행의 잔상. 새 명령이 올 때까지 아무것도 안 바꾼다.
+                control_content = None
 
             if control_content:
                 fl_state = control_content.get(
