@@ -59,6 +59,11 @@ logs/
 # (FEMTO 시절 fl_buffer/*.pkl 53MB, femto_replay/*.npz 50MB가 히스토리에
 #  들어가 있었다. 새 레포에서는 처음부터 막는다)
 *.npz
+
+# 다만 검증셋은 레포에 둔다. 고정된 라벨 데이터라 매 실행 같은 자로 재야
+# 라운드별 AUROC 를 비교할 수 있다. 2MB 라 용량 문제도 없다.
+!fl/valset_amr.npz
+
 fl_buffer/
 femto_replay/
 data/

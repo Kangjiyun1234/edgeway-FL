@@ -23,6 +23,7 @@ import torch
 from flask import Flask, request, make_response
 
 import config
+import valset
 
 # IN-AE 의 AE-ID. ACP의 acor 와 X-M2M-Origin 에 쓰는 값이다.
 ORIGIN_IN_AE = config.IN_AE_ID
@@ -55,6 +56,9 @@ class INAECoordinator:
         self.fl_control_path   = f"{self.in_cse_name}/{config.IN_AE_NAME}/cnt-fl-control"
         self.global_model_path = f"{self.in_cse_name}/{config.IN_AE_NAME}/cnt-global-model"
         self.dropbox_root      = f"{self.in_cse_name}/{config.IN_AE_NAME}/cnt-local-updates"
+        # 고정 검증셋으로 잰 라운드별 성능을 여기에 남긴다.
+        # 대시보드가 이걸 읽어 로그로 띄운다.
+        self.fl_inference_path = f"{self.in_cse_name}/{config.IN_AE_NAME}/cnt-fl-inference"
 
         # 리소스/구독은 모든 노드에 대해 만든다.
         # cold start 노드도 라운드 명령과 글로벌 모델은 받아야 추론을 할 수 있다.
@@ -1094,6 +1098,47 @@ class INAECoordinator:
         return avg_loss, out_path
 
     # -----------------------
+    # 고정 검증셋 평가
+    # -----------------------
+    def _evaluate_global(self, round_num: int, model_path: str):
+        """
+        이번 라운드 글로벌 모델을 고정 검증셋으로 잰다.
+
+        라운드마다 같은 데이터·같은 자로 재야 "갈수록 좋아진다"를 말할 수
+        있다. 그동안의 val_auroc 는 그 라운드에 받은 윈도우로 계산해서
+        라운드 간 비교가 안 됐고, 라이브 스트림에 라벨이 없어 늘 0.5 였다.
+
+        결과는 cnt-fl-inference 에 CIN 으로 남긴다. 대시보드가 읽어 띄운다.
+        평가가 실패해도 FL 은 계속한다.
+        """
+        try:
+            m = valset.evaluate(model_path)
+        except Exception as e:
+            print(f"  ⚠ 검증셋 평가 실패(계속 진행): {e}")
+            return
+
+        if not m:
+            return
+
+        print(f"  [EVAL] Round {round_num}  {valset.summary_line(m)}")
+
+        payload = {
+            "type": "global-eval",
+            "round": round_num,
+            "model": model_path,
+            "timestamp": time.time(),
+        }
+        payload.update(m)
+
+        try:
+            om2m.create_content_instance(
+                self.fl_inference_path, payload,
+                labels=[f"round_{round_num}", "global-eval"],
+            )
+        except Exception as e:
+            print(f"  ⚠ 평가 결과 업로드 실패(계속 진행): {e}")
+
+    # -----------------------
     # Hidden test evaluation
     # -----------------------
     def _run_hidden_test_eval(self):
@@ -1254,6 +1299,8 @@ class INAECoordinator:
                     "abort FL"
                 )
                 return
+
+            self._evaluate_global(r, final_path)
 
         print("\nFederated learning completed!")
         self._publish_job_state("FL_COMPLETED", self.max_rounds)

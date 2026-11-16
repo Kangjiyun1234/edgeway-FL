@@ -1349,8 +1349,13 @@ def _poll_thread() -> None:
     local_updates_path = om2m.in_path(
         f"{config.IN_AE_NAME}/cnt-local-updates"
     )
+    # IN-AE 가 라운드마다 고정 검증셋으로 잰 결과를 올리는 곳.
+    fl_inference_path = om2m.in_path(
+        f"{config.IN_AE_NAME}/cnt-fl-inference"
+    )
 
     previous_snapshot: dict = {}
+    last_eval_round = -1
 
     while True:
         try:
@@ -1488,6 +1493,21 @@ def _poll_thread() -> None:
                         f"{fl_state} "
                         f"nodes={list(nodes.keys())}"
                     )
+
+            # 라운드별 평가 결과. 새 라운드 것만 한 번씩 내보낸다.
+            ev = _parse_content_instance(
+                om2m.get_latest_content_instance(fl_inference_path)
+            )
+            if (ev and ev.get("type") == "global-eval"
+                    and int(ev.get("round", -1)) > last_eval_round):
+                last_eval_round = int(ev["round"])
+                ev = dict(ev)
+                ev["type"] = "eval"
+                _broadcast(ev)
+                print(f"  [Eval] R{last_eval_round} "
+                      f"AUROC={ev.get('auroc')} "
+                      f"탐지={ev.get('detected')}/{ev.get('n_anomaly')} "
+                      f"오경보={ev.get('false_alarms')}/{ev.get('n_normal')}")
 
         except Exception as error:
             print(

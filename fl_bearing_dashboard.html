@@ -261,6 +261,21 @@
     border-radius: var(--radius-lg); padding: 12px 16px;
   }
   .conn-label { font-size: 12px; font-weight: 500; color: var(--text2); }
+
+  /* 라운드별 평가 로그. 고정 검증셋으로 잰 값이 여기에 쌓인다. */
+  .evallog { margin-top: 14px; border: 1px solid var(--line); border-radius: 10px;
+             background: var(--card); overflow: hidden; }
+  .evallog-head { padding: 10px 14px; border-bottom: 1px solid var(--line);
+                  font-size: 12px; font-weight: 600; color: var(--text2);
+                  display: flex; justify-content: space-between; align-items: center; }
+  .evallog-sub  { font-size: 10px; font-weight: 500; color: var(--text3); }
+  .evallog-body { max-height: 168px; overflow-y: auto; padding: 8px 0;
+                  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                  font-size: 11.5px; line-height: 1.75; }
+  .evallog-body .row { padding: 1px 14px; color: var(--text2); white-space: pre; }
+  .evallog-body .row b { color: var(--text); font-weight: 600; }
+  .evallog-body .empty { padding: 10px 14px; color: var(--text3); font-size: 11px;
+                         font-family: inherit; }
   .sep { flex: 1; }
   .btn {
     font-size: 12px; padding: 6px 14px;
@@ -434,6 +449,17 @@
         <div style="position:relative;height:100px;"><canvas id="c-loss"></canvas></div>
       </div>
 
+    </div>
+  </div>
+
+  <!-- 라운드별 평가 로그 -->
+  <div class="evallog">
+    <div class="evallog-head">
+      <span>ROUND EVALUATION — 고정 검증셋</span>
+      <span class="evallog-sub" id="evallog-meta">대기 중</span>
+    </div>
+    <div class="evallog-body" id="evallog-body">
+      <div class="empty">집계가 끝나면 라운드마다 한 줄씩 쌓입니다.</div>
     </div>
   </div>
 
@@ -931,6 +957,8 @@ function connect() {
       handleScore(evt);
     } else if (evt.type === 'summary') {
       handleSummary(evt);
+    } else if (evt.type === 'eval') {
+      handleEval(evt);
     }
   };
 
@@ -942,6 +970,38 @@ function connect() {
       reconnectTimer = setTimeout(connect, 5000);
     }
   };
+}
+
+// ───────────────────────────────────────────────────
+// 라운드별 평가 로그
+//
+// 매 라운드 같은 검증셋·같은 자로 잰 값이라 라운드 간 비교가 된다.
+// 라운드에 받은 데이터로 계산하던 기존 val_auroc 와는 다르다.
+// ───────────────────────────────────────────────────
+const evalSeen = new Set();
+
+function handleEval(e) {
+  if (e.round == null || evalSeen.has(e.round)) return;
+  evalSeen.add(e.round);
+
+  const body = document.getElementById('evallog-body');
+  const empty = body.querySelector('.empty');
+  if (empty) empty.remove();
+
+  const pad = (v, n) => String(v).padStart(n, ' ');
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.innerHTML =
+    `R${pad(e.round, 2)}  AUROC <b>${Number(e.auroc).toFixed(4)}</b>` +
+    `   탐지 ${pad(e.detected, 3)}/${e.n_anomaly}` +
+    `   오경보 ${pad(e.false_alarms, 3)}/${e.n_normal}` +
+    `   정상 ${Number(e.mean_normal).toFixed(3)}` +
+    ` vs 이상 ${Number(e.mean_anomaly).toFixed(3)}`;
+  body.appendChild(row);
+  body.scrollTop = body.scrollHeight;
+
+  document.getElementById('evallog-meta').textContent =
+    `정상 ${e.n_normal} / 이상 ${e.n_anomaly} · 최신 R${e.round} AUROC ${Number(e.auroc).toFixed(4)}`;
 }
 
 document.getElementById('btn-reconnect').addEventListener('click', () => {
