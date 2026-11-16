@@ -89,6 +89,10 @@ class MNAETrainer:
         # 한 번에 다 긁을 수 없어서, 받을 때마다 여기에 쌓는다.
         self._round_buffer = None
         self._round_buffer_round = None
+
+        # 이번 라운드가 쓰고 남길 몫. 라운드가 실제로 성립한 뒤에
+        # _round_buffer 로 옮긴다.
+        self._pending_leftover = None
         self.telemetry_paths = [
             f"{mn_cse}/{rb}/{config.ROBOT_TELEMETRY_CNT}"
             for rb in self.robot_names
@@ -714,8 +718,10 @@ class MNAETrainer:
                 return None
 
             if data is not SKIP_ROUND:
-                # 버퍼는 take_head 가 이미 "쓴 만큼만" 덜어냈다.
-                # 남은 것은 다음 라운드 몫이므로 여기서 비우면 안 된다.
+                # 라운드가 성립했다. 이제서야 쓴 만큼을 버퍼에서 덜어낸다.
+                # 실패했다면 버퍼는 손대지 않은 채로 남아 재시도가
+                # 같은 윈도우를 다시 본다.
+                self._round_buffer = self._pending_leftover
                 return data
 
             left = deadline - time.time()
@@ -886,13 +892,16 @@ class MNAETrainer:
             before = len(got["signals"])
             got = amr_ingest.sort_by_time(got)
             got, leftover = amr_ingest.take_head(got, take)
-            self._round_buffer = leftover
+            # 여기서 바로 버퍼를 줄이면 안 된다. 아래 _build_round_data
+            # 에서 정상 구간이 하나도 없어 SKIP_ROUND 가 나면 방금 뗀
+            # 윈도우가 사라진다. 라운드가 성립한 뒤에 바깥에서 옮긴다.
+            self._pending_leftover = leftover
             print(f"    [{self.node_name}] ⓘ 시간순 {before}개 중 앞 "
                   f"{len(got['signals'])}개 사용, "
                   f"{len(leftover['signals'])}개는 다음 라운드로")
         else:
             got = amr_ingest.sort_by_time(got)
-            self._round_buffer = None
+            self._pending_leftover = None
 
         if self.telemetry_subs:
             print(f"    [{self.node_name}] ⓘ 이번 수집까지 받은 알림 "
