@@ -1037,21 +1037,39 @@ class MNAETrainer:
         navs = got.get("nav")
         if navs is not None and len(navs) == len(mv):
             navs = navs[mv] if mv.any() else navs
-        is_normal = names == "normal"
-        if navs is not None and len(navs) == len(is_normal):
-            is_normal = is_normal & ~np.isin(navs, list(sch.EXCLUDE_NAV_TRAIN))
+        # 라벨 기반 필터와 품질 기반 필터를 나눠 둔다.
+        #
+        #  label_ok : cond/nav 가 알려주는 '정답'. 이걸로 학습 집합을
+        #             추리면 "이 구간이 정상임을 미리 안다"는 가정이 되어
+        #             비지도 주장이 약해진다. 기본으로 쓰지 않는다.
+        #  nav_ok   : 'aborted' 같은 끊긴 주행 제외. 정답이 아니라 사실이고,
+        #             끊긴 구간은 어느 쪽이든 학습에 못 쓴다. 항상 적용한다.
+        label_ok = names == "normal"
 
-        n_normal = int(is_normal.sum())
-        print(f"      이동 {len(Xn)}개 중 학습 대상 {n_normal}개")
+        nav_ok = np.ones(len(Xn), dtype=bool)
+        if navs is not None and len(navs) == len(nav_ok):
+            nav_ok = ~np.isin(navs, list(sch.EXCLUDE_NAV_TRAIN))
 
-        if n_normal == 0:
-            print("      ✗ 정상 주행 구간이 없다. 이 라운드는 학습하지 않는다.")
-            print("        (이상 구간으로 정상 패턴을 학습할 수는 없다)")
+        # FL_LABEL_FOR_TRAIN=1 이면 예전처럼 정상 라벨만 학습한다.
+        # 둘을 각각 돌려 비교하면 "라벨 없이도 이만큼 된다"가 수치로 남는다.
+        use_label = os.getenv("FL_LABEL_FOR_TRAIN", "0") not in (
+            "0", "false", "False")
+        train_mask = (nav_ok & label_ok) if use_label else nav_ok
+
+        n_train = int(train_mask.sum())
+        n_label_anom = int((~label_ok).sum())
+
+        print(f"      이동 {len(Xn)}개 중 학습 대상 {n_train}개 "
+              f"(라벨 이상 {n_label_anom}개"
+              f"{', 학습에서 제외' if use_label else ', 학습에 포함'})")
+
+        if n_train == 0:
+            print("      ✗ 학습에 쓸 윈도우가 없다. 이 라운드는 학습하지 않는다.")
             return SKIP_ROUND
 
         return {
-            "train_signals": Xn[is_normal],
-            "train_cond": C[is_normal],
+            "train_signals": Xn[train_mask],
+            "train_cond": C[train_mask],
             "val_signals": Xn,
             "val_cond": C,
             "val_labels": (names != "normal").astype(np.int64),
