@@ -351,7 +351,7 @@ class INAECoordinator:
     def _verify_acp(self):
         """시작 시 ACP 접근 제어 검증 로그 출력"""
         print("\n=== ACP 접근 제어 검증 ===")
-        cse = config.CSE_NAME
+        cse = om2m.cse_name()
         cin = {"m2m:cin": {"con": "acp-verify-test"}}
 
         def check(method, path, origin, data=None, expect_ok=True):
@@ -361,9 +361,10 @@ class INAECoordinator:
                 "X-M2M-Origin": origin,
                 "Content-Type": "application/json;ty=4",
             }
-            url = f"{config.BASE_URL}/{path}"
+            url = f"{om2m.base_url()}/{path}"
             try:
-                r = getattr(_req, method)(url, headers=h, json=data, timeout=5)
+                r = om2m._request_with_retry(
+                    method, url, headers=h, json=data, timeout=5)
                 blocked = "no privilege" in r.text or r.status_code == 403
                 allowed = r.status_code in [200, 201]
                 short_path = path.replace(f"{cse}/", "")
@@ -394,7 +395,9 @@ class INAECoordinator:
             ]
         h_admin = config.HEADERS.copy()
         for path in check_paths:
-            r = _req.get(f"{config.BASE_URL}/{path}", headers=h_admin, timeout=5)
+            r = om2m._request_with_retry(
+                "get", f"{om2m.base_url()}/{path}",
+                headers=h_admin, timeout=5)
             if r.status_code == 200:
                 acpi = r.json().get("m2m:cnt", {}).get("acpi", [])
                 short = path.replace(f"{cse}/", "")
@@ -435,7 +438,7 @@ class INAECoordinator:
 
     def _prepare_dropbox(self):
         print("\n  Prepare drop-box containers (delete & recreate to clear old CINs)...")
-        dropbox_path = f"{config.CSE_NAME}/{config.IN_AE_NAME}/cnt-local-updates"
+        dropbox_path = f"{om2m.cse_name()}/{config.IN_AE_NAME}/cnt-local-updates"
 
         # 삭제 전 ACP 정보 저장
         root_acpi = self._read_acpi(dropbox_path)
@@ -445,7 +448,7 @@ class INAECoordinator:
         }
 
         om2m.delete_resource(dropbox_path)
-        om2m.create_container(f"{config.CSE_NAME}/{config.IN_AE_NAME}", "cnt-local-updates",
+        om2m.create_container(f"{om2m.cse_name()}/{config.IN_AE_NAME}", "cnt-local-updates",
                               mni=5000, mbs=50_000_000)
         if root_acpi:
             om2m.update_acpi(dropbox_path, root_acpi)
