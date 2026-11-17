@@ -59,8 +59,8 @@ class MNAETrainer:
         self.norm_mean = None
         self.norm_std = None
 
-        self.ae_name = f"MN-AE-{node_id + 1}"
-        self.ae_id = config.mn_ae_id(self.node_name)
+        self.ae_name = config.training_ae_name(self.node_name)
+        self.ae_id = config.training_ae_id(self.node_name)
 
         # 켜져 있으면 이 사업장의 AE-ID 로 CSE에 요청한다. 그래야 ACP가
         # 실제로 작동한다. 꺼져 있으면 기존처럼 CAdmin 으로 나간다.
@@ -156,7 +156,7 @@ class MNAETrainer:
 
         self.edge_node = None
 
-        self.app = Flask(f"MN-AE-{self.node_name}")
+        self.app = Flask(self.ae_name)
         self._setup_flask()
 
         self.edge_cache_dir = f"/tmp/fl_models/cache/{self.node_name}"

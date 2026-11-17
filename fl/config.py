@@ -270,7 +270,6 @@ IN_IS_REMOTE = (IN_BASE_URL != MN_BASE_URL) or (IN_CSE_NAME != MN_CSE_NAME)
 BASE_URL = MN_BASE_URL
 CSE_NAME = MN_CSE_NAME
 
-MN_AE_NAME = "MN-AE-1"
 # 중앙 조정 앱의 AE 이름과 AE-ID.
 #
 # IN-CSE 는 여러 팀이 같이 쓰는 공유 자원이다. "IN-AE" 는 누구나 쓸 법한
@@ -345,7 +344,7 @@ ORIGINATOR = os.getenv("FL_ORIGINATOR", "CAdmin")
 # 꺼져 있으면 모두 ORIGINATOR(기본 CAdmin)로 나간다. 관리자 신원은 ACP를
 # 전부 통과하므로 정책이 걸려 있어도 실제로는 아무것도 막지 못한다.
 #
-# 켜면 MN-AE-1 은 CMN-AE-1, IN-AE 는 CIN-AE 로 요청한다. 그래야 ACP가
+# 켜면 TRAINING-AE-1 은 CTRAINING-AE-1, IN-AE 는 CIN-AE 로 요청한다. 그래야 ACP가
 # 실제로 작동하고 "사업장 간 격리"가 말뿐이 아니게 된다.
 #
 # 다만 정책에 구멍이 있으면 그 순간부터 동작이 막힌다. 로봇 AE 쪽 ACP가
@@ -357,20 +356,26 @@ USE_AE_IDENTITY = os.getenv("FL_USE_AE_IDENTITY", "0") == "1"
 IN_AE_ID = os.getenv("FL_IN_AE_ID", "CIN-AE")
 
 
-def mn_ae_name(node: str) -> str:
-    """mn1 -> MN-AE-1"""
-    return f"MN-AE-{node[2:]}"
+def training_ae_name(node: str) -> str:
+    """mn1 -> TRAINING-AE-1
+
+    사업장의 학습 앱이다. 전에는 MN-AE-i 였다. 같은 앱이 MN-CSE 와 IN-CSE
+    양쪽에 등록돼 있어서 IN-CSE 트리에 "MN" 이 튀어나왔고, 거기 사는 앱으로
+    읽혔다. 분석 앱(ANALYSIS-AE-i)처럼 하는 일로 이름을 맞춘다.
+    """
+    return f"TRAINING-AE-{node[2:]}"
 
 
-def mn_ae_id(node: str) -> str:
-    """mn1 -> CMN-AE-1"""
-    return f"C{mn_ae_name(node)}"
+def training_ae_id(node: str) -> str:
+    """mn1 -> CTRAINING-AE-1"""
+    return f"C{training_ae_name(node)}"
 
 
 # ── 분석 앱(판정) ────────────────────────────────────────
 #
-# 설계서에서 사업장 안의 앱은 분석 / 운행 / 학습으로 나뉜다. 학습 앱이 MN-AE 고,
-# 판정은 분석 앱의 일이다. 지금은 모델을 들고 있는 MN-AE 가 계산까지 하지만,
+# 설계서에서 사업장 안의 앱은 분석 / 운행 / 학습으로 나뉜다. 학습 앱이
+# TRAINING-AE-i 고, 판정은 분석 앱의 일이다. 지금은 모델을 들고 있는 학습 앱이
+# 계산까지 하지만,
 # 리소스는 분석 앱 신원으로 남긴다. 나중에 분석 앱을 별도 프로세스로 떼어내도
 # 리소스 트리와 구독하는 쪽 코드가 바뀌지 않는다.
 #

@@ -6,6 +6,10 @@ MEC 샌드박스에는 CSE가 4개다. 사업장마다 MEP 안에 MN-CSE가 하�
 다르므로, 이 스크립트는 생성 직전에 바인딩을 바꿔 가며 돈다.
 
   IN-CSE (클라우드)                        config.in_endpoint()
+    TRAINING-AE-1/2/3                      ← 우리가 만든다. 사업장 학습 앱이
+                                             MN-CSE 와 IN-CSE 양쪽에 등록된다.
+                                             IN 쪽은 <pollingChannel> 을 걸고
+                                             드롭박스에 쓰기 위한 신원이다.
     IN-AE                                  ← 우리가 만든다
       cnt-fl-control      라운드 지시 (IN→MN)
       cnt-global-model    글로벌 가중치 (IN→MN)
@@ -17,23 +21,27 @@ MEC 샌드박스에는 CSE가 4개다. 사업장마다 MEP 안에 MN-CSE가 하�
     siteA_AMR_1 … siteA_AMR_4              ← Isaac Sim이 만든다. 확인만 한다
       telemetry                            ← Isaac이 채운다. 우리는 읽는다
       status
-    MN-AE-1                                ← 우리가 만든다
+    TRAINING-AE-1                          ← 우리가 만든다. 학습 앱
       cnt-local-model     라운드 캐시
       cnt-net-status      MEC028 스냅샷 / 버퍼 상태
+    ANALYSIS-AE-1                          ← 우리가 만든다. 분석 앱
+      cnt-verdict         판정 결과. 사업장 밖으로 나가지 않는다
 
 AE가 두 종류라는 점이 중요하다.
   로봇 AE   : Isaac Sim이 CSE에 등록한다. 여기서 만들지 않는다. 없으면 경고만.
-  FL 앱 AE  : MN-AE-1/2/3, IN-AE. 아무도 만들어 주지 않으므로 여기서 만든다.
+  FL 앱 AE  : TRAINING-AE-1/2/3, ANALYSIS-AE-1/2/3, IN-AE.
+              아무도 만들어 주지 않으므로 여기서 만든다.
 
 TinyIoT 시절의 PostgreSQL 직접 초기화(clean_db)는 없앴다. ACME는 클라우드에
 있고 DB 접근권도 없다. 초기화는 oneM2M DELETE로만 한다.
 
 ACP 정책
-  acp-fl-control    IN-AE 전체 / MN-AE-* RETRIEVE          (IN-CSE)
-  acp-global-model  IN-AE 전체 / MN-AE-* RETRIEVE          (IN-CSE)
-  acp-local-updates IN-AE 전체 / MN-AE-* CREATE            (IN-CSE)
-  acp-dropbox-mnX   IN-AE 전체 / 해당 MN-AE-X만 CREATE     (IN-CSE)
-  acp-cache-mnX     해당 MN-AE-X 전체 / IN-AE RETRIEVE     (MN-CSE of X)
+  acp-fl-control    IN-AE 전체 / TRAINING-AE-* RETRIEVE          (IN-CSE)
+  acp-global-model  IN-AE 전체 / TRAINING-AE-* RETRIEVE          (IN-CSE)
+  acp-local-updates IN-AE 전체 / TRAINING-AE-* CREATE            (IN-CSE)
+  acp-dropbox-mnX   IN-AE 전체 / 해당 TRAINING-AE-X만 CREATE     (IN-CSE)
+  acp-cache-mnX     해당 TRAINING-AE-X 전체 / IN-AE RETRIEVE     (MN-CSE of X)
+  acp-verdict-mnX   분석 앱 전체 / 학습 앱·로봇 AE RETRIEVE      (MN-CSE of X)
   로봇 telemetry에는 ACP를 걸지 않는다. Isaac 소유다.
 
 ACOP 비트마스크 (TS-0001)
@@ -70,8 +78,8 @@ SETTLE = 0.3  # CSE가 생성을 커밋할 시간
 
 
 def origin_mn(node: str) -> str:
-    """MN-AE-i의 Originator. mn2 -> CMN-AE-2"""
-    return config.mn_ae_id(node)
+    """학습 앱의 Originator. mn2 -> CTRAINING-AE-2"""
+    return config.training_ae_id(node)
 
 
 def all_mn_origins(nodes: List[str]) -> List[str]:
@@ -123,14 +131,14 @@ def reachable(label: str) -> bool:
 
 
 # ════════════════════════════════════════════════════════
-# AE 생성 (우리 소유: IN-AE, MN-AE-i)
+# AE 생성 (우리 소유: IN-AE, TRAINING-AE-i, ANALYSIS-AE-i)
 # ════════════════════════════════════════════════════════
 
 def create_fl_ae(ae_name: str, origin: str) -> bool:
     """
     FL 애플리케이션 AE를 등록한다.
 
-    rr=True는 request reachable. IN-AE가 보내는 NOTIFY를 MN-AE가 받으려면
+    rr=True는 request reachable. IN-AE가 보내는 NOTIFY를 학습 앱이 받으려면
     필요하다. srv는 지원 릴리스 버전(TS-0004).
     이미 있으면(409) 그대로 둔다.
     """
@@ -289,6 +297,21 @@ def setup_in_resources(nodes: List[str], acps: Dict[str, str]) -> None:
     create_fl_ae(config.IN_AE_NAME, ORIGIN_IN_AE)
     time.sleep(SETTLE)
 
+    # 사업장 학습 앱은 IN-CSE 에도 AE 로 등록돼 있어야 한다.
+    #
+    # <pollingChannel> 은 AE 의 자식이고 그 AE 본인만 만들 수 있다(관리자도
+    # 안 된다). 캠퍼스 방화벽이 인바운드를 버려서 IN-CSE 가 우리를 직접
+    # 부르지 못하므로, 라운드 명령은 전부 그 채널로 온다. 여기에 AE 가
+    # 없으면 MN 은 명령을 영영 못 받는다. 드롭박스 ACP 의 acor 도 이
+    # AE-ID 를 가리킨다.
+    #
+    # 지금까지 이 코드가 없었다. IN-CSE 에 있던 AE 들은 예전에 손으로
+    # 만든 것이고, 그 CSE 가 초기화되면 조용히 전부 멈췄을 것이다.
+    for node in nodes:
+        create_fl_ae(config.training_ae_name(node),
+                     config.training_ae_id(node))
+        time.sleep(SETTLE)
+
     ae = f"{cse}/{config.IN_AE_NAME}"
 
     def cnt(parent: str, name: str, mni: int, acp_key: Optional[str]) -> None:
@@ -398,7 +421,7 @@ def setup_mn_resources(node: str) -> Dict[str, bool]:
     """
     한 사업장 분. MEP의 MN-CSE에 바인딩하고
       1) 로봇 AE / telemetry 확인 (Isaac 소유)
-      2) MN-AE-i 생성 (우리 소유)
+      2) TRAINING-AE-i 생성 (우리 소유)
       3) cnt-local-model, cnt-net-status 생성
     """
     site = config.SITE_OF_NODE.get(node, node)
@@ -411,7 +434,7 @@ def setup_mn_resources(node: str) -> Dict[str, bool]:
 
     robots = verify_robot_aes(node)
 
-    ae_name = f"MN-AE-{node[2:]}"
+    ae_name = config.training_ae_name(node)
     create_fl_ae(ae_name, origin_mn(node))
     time.sleep(SETTLE)
 
@@ -549,7 +572,7 @@ def verify(nodes: List[str]) -> bool:
         mep = config.MEP_OF_NODE.get(node, "?")
         print(f"\n[{mep}] {om2m.base_url()}/{cse}  ({site})")
 
-        ae_name = f"MN-AE-{node[2:]}"
+        ae_name = config.training_ae_name(node)
         for t in (f"{cse}/{ae_name}",
                   f"{cse}/{ae_name}/cnt-local-model",
                   f"{cse}/{ae_name}/cnt-net-status"):
@@ -590,7 +613,7 @@ def clean(nodes: List[str]) -> None:
 
     for node in nodes:
         cse = bind_mn(node)
-        ae_name = f"MN-AE-{node[2:]}"
+        ae_name = config.training_ae_name(node)
         print(f"  {'✓' if om2m.delete_resource(f'{cse}/{ae_name}') else '✗'} "
               f"{config.MEP_OF_NODE.get(node)}/{ae_name}")
         om2m.delete_resource(f"{cse}/acp-cache-{node}")

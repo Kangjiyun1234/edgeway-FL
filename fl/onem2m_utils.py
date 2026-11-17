@@ -63,7 +63,7 @@ def set_originator(aeid: Optional[str]) -> None:
     아무것도 막히지 않았다. 사업장 간 격리가 설정만 돼 있고 발동하지
     않는 상태였다.
 
-    각 AE가 자기 AE-ID(CMN-AE-1, CIN-AE …)로 요청해야 ACP가 의미를 갖는다.
+    각 AE가 자기 AE-ID(CTRAINING-AE-1, CIN-AE …)로 요청해야 ACP가 의미를 갖는다.
     None 을 주면 기본값으로 돌아간다.
     """
     global _ORIGINATOR

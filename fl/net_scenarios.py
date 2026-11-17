@@ -18,7 +18,7 @@ fl/net_scenarios.py — 데모 시나리오 2·3 (네트워크 이상)
 역할 분담
   탐지·판정  이 코드 (MEC028을 읽는다)
   실행       샌드박스 컨트롤러 이벤트 API (mec_sandbox.py)
-  기록       oneM2M  <MN-CSE>/MN-AE-i/cnt-net-status  (대시보드가 읽는다)
+  기록       oneM2M  <MN-CSE>/TRAINING-AE-i/cnt-net-status  (대시보드가 읽는다)
 
 FL이 로봇에게 직접 명령하지 않는다. 판정은 리소스에 써 두고, 움직이는 일은
 샌드박스가 한다.
@@ -56,7 +56,7 @@ def bind(node: str) -> str:
 
 def net_status_path(node: str) -> str:
     cse = om2m.cse_name()
-    return f"{cse}/MN-AE-{node[2:]}/cnt-net-status"
+    return f"{cse}/{config.training_ae_name(node)}/cnt-net-status"
 
 
 def report(node: str, payload: dict) -> bool:
