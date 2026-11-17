@@ -9,6 +9,7 @@ AMR 주행 텔레메트리(38채널 CVAE)용
 - val_acc → val_auroc (재구성 오차 기반 AUROC)
 """
 import sys
+import calendar
 
 import os
 import time
@@ -643,22 +644,94 @@ class MNAETrainer:
 
             time.sleep(poll)
 
+    # ct 는 oneM2M 절대시각(UTC). cra 는 쉼표 앞만 받는다.
+    CT_FMT = "%Y%m%dT%H%M%S"
+
+    def _cse_now_ct(self):
+        """
+        CSE 가 보는 '지금'. 텔레메트리 컨테이너들의 마지막 ct 중 최신값이다.
+
+        커서를 로컬 시계로 만들면 CSE 와 시계가 틀어졌을 때 멀쩡한 데이터를
+        건너뛰거나 묵은 것을 끌어온다. 기준을 CSE 가 찍은 ct 로 두면 시계
+        차이와 무관해진다. 하나도 못 읽으면 None.
+        """
+        newest = None
+        for path in self.telemetry_paths:
+            try:
+                cin = om2m.get_latest_content_instance(path)
+            except Exception as e:
+                print(f"    ⚠ {path} 마지막 ct 조회 실패(건너뜀): {e}")
+                continue
+            ct = ((cin or {}).get("m2m:cin") or {}).get("ct")
+            if ct and (newest is None or str(ct) > str(newest)):
+                newest = ct
+        return newest
+
     def _seed_telemetry_cursor(self) -> None:
         """
-        이미 쌓여 있는 텔레메트리를 건너뛰고, FL 시작 후에 들어온 것부터 읽는다.
+        FL 시작 전에 쌓인 텔레메트리 중 '너무 오래된 것'만 건너뛴다.
 
-        [왜]
-        커서가 비어 있으면 fetch 가 "최근 N개"를 긁어 온다. 그래서 Round 1
-        만 Isaac Sim 이 그때까지 올려둔 걸 통째로 가져갔다. 로그에서 mn1 이
-        Round 1 에 341개를 먹고 Round 2 에는 37개밖에 안 남았던 것이 이것
-        때문이다. 라운드마다 조건이 같아야 비교가 되므로, Round 1 도 다른
-        라운드처럼 FL 이 시작된 뒤에 쌓인 것만 받아야 한다.
+        [왜 시각 기준인가]
+        전에는 각 컨테이너의 마지막 ct 를 커서로 놓아 쌓여 있던 것을 통째로
+        버렸다. 그러면 Isaac Sim 을 먼저 켜 두고 FL 을 켜는 순간, 그동안
+        들어온 데이터가 전부 날아간다. "아이작심을 먼저 켜라"고 해 놓고 그
+        데이터를 버리는 것은 앞뒤가 안 맞는다.
 
-        각 로봇 컨테이너의 지금 마지막 ct 를 커서로 놓는다. 비어 있는
-        컨테이너는 커서를 두지 않는다. 어차피 거기는 지금부터가 처음이다.
+        반대로 커서를 아예 안 두면 지난 실행의 묵은 데이터까지 끌려온다.
+
+        그래서 경계를 시각으로 둔다. 방금 전까지 들어온 것은 쓰고, 한참 전
+        것은 건너뛴다.
+
+        쌓인 것은 전부 쓰는 것이 기본이다. 실험 사이에 telemetry 컨테이너를
+        비우고 시작하므로, 거기 남아 있는 것은 곧 이번 실험의 데이터다.
+        앞부분을 버릴 이유가 없다.
+
+          FL_SENSOR_BACKLOG_SEC = 0   쌓인 것 전부 쓴다 (기본)
+                               > 0   그 초 이내에 쌓인 것만 쓴다. 컨테이너를
+                                     못 비우고 묵은 게 섞였을 때만 쓴다.
+                               < 0   쌓인 것 전부 건너뛴다
+
+        Round 1 이 쌓인 걸 통째로 먹던 문제는 커서가 막는 게 아니다.
+        _collect_round_data_once 의 take_head 가 막는다. 라운드마다 시간순
+        앞에서 FL_SENSOR_MIN_WINDOWS 개만 떼고 나머지는 버퍼에 남으므로,
+        백로그를 쓰더라도 라운드당 양은 똑같이 50 개다.
         """
-        seeded, empty = 0, 0
+        backlog = float(os.getenv("FL_SENSOR_BACKLOG_SEC", "0"))
+        n_cnt = len(self.telemetry_paths)
 
+        if backlog == 0:
+            print(f"  ⏱ [{self.node_name}] 쌓여 있는 텔레메트리를 처음부터 "
+                  f"전부 쓴다. 라운드당 양은 take_head 가 "
+                  f"{os.getenv('FL_SENSOR_MIN_WINDOWS', '50')}개로 맞춘다.")
+            return
+
+        if backlog > 0:
+            newest = self._cse_now_ct()
+            if newest is None:
+                print(f"  ⏱ [{self.node_name}] 아직 텔레메트리가 없다. "
+                      f"커서 없이 시작한다.")
+                return
+
+            stamp = str(newest).split(",")[0]
+            try:
+                base = calendar.timegm(time.strptime(stamp, self.CT_FMT))
+                cutoff = time.strftime(self.CT_FMT,
+                                       time.gmtime(base - backlog))
+            except ValueError as e:
+                print(f"  ⚠ [{self.node_name}] ct 해석 실패({stamp}): {e}. "
+                      f"커서 없이 시작한다.")
+                return
+
+            for path in self.telemetry_paths:
+                self.telemetry_cursor[path] = cutoff
+
+            print(f"  ⏱ [{self.node_name}] 최근 {backlog:.0f}초 안에 쌓인 "
+                  f"텔레메트리부터 쓴다 (cra={cutoff}, 최신={stamp}, "
+                  f"컨테이너 {n_cnt}개).")
+            return
+
+        # backlog < 0 : 지금까지 쌓인 것은 전부 건너뛴다.
+        seeded, empty = 0, 0
         for path in self.telemetry_paths:
             try:
                 cin = om2m.get_latest_content_instance(path)
@@ -673,7 +746,7 @@ class MNAETrainer:
             else:
                 empty += 1
 
-        print(f"  ⏱ 쌓여 있던 텔레메트리는 건너뛴다 "
+        print(f"  ⏱ [{self.node_name}] 쌓여 있던 텔레메트리는 건너뛴다 "
               f"(커서 설정 {seeded}개 / 비어 있음 {empty}개). "
               f"지금부터 쌓이는 것만 학습한다.")
 
@@ -1725,8 +1798,8 @@ class MNAETrainer:
         # 로봇이 올라온 뒤에 구독을 건다. 없는 컨테이너에는 못 건다.
         self._subscribe_to_telemetry()
 
-        # 이미 쌓여 있던 텔레메트리는 버리고 지금부터 받는다.
-        # FL_SENSOR_SEED_CURSOR=0 이면 예전처럼 쌓인 것을 가져간다.
+        # 쌓여 있는 텔레메트리를 처음부터 쓴다(기본).
+        # 묵은 게 섞였을 때만 FL_SENSOR_BACKLOG_SEC 으로 경계를 준다.
         if os.getenv("FL_SENSOR_SEED_CURSOR", "1") != "0":
             self._seed_telemetry_cursor()
 
