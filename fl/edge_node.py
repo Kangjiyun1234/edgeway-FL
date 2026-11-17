@@ -13,6 +13,7 @@ AEEdgeNode: 조건부 1D CNN VAE 기반 정상 주행 재구성 학습 (이상 �
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -168,21 +169,55 @@ class AEEdgeNode:
             drop_last  = (self.num_train_samples % self.train_cfg.batch_size == 1),
         )
 
-        self.model.train()
-        loss_sum, total = 0.0, 0
+        # 절사 손실. 손실이 큰 쪽을 그 에폭 학습에서 뺀다.
+        #
+        # [왜]
+        # 재구성 기반 탐지기는 정상만 학습해야 이상의 오차가 커진다. 그런데
+        # 학습 집합은 비지도라 이상이 섞여 있고(FL_LABEL_FOR_TRAIN=0 이 기본),
+        # 그대로 두면 모델이 이상까지 복원하는 법을 배운다. 라운드가 갈수록
+        # 이상의 손실이 내려가 정상과 구분이 사라진다.
+        #
+        # 이상은 정의상 손실이 크므로, 손실 상위 몇 %를 빼면 라벨 없이도
+        # 학습 집합이 정상 쪽으로 정리된다. 라벨은 한 글자도 보지 않는다.
+        # 통계의 trimmed mean, 회귀의 LTS 와 같은 생각이다.
+        #
+        # 자르는 단위는 배치다. 전체를 모아 자르는 것의 근사지만 한 번의
+        # 순전파로 끝나고, 배치가 섞여 있으므로 편향되지 않는다.
+        #
+        #   FL_TRIM_RATIO=0  으로 두면 예전 동작(전부 학습)이다. A/B 비교용.
+        trim_ratio = float(os.getenv("FL_TRIM_RATIO", "0.15"))
+        trim_warmup = int(os.getenv("FL_TRIM_WARMUP_EPOCHS", "2"))
 
-        for _ in range(self.train_cfg.local_epochs):
+        self.model.train()
+        loss_sum, total, trimmed = 0.0, 0, 0
+
+        for epoch in range(self.train_cfg.local_epochs):
+            # 초반에는 모델이 무작위라 손실이 커도 이상이 아니다.
+            # 워밍업 동안은 자르지 않는다.
+            trim = trim_ratio if epoch >= trim_warmup else 0.0
+
             for xb, cb in train_loader:
                 xb = xb.to(self.device)
                 cb = cb.to(self.device) if self.cond_dim else None
 
                 self.optimizer.zero_grad()
-                loss, rec, kl = self.model.loss(xb, cb, beta=self.beta)
+                per, rec, kl = self.model.loss_terms(xb, cb, beta=self.beta)
 
                 bs = int(xb.size(0))
-                loss_sum += float(loss.item()) * bs
+                # 기록은 자르기 전 전체 평균이다. 라운드 간 비교가 되려면
+                # 매번 같은 집합을 재야 한다.
+                loss_sum += float(per.mean().item()) * bs
                 total    += bs
 
+                # 배치가 너무 작으면 자르는 쪽이 더 흔들린다.
+                if trim > 0 and bs > 4:
+                    keep_n = max(1, int(round(bs * (1.0 - trim))))
+                    kept = per.topk(keep_n, largest=False).values
+                    trimmed += bs - keep_n
+                else:
+                    kept = per
+
+                loss = kept.mean()
                 loss.backward()
 
                 if use_dp:
@@ -198,6 +233,10 @@ class AEEdgeNode:
 
         train_loss = loss_sum / max(total, 1)
 
+        if trimmed:
+            print(f"    ◦ 절사 손실: {trimmed}/{total} 샘플을 학습에서 제외 "
+                  f"(비율 {trim_ratio:.0%}, 워밍업 {trim_warmup}에폭)")
+
         # 학습이 끝난 모델 기준으로 채널 기준 오차와 임계값을 다시 잡는다.
         self.calibrate()
 
@@ -208,10 +247,26 @@ class AEEdgeNode:
 
     def calibrate(self, n_sigma: float = 3.0) -> Optional[float]:
         """
-        학습 정상 데이터로 채널별 기준 오차와 임계값을 정한다.
+        학습 데이터로 채널별 기준 오차와 임계값을 정한다.
 
         임계값은 노드마다 자기 데이터로 잡아야 한다. 사업장·로봇마다
         정상의 모습이 달라서 공용 임계값을 쓰면 정상도 이상으로 나온다.
+
+        [왜 평균이 아니라 중앙값인가]
+        학습 집합은 비지도라 이상이 섞여 있다(FL_LABEL_FOR_TRAIN=0 이 기본).
+        평균과 표준편차는 이상치에 끌려 올라가므로 임계값이 과하게 높아지고,
+        그러면 아무것도 안 잡힌다. 실제로 판정(cnt-verdict)이 0 건이었다.
+
+        중앙값과 MAD 는 이상이 절반 미만이면 거의 움직이지 않아 정상 분포를
+        그대로 반영한다. 1.4826 은 정규분포에서 MAD 를 표준편차와 같은 자로
+        맞추는 상수라 n_sigma 의 의미(3σ)가 그대로 유지된다.
+
+        고정 검증셋에서 실측한 차이:
+          평균+3σ      thr 8.730  탐지  6/80  오경보 0/377
+          중앙값+3MAD  thr 2.320  탐지 26/80  오경보 0/377
+
+        채널 기준 오차도 같은 이유로 중앙값을 쓴다. 평균을 쓰면 이상이 크게
+        튀는 채널일수록 기준이 위로 떠서, 정작 그 채널의 이상 신호가 눌린다.
         """
         if self.num_train_samples == 0:
             return None
@@ -226,10 +281,20 @@ class AEEdgeNode:
                 errs.append(self.model.channel_error(xb, cb).cpu())
 
         E = torch.cat(errs)                       # (N, C)
-        self.channel_norm = E.mean(dim=0)         # 채널별 기준 오차
+        self.channel_norm = E.median(dim=0).values    # 채널별 기준 오차
 
         scores = self._aggregate(E)
-        self.threshold = float(scores.mean() + n_sigma * scores.std())
+
+        med = scores.median()
+        mad = (scores - med).abs().median() * 1.4826
+        if not torch.isfinite(mad) or mad <= 0:
+            # 점수가 거의 같으면 MAD 가 0 이 된다. 표준편차로, 그것도
+            # 못 쓰면(샘플 1개) 중앙값의 10% 로 물러선다.
+            s = scores.std()
+            mad = (s if torch.isfinite(s) and s > 0
+                   else med.abs() * 0.1 + 1e-6)
+
+        self.threshold = float(med + n_sigma * mad)
         return self.threshold
 
     def _aggregate(self, E: torch.Tensor) -> torch.Tensor:

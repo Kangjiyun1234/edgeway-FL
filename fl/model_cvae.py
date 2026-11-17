@@ -124,6 +124,24 @@ class CVAE1D(nn.Module):
         kl = kl / (x.shape[1] * x.shape[2])
         return rec + beta * kl, rec.detach(), kl.detach()
 
+    def loss_terms(
+        self,
+        x: torch.Tensor,
+        c: Optional[torch.Tensor] = None,
+        beta: float = 0.5,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        샘플별 ELBO. loss() 와 같은 식이되 배치 평균을 내지 않는다.
+
+        절사 손실(손실 큰 쪽을 그 에폭 학습에서 제외)을 쓰려면 샘플마다
+        값이 있어야 한다. loss_terms(...)[0].mean() 은 loss(...)[0] 과 같다.
+        """
+        recon, mu, logvar = self.forward(x, c)
+        rec = ((recon - x) ** 2).mean(dim=(1, 2))
+        kl = -0.5 * (1 + logvar - mu ** 2 - logvar.exp()).sum(dim=1)
+        kl = kl / (x.shape[1] * x.shape[2])
+        return rec + beta * kl, rec.detach(), kl.detach()
+
     # ── 이상 점수 ─────────────────────────────────────────
     @torch.no_grad()
     def channel_error(
