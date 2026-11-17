@@ -121,8 +121,26 @@ RMS_FAULT_THRESHOLD = 1.0
 # 재구성 오차가 threshold를 연속 K회 초과하면 fault 판정
 ANOMALY_K_CONSECUTIVE = 3
 
-# threshold = 정상 validation MSE 평균 + N × 표준편차
-THRESHOLD_N_SIGMA = 3.0
+# threshold = 중앙값 + N x MAD x 1.4826  (평균+Nσ 가 아니다)
+#
+# 지금까지 edge_node.calibrate() 가 이 값을 안 쓰고 자기 기본값 3.0 을
+# 썼다. 그래서 이걸 고쳐도 실제 임계값이 안 바뀌었다. 연결했다.
+#
+# 기본값이 조건별 정규화(FL_COND_NORM) 여부에 따라 다르다. 정규화를 하면
+# 학습 점수의 중앙값이 1 로 모이면서 MAD 가 같이 줄어든다. 3 을 그대로 쓰면
+# 임계값이 내려가 오경보가 오히려 는다. 실측(1사업장, 평가 318정상/133이상):
+#
+#   정규화 없음  3MAD   임계 5.52   탐지 99.2%   오경보 48.7%
+#   정규화 후    3MAD   임계 3.58   탐지 95.5%   오경보 71.4%   <- 더 나쁨
+#   정규화 후    8MAD   임계 7.87   탐지 90.2%   오경보 38.1%
+#   정규화 후   12MAD   임계 11.31  탐지 82.7%   오경보 28.0%
+#
+# 정규화 없이 n_sigma 만 8 로 올렸을 때가 탐지 75.9% / 오경보 31.1% 였으므로,
+# 정규화 후 8 은 탐지와 오경보 양쪽에서 그보다 낫다. 그래서 8 을 기본으로
+# 둔다. 탐지를 더 원하면 5, 오경보를 더 줄이려면 12 로 바꾸면 된다.
+COND_NORM = os.getenv("FL_COND_NORM", "1") not in ("0", "false", "False")
+THRESHOLD_N_SIGMA = float(
+    os.getenv("FL_THRESHOLD_N_SIGMA", "8.0" if COND_NORM else "3.0"))
 
 # 데모에서 이상 상태를 표시할 노드
 ANOMALY_DEMO_NODE = os.getenv(

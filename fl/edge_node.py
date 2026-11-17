@@ -23,6 +23,16 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from aggregator import FEDBN
+
+# 점수를 주행 조건별 기준으로 나눌지. 기본값은 config 와 같은 환경변수를
+# 본다(edge_node 는 단독 실험에서도 돌아야 해서 config 를 안 들여온다).
+#
+# 측정(2노드 FedAvg, 10라운드, 8시드): AUROC +0.0016, 승률 74%.
+# 크기는 작지만 8시드 중 6승으로 방향이 일관됐다.
+#
+# 주의: 이걸 켜면 임계값의 n_sigma 도 같이 올려야 한다. 이유와 실측은
+# config.THRESHOLD_N_SIGMA 주석에 있다.
+COND_NORM = os.getenv("FL_COND_NORM", "1") not in ("0", "false", "False")
 from config import TrainConfig, AEConfig
 from model_cvae import CVAE1D
 
@@ -107,6 +117,15 @@ class AEEdgeNode:
         # 채널마다 오차 규모가 달라서, 정규화 없이 평균내면
         # 규모가 큰 채널이 점수를 지배한다.
         self.channel_norm: Optional[torch.Tensor] = None
+
+        # 주행 조건별 기준 점수. {조건키: 중앙값}
+        #
+        # 점수가 회전·저속 구간에서 10~20배 높은데, 고장이라서가 아니라
+        # 그 구간이 드물어 덜 배웠기 때문이다. 조건마다 기준을 따로 잡아
+        # 나누면 "느려서 높은 것"이 빠지고 "그 조건치고 높은 것"만 남는다.
+        # 채널마다 channel_norm 으로 나누는 것과 같은 생각을 조건 축에 쓴다.
+        self.cond_norm: Optional[dict] = None
+        self.cond_norm_fallback: float = 1.0
         # 정상 데이터로 잡은 임계값
         self.threshold: Optional[float] = None
 
@@ -272,7 +291,7 @@ class AEEdgeNode:
 
     # ── 캘리브레이션 ──────────────────────────────────────
 
-    def calibrate(self, n_sigma: float = 3.0) -> Optional[float]:
+    def calibrate(self, n_sigma: Optional[float] = None) -> Optional[float]:
         """
         학습 데이터로 채널별 기준 오차와 임계값을 정한다.
 
@@ -295,6 +314,15 @@ class AEEdgeNode:
         채널 기준 오차도 같은 이유로 중앙값을 쓴다. 평균을 쓰면 이상이 크게
         튀는 채널일수록 기준이 위로 떠서, 정작 그 채널의 이상 신호가 눌린다.
         """
+        if n_sigma is None:
+            # edge_node 는 config 를 안 들여온다(단독 실험에서도 돌아야 한다).
+            # 있으면 쓰고 없으면 3.0 으로 간다.
+            try:
+                import config as _cfg
+                n_sigma = float(getattr(_cfg, "THRESHOLD_N_SIGMA", 3.0))
+            except Exception:
+                n_sigma = float(os.getenv("FL_THRESHOLD_N_SIGMA", "3.0"))
+
         if self.num_train_samples == 0:
             return None
 
@@ -312,6 +340,24 @@ class AEEdgeNode:
 
         scores = self._aggregate(E)
 
+        # 조건별 기준값을 학습 점수에서 잡는다. 그 다음 임계값은 '나눈'
+        # 점수로 잡아야 추론 때와 단위가 같아진다.
+        if COND_NORM and self.cond_dim:
+            raw = scores.cpu().numpy()
+            keys = self.cond_key(
+                self.train_ds.tensors[1][:len(raw)].cpu().numpy())
+            self.cond_norm_fallback = float(np.median(raw))
+            self.cond_norm = {
+                int(k): float(np.median(raw[keys == k]))
+                for k in np.unique(keys)
+            }
+            scores = torch.from_numpy(
+                self._apply_cond_norm(raw, 
+                    self.train_ds.tensors[1][:len(raw)].cpu().numpy()))
+            print(f"    ◦ 조건별 기준 {len(self.cond_norm)}개 "
+                  f"(중앙값 범위 {min(self.cond_norm.values()):.2f}"
+                  f"~{max(self.cond_norm.values()):.2f})")
+
         med = scores.median()
         mad = (scores - med).abs().median() * 1.4826
         if not torch.isfinite(mad) or mad <= 0:
@@ -322,7 +368,51 @@ class AEEdgeNode:
                    else med.abs() * 0.1 + 1e-6)
 
         self.threshold = float(med + n_sigma * mad)
+
+        # 임계값이 정상 덩어리에 얼마나 붙어 있는지 눈으로 보려고 분포를
+        # 같이 찍는다. 넘은 것만 로그에 남으면 "너무 낮다"를 판단할 수 없다.
+        q = torch.quantile(
+            scores.float(),
+            torch.tensor([0.50, 0.90, 0.99], device=scores.device),
+        ).tolist()
+        over = int((scores > self.threshold).sum())
+        print(f"    ◦ 임계 {self.threshold:.4f}  (중앙값 {q[0]:.4f} "
+              f"+ {n_sigma:g} x MAD {float(mad):.4f})\n"
+              f"      학습점수 p50 {q[0]:.3f}  p90 {q[1]:.3f}  "
+              f"p99 {q[2]:.3f}  max {float(scores.max()):.3f}  "
+              f"| 임계 초과 {over}/{len(scores)} "
+              f"({over / max(1, len(scores)):.1%})")
+
         return self.threshold
+
+    @staticmethod
+    def cond_key(cond: np.ndarray) -> np.ndarray:
+        """
+        cond 원핫(nav 5 + speed 3)을 조건키 하나로 접는다.
+
+        모델이 실제로 받는 벡터를 그대로 쓴다. 따로 nav/speed 를 받아오면
+        학습 때와 추론 때 기준이 어긋날 수 있다.
+        """
+        C = np.asarray(cond, dtype=np.float32)
+        if C.ndim != 2 or C.shape[1] < 8:
+            return np.zeros(len(C), dtype=np.int64)
+        return (np.argmax(C[:, :5], 1) * 10
+                + np.argmax(C[:, 5:8], 1)).astype(np.int64)
+
+    def _apply_cond_norm(self, scores: np.ndarray,
+                         cond: Optional[np.ndarray]) -> np.ndarray:
+        """점수를 그 조건의 기준으로 나눈다. 기준이 없으면 그대로 둔다."""
+        if not COND_NORM or not self.cond_norm or cond is None:
+            return scores
+        keys = self.cond_key(cond)
+        if len(keys) != len(scores):
+            return scores
+        div = np.array(
+            [max(self.cond_norm.get(int(k), self.cond_norm_fallback), 1e-6)
+             for k in keys],
+            dtype=np.float32,
+        )
+        return scores / div
 
     def _aggregate(self, E: torch.Tensor) -> torch.Tensor:
         """채널별 오차 (N, C) -> 이상 점수 (N,)"""
@@ -384,7 +474,7 @@ class AEEdgeNode:
                 out.append(self._aggregate(
                     self.model.channel_error(xb, cb)).cpu().numpy())
 
-        return np.concatenate(out)
+        return self._apply_cond_norm(np.concatenate(out), cond)
 
     @staticmethod
     def aggregate_by_run(
