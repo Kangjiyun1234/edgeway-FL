@@ -141,13 +141,33 @@ def evaluate(model_path: str, n_sigma: float = None) -> Optional[dict]:
         E = E / (E.mean(dim=0) + 1e-12)
         scores = E.mean(dim=1).cpu().numpy()
 
-    # 임계값도 라벨 없이 전체에서 뽑는다.
-    thr = float(scores.mean() + n_sigma * scores.std())
+    # 임계값도 라벨 없이 전체에서 뽑는다. 다만 평균/표준편차가 아니라
+    # 중앙값/MAD 를 쓴다.
+    #
+    # 검증셋에는 정상과 이상이 섞여 있다. 평균과 표준편차는 이상치에 끌려
+    # 올라가므로 임계값이 과하게 높아진다. 실제로 그 때문에 오경보는 0 인데
+    # 탐지가 8% 에 그쳤다. 중앙값과 MAD 는 이상치가 섞여도 거의 움직이지
+    # 않아 정상 분포를 그대로 반영한다.
+    #
+    # 1.4826 은 정규분포에서 MAD 를 표준편차와 같은 자로 맞추는 상수다.
+    # 그래서 n_sigma 의 의미(3σ)가 그대로 유지된다.
+    med = float(np.median(scores))
+    mad = float(np.median(np.abs(scores - med))) * 1.4826
+    if mad <= 0:
+        mad = float(scores.std())      # 점수가 거의 같으면 MAD 가 0 이 된다
+    thr = med + n_sigma * mad
+
+    # 예전 기준도 같이 남긴다. 둘을 비교해야 임계값 때문인지 모델 때문인지
+    # 가릴 수 있다.
+    thr_mean = float(scores.mean() + n_sigma * scores.std())
 
     norm, anom = scores[y == 0], scores[y == 1]
     return {
         "auroc": round(_auroc(scores, y), 4),
         "threshold": round(thr, 4),
+        "threshold_mean3s": round(thr_mean, 4),
+        "detected_mean3s": int((anom > thr_mean).sum()),
+        "false_alarms_mean3s": int((norm > thr_mean).sum()),
         "detected": int((anom > thr).sum()),
         "miss": int((anom <= thr).sum()),
         "false_alarms": int((norm > thr).sum()),
@@ -164,4 +184,7 @@ def summary_line(m: dict) -> str:
     return (f"AUROC {m['auroc']:.4f}  "
             f"탐지 {m['detected']}/{m['n_anomaly']}  "
             f"오경보 {m['false_alarms']}/{m['n_normal']}  "
-            f"정상 {m['mean_normal']:.3f} vs 이상 {m['mean_anomaly']:.3f}")
+            f"정상 {m['mean_normal']:.3f} vs 이상 {m['mean_anomaly']:.3f}  "
+            f"thr {m['threshold']:.3f}"
+            f"(평균3σ {m['threshold_mean3s']:.3f} -> "
+            f"{m['detected_mean3s']}/{m['false_alarms_mean3s']})")
