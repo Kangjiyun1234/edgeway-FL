@@ -967,6 +967,9 @@ def _compute_summary() -> dict | None:
         max_rounds = _shared[
             "max_rounds"
         ]
+        evals = list(
+            _shared.get("evals", [])
+        )
 
     if (
         model_round < max_rounds
@@ -974,9 +977,23 @@ def _compute_summary() -> dict | None:
     ):
         return None
 
+    # 라이브 스트림에는 라벨이 없다. 그래서 AUROC·오경보 같은 수치는
+    # 고정 검증셋(valset) 평가 결과에서 가져온다. 라운드가 가장 큰 것을
+    # 쓰고, 없으면 None 으로 두고 화면에서 해당 블록을 감춘다.
+    global_eval = None
+    if evals:
+        def _round_of(e: dict) -> int:
+            try:
+                return int(e.get("round", -1))
+            except (TypeError, ValueError):
+                return -1
+
+        global_eval = max(evals, key=_round_of)
+
     result = {
         "type": "summary",
         "model_round": model_round,
+        "global_eval": global_eval,
         "nodes": {},
     }
 
@@ -1077,31 +1094,83 @@ def _compute_summary() -> dict | None:
             else:
                 false_alarm_consecutive = 0
 
-        result["nodes"][node] = {
-            "auroc": round(
-                auroc,
-                4,
-            ),
+        # K 회 연속 초과가 '시작된' 지점의 개수. verdict.py 와 같은 규칙이라
+        # 실제로 CSE 에 올라간 판정 건수와 맞는다.
+        detections = 0
+        run = 0
+        for score in node_scores:
+            if score > threshold:
+                run += 1
+                if run == K_CONSECUTIVE:
+                    detections += 1
+            else:
+                run = 0
+
+        labeled = bool(
+            len(
+                np.unique(
+                    node_labels,
+                )
+            ) > 1
+        )
+
+        entry = {
             "threshold": round(
                 float(threshold),
                 4,
             ),
-            "onset_idx": onset_index,
-            "detect_idx": detection_index,
-            "delay": detection_delay,
-            "false_alarms": false_alarms,
+            "labeled": labeled,
 
-            "n_normal": int(
+            # 라벨이 없어도 말할 수 있는 것들
+            "n_windows": int(
+                len(node_scores)
+            ),
+            "exceed": int(
                 np.sum(
-                    node_labels == 0
+                    node_scores > threshold
                 )
             ),
-            "n_anomaly": int(
-                np.sum(
-                    node_labels == 1
-                )
+            "detections": detections,
+            "mean_score": round(
+                float(
+                    np.mean(node_scores)
+                ),
+                4,
+            ),
+            "max_score": round(
+                float(
+                    np.max(node_scores)
+                ),
+                4,
             ),
         }
+
+        # 라벨이 있을 때만 의미가 있는 것들. 라이브 스트림은 전부 정상
+        # 라벨이라 AUROC 가 0 으로 찍혔고, 그 0 을 화면에 띄우면 거짓말이
+        # 된다. 아예 싣지 않는다.
+        if labeled:
+            entry.update({
+                "auroc": round(
+                    auroc,
+                    4,
+                ),
+                "onset_idx": onset_index,
+                "detect_idx": detection_index,
+                "delay": detection_delay,
+                "false_alarms": false_alarms,
+                "n_normal": int(
+                    np.sum(
+                        node_labels == 0
+                    )
+                ),
+                "n_anomaly": int(
+                    np.sum(
+                        node_labels == 1
+                    )
+                ),
+            })
+
+        result["nodes"][node] = entry
 
     return result
 

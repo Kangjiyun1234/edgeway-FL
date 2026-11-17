@@ -1587,10 +1587,20 @@ class MNAETrainer:
         학습이 끝난 뒤에 부른다. 임계값이 이번 라운드 모델 기준으로
         갱신돼 있어야 판정이 의미를 갖는다.
 
+        config.VERDICT_START_ROUND(기본 3) 전에는 아무것도 올리지 않는다.
+
         판정이 실패해도 라운드는 계속된다. 연합학습 본체가 부수 기능 때문에
         멈추면 안 된다.
         """
         if not getattr(config, "VERDICT_ENABLED", True):
+            return 0
+
+        # 초반 라운드는 건너뛴다. 임계값이 덜 학습된 모델로 잡혀 있어서
+        # 이때 내는 판정은 맞든 틀리든 근거가 없다.
+        start = int(getattr(config, "VERDICT_START_ROUND", 1))
+        if round_num < start:
+            print(f"  · 판정 보류 — R{round_num} < R{start} "
+                  f"(FL_VERDICT_START_ROUND)")
             return 0
 
         w = self.last_windows

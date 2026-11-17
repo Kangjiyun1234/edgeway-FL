@@ -254,6 +254,28 @@
   .summary-val.good { color: var(--ok-bar); }
   .summary-val.warn { color: #e24b4a; }
   .summary-footer { font-size: 10px; color: var(--text3); text-align: right; }
+  .summary-global {
+    border: 0.5px solid var(--border); border-radius: var(--radius-lg);
+    padding: 12px 14px; margin-bottom: 12px; background: var(--bg);
+  }
+  .summary-global-head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    margin-bottom: 10px;
+  }
+  .summary-global-title { font-size: 12px; font-weight: 700; color: var(--text); }
+  .summary-global-sub { font-size: 10px; color: var(--text3); }
+  .summary-metrics {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;
+    font-variant-numeric: tabular-nums;
+  }
+  .summary-metric-k { font-size: 10px; color: var(--text2); margin-bottom: 2px; }
+  .summary-metric-v { font-size: 16px; font-weight: 700; color: var(--text); }
+  .summary-metric-v.good { color: var(--ok-bar); }
+  .summary-metric-v.warn { color: #e24b4a; }
+  .summary-note {
+    font-size: 10px; color: var(--text3); font-style: italic;
+    margin-top: 8px; line-height: 1.5;
+  }
 
   .ctrl {
     display: flex; align-items: center; gap: 10px;
@@ -332,9 +354,11 @@
       </div>
       <button class="summary-close" id="summary-close">✕</button>
     </div>
+    <div class="summary-global" id="summary-global"></div>
     <div class="summary-grid" id="summary-grid"></div>
     <div class="summary-footer">
-      Threshold = val normal MSE μ + 3σ &nbsp;·&nbsp; Detection: K=3 consecutive exceedances
+      Per-node figures are live stream: no labels, so no AUROC there.<br>
+      Threshold = median + 3 · MAD · 1.4826 &nbsp;·&nbsp; Detection: K=3 consecutive exceedances
     </div>
   </div>
 </div>
@@ -851,9 +875,60 @@ document.getElementById('summary-close').addEventListener('click', () => {
   document.getElementById('summary-overlay').classList.remove('show');
 });
 
+// 고정 검증셋(valset) 평가 결과. 라이브 스트림과 달리 라벨이 있어서
+// AUROC·탐지·오경보를 말할 수 있는 유일한 수치다.
+function renderGlobalEval(ev) {
+  const box = document.getElementById('summary-global');
+  if (!ev) { box.innerHTML = ''; box.style.display = 'none'; return; }
+  box.style.display = '';
+
+  const auroc = toNumber(ev.auroc, null);
+  const det   = toNumber(ev.detected, null);
+  const nAn   = toNumber(ev.n_anomaly, null);
+  const fa    = toNumber(ev.false_alarms, null);
+  const nNo   = toNumber(ev.n_normal, null);
+  const mNo   = toNumber(ev.mean_normal, null);
+  const mAn   = toNumber(ev.mean_anomaly, null);
+  const sep   = toNumber(ev.separation, null);
+  const thr   = toNumber(ev.threshold, null);
+
+  const recall = (det !== null && nAn) ? (det / nAn * 100).toFixed(1) + '%' : '—';
+  const faRate = (fa  !== null && nNo) ? (fa  / nNo * 100).toFixed(1) + '%' : '—';
+
+  box.innerHTML = `
+    <div class="summary-global-head">
+      <span class="summary-global-title">Global model &mdash; fixed validation set</span>
+      <span class="summary-global-sub">Round ${textOrDash(ev.round)} &nbsp;&middot;&nbsp; ${textOrDash(nNo)} normal / ${textOrDash(nAn)} anomaly</span>
+    </div>
+    <div class="summary-metrics">
+      <div>
+        <div class="summary-metric-k">AUROC</div>
+        <div class="summary-metric-v ${auroc !== null && auroc >= 0.7 ? 'good' : ''}">${fmt(auroc, 4)}</div>
+      </div>
+      <div>
+        <div class="summary-metric-k">Detected</div>
+        <div class="summary-metric-v">${textOrDash(det)} / ${textOrDash(nAn)}<span style="font-size:11px;font-weight:500;color:var(--text3);"> &nbsp;${recall}</span></div>
+      </div>
+      <div>
+        <div class="summary-metric-k">False alarms</div>
+        <div class="summary-metric-v">${textOrDash(fa)} / ${textOrDash(nNo)}<span style="font-size:11px;font-weight:500;color:var(--text3);"> &nbsp;${faRate}</span></div>
+      </div>
+      <div>
+        <div class="summary-metric-k">Normal vs anomaly</div>
+        <div class="summary-metric-v">${fmt(mNo, 2)} &rarr; ${fmt(mAn, 2)}<span style="font-size:11px;font-weight:500;color:var(--text3);"> &nbsp;&Delta;${fmt(sep, 2)}</span></div>
+      </div>
+    </div>
+    <div class="summary-note">
+      Threshold ${fmt(thr, 4)} &middot; median + 3 &middot; MAD &middot; 1.4826.
+      Labelled set, so these are the only AUROC / false-alarm figures on this page.
+    </div>`;
+}
+
 function handleSummary(evt) {
   document.getElementById('summary-sub').textContent =
     `Final Evaluation — Global Model Round ${textOrDash(evt.model_round)}`;
+
+  renderGlobalEval(evt.global_eval);
 
   const grid = document.getElementById('summary-grid');
   grid.innerHTML = '';
@@ -865,8 +940,12 @@ function handleSummary(evt) {
     const d = nodes[node];
     if (!d) return;
 
-    const auroc = toNumber(d.auroc, null);
-    const threshold = toNumber(d.threshold, null);
+    const threshold  = toNumber(d.threshold, null);
+    const nWindows   = toNumber(d.n_windows, null);
+    const exceed     = toNumber(d.exceed, null);
+    const detections = toNumber(d.detections, null);
+    const meanScore  = toNumber(d.mean_score, null);
+    const maxScore   = toNumber(d.max_score, null);
     const isFaultNode = node === FAULT_NODE;
 
     const card = document.createElement('div');
@@ -876,26 +955,49 @@ function handleSummary(evt) {
       ? `<span style="font-size:10px;color:var(--warn);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Fault Transition</span>`
       : `<span style="font-size:10px;color:var(--text3);font-weight:600;letter-spacing:.05em;">정상</span>`;
 
+    const exceedPct = (exceed !== null && nWindows)
+      ? ` <span style="color:var(--text3);font-weight:500;">(${(exceed / nWindows * 100).toFixed(1)}%)</span>`
+      : '';
+
     let rows = `
       <div class="summary-node-name">${node} ${roleTag}</div>
-      <div class="summary-row">
-        <span class="summary-key">AUROC</span>
-        <span class="summary-val ${auroc !== null && auroc >= 0.95 ? 'good' : ''}">${fmt(auroc, 4)}</span>
-      </div>
       <div class="summary-row">
         <span class="summary-key">Threshold</span>
         <span class="summary-val">${fmt(threshold, 4)}</span>
       </div>
       <div class="summary-row">
-        <span class="summary-key">Normal / Anomaly</span>
-        <span class="summary-val">${textOrDash(d.n_normal)} / ${textOrDash(d.n_anomaly)}</span>
+        <span class="summary-key">Windows scored</span>
+        <span class="summary-val">${textOrDash(nWindows)}</span>
+      </div>
+      <div class="summary-row">
+        <span class="summary-key">Above threshold</span>
+        <span class="summary-val">${textOrDash(exceed)}${exceedPct}</span>
+      </div>
+      <div class="summary-row">
+        <span class="summary-key">Verdicts (K=3)</span>
+        <span class="summary-val ${detections ? 'warn' : 'good'}">${textOrDash(detections)}</span>
+      </div>
+      <div class="summary-row">
+        <span class="summary-key">Score mean / max</span>
+        <span class="summary-val">${fmt(meanScore, 2)} / ${fmt(maxScore, 2)}</span>
       </div>`;
 
-    if (isFaultNode) {
+    // 라벨이 붙은 스트림(PKL 재생)일 때만 나오는 값들.
+    // 라이브 스트림은 라벨이 없어서 서버가 아예 안 싣는다.
+    if (d.labeled) {
+      const auroc = toNumber(d.auroc, null);
       const detected = d.detect_idx !== null && d.detect_idx !== undefined;
       const delayTxt = (d.delay !== null && d.delay !== undefined) ? `${d.delay} samples` : '—';
       const falseAlarms = toNumber(d.false_alarms, null);
       rows += `
+      <div class="summary-row">
+        <span class="summary-key">AUROC</span>
+        <span class="summary-val ${auroc !== null && auroc >= 0.95 ? 'good' : ''}">${fmt(auroc, 4)}</span>
+      </div>
+      <div class="summary-row">
+        <span class="summary-key">Normal / Anomaly</span>
+        <span class="summary-val">${textOrDash(d.n_normal)} / ${textOrDash(d.n_anomaly)}</span>
+      </div>
       <div class="summary-row">
         <span class="summary-key">Fault onset</span>
         <span class="summary-val">${d.onset_idx !== null && d.onset_idx !== undefined ? '#' + d.onset_idx : '—'}</span>
@@ -912,7 +1014,9 @@ function handleSummary(evt) {
         <span class="summary-key">False alarms</span>
         <span class="summary-val ${falseAlarms === 0 ? 'good' : 'warn'}">${textOrDash(d.false_alarms)}</span>
       </div>`;
-    } else {
+    }
+
+    if (!isFaultNode) {
       rows += `
       <div class="summary-row" style="margin-top:8px;">
         <span class="summary-key" style="color:var(--text3);font-style:italic;font-size:11px;">Contributes to global model stability — fault detection not targeted</span>

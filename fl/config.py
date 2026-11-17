@@ -385,6 +385,13 @@ VERDICT_CNT = os.getenv("FL_VERDICT_CNT", "cnt-verdict")
 VERDICT_MNI = int(os.getenv("FL_VERDICT_MNI", "500"))
 VERDICT_ENABLED = os.getenv("FL_VERDICT", "1") not in ("0", "false", "False")
 
+# 이 라운드 전에는 판정을 내지 않는다.
+#
+# 초반 라운드의 임계값은 거의 학습되지 않은 모델로 잰 것이라 판정이
+# 의미를 갖지 못한다. 고정 검증셋 측정에서 AUROC 가 R1 0.615 -> R3 0.683
+# 까지 오르고 그 뒤로 평평했으므로 기본값을 3 으로 둔다.
+VERDICT_START_ROUND = int(os.getenv("FL_VERDICT_START_ROUND", "3"))
+
 
 def analysis_ae_name(node: str) -> str:
     """mn1 -> ANALYSIS-AE-1"""
