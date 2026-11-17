@@ -262,20 +262,29 @@
   }
   .conn-label { font-size: 12px; font-weight: 500; color: var(--text2); }
 
-  /* 라운드별 평가 로그. 고정 검증셋으로 잰 값이 여기에 쌓인다. */
-  .evallog { margin-top: 14px; border: 1px solid var(--line); border-radius: 10px;
-             background: var(--card); overflow: hidden; }
-  .evallog-head { padding: 10px 14px; border-bottom: 1px solid var(--line);
-                  font-size: 12px; font-weight: 600; color: var(--text2);
-                  display: flex; justify-content: space-between; align-items: center; }
+  /* 라운드별 평가 로그. 고정 검증셋으로 잰 값이 여기에 쌓인다.
+     배경·테두리·글꼴은 차트 카드와 같은 토큰을 쓴다. 전에는 정의되지
+     않은 --card/--line 을 참조해 배경과 테두리가 통째로 빠졌다. */
+  .evallog {
+    background: var(--bg); border: 0.5px solid var(--border);
+    border-radius: var(--radius-lg); overflow: hidden;
+  }
+  .evallog-head { padding: 13px 16px; border-bottom: 0.5px solid var(--border);
+                  display: flex; justify-content: space-between; align-items: baseline; }
+  .evallog-title { font-size: 13px; font-weight: 600; color: var(--text); }
   .evallog-sub  { font-size: 10px; font-weight: 500; color: var(--text3); }
-  .evallog-body { max-height: 168px; overflow-y: auto; padding: 8px 0;
-                  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-                  font-size: 11.5px; line-height: 1.75; }
-  .evallog-body .row { padding: 1px 14px; color: var(--text2); white-space: pre; }
+  /* 고정폭 글꼴을 쓰지 않는다. 숫자만 등폭으로 두고 열은 그리드로 맞춘다. */
+  .evallog-body { max-height: 176px; overflow-y: auto; padding: 6px 0;
+                  font-variant-numeric: tabular-nums; }
+  .evallog-body .row {
+    display: grid; grid-template-columns: 34px 112px 92px 104px 1fr;
+    gap: 10px; padding: 4px 16px;
+    font-size: 12px; color: var(--text2);
+  }
+  /* 맨 위가 최신 라운드다. 한 톤 진하게 둔다. */
+  .evallog-body .row:first-child { color: var(--text); }
   .evallog-body .row b { color: var(--text); font-weight: 600; }
-  .evallog-body .empty { padding: 10px 14px; color: var(--text3); font-size: 11px;
-                         font-family: inherit; }
+  .evallog-body .empty { padding: 10px 16px; color: var(--text3); font-size: 11px; }
   .sep { flex: 1; }
   .btn {
     font-size: 12px; padding: 6px 14px;
@@ -455,7 +464,7 @@
   <!-- 라운드별 평가 로그 -->
   <div class="evallog">
     <div class="evallog-head">
-      <span>ROUND EVALUATION — 고정 검증셋</span>
+      <span class="evallog-title">ROUND EVALUATION — 고정 검증셋</span>
       <span class="evallog-sub" id="evallog-meta">대기 중</span>
     </div>
     <div class="evallog-body" id="evallog-body">
@@ -946,6 +955,10 @@ function connect() {
     try { evt = JSON.parse(e.data); } catch { return; }
 
     if (evt.type === 'init' || evt.type === 'round') {
+      // 접속 시 서버가 그동안의 라운드 평가를 같이 보낸다. 오래된 것부터
+      // 꽂으므로 마지막(최신)이 맨 위에 남는다. applyState 보다 먼저 둬서
+      // 그쪽이 실패해도 로그는 뜨게 한다.
+      (evt.evals || []).forEach(handleEval);
       applyState(evt);
     } else if (evt.type === 'threshold') {
       applyThresholds(evt.thresholds || {});
@@ -988,17 +1001,17 @@ function handleEval(e) {
   const empty = body.querySelector('.empty');
   if (empty) empty.remove();
 
-  const pad = (v, n) => String(v).padStart(n, ' ');
   const row = document.createElement('div');
   row.className = 'row';
   row.innerHTML =
-    `R${pad(e.round, 2)}  AUROC <b>${Number(e.auroc).toFixed(4)}</b>` +
-    `   탐지 ${pad(e.detected, 3)}/${e.n_anomaly}` +
-    `   오경보 ${pad(e.false_alarms, 3)}/${e.n_normal}` +
-    `   정상 ${Number(e.mean_normal).toFixed(3)}` +
-    ` vs 이상 ${Number(e.mean_anomaly).toFixed(3)}`;
-  body.appendChild(row);
-  body.scrollTop = body.scrollHeight;
+    `<span>R${e.round}</span>` +
+    `<span>AUROC <b>${Number(e.auroc).toFixed(4)}</b></span>` +
+    `<span>탐지 <b>${e.detected}</b>/${e.n_anomaly}</span>` +
+    `<span>오경보 <b>${e.false_alarms}</b>/${e.n_normal}</span>` +
+    `<span>정상 ${Number(e.mean_normal).toFixed(3)} ` +
+    `vs 이상 ${Number(e.mean_anomaly).toFixed(3)}</span>`;
+  // 최신이 위로 오게 맨 앞에 꽂는다.
+  body.insertBefore(row, body.firstChild);
 
   document.getElementById('evallog-meta').textContent =
     `정상 ${e.n_normal} / 이상 ${e.n_anomaly} · 최신 R${e.round} AUROC ${Number(e.auroc).toFixed(4)}`;
@@ -1013,6 +1026,12 @@ document.getElementById('btn-reconnect').addEventListener('click', () => {
   onsetIdx   = null;
   document.getElementById('fault-banner').classList.remove('show');
   document.getElementById('summary-overlay').classList.remove('show');
+
+  // 평가 로그도 비운다. 다시 접속하면 서버가 쌓아 둔 걸 보내 준다.
+  evalSeen.clear();
+  document.getElementById('evallog-body').innerHTML =
+    '<div class="empty">집계가 끝나면 라운드마다 한 줄씩 쌓입니다.</div>';
+  document.getElementById('evallog-meta').textContent = '대기 중';
 
   // 차트 초기화
   ['mn1', 'mn2', 'mn3', 'loss'].forEach(k => {

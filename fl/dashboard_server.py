@@ -193,7 +193,14 @@ _shared: dict = {
     "summary_sent": False,
 
     "anomaly_start_round": ANOMALY_START_ROUND,
+
+    # 라운드별 고정 검증셋 평가 결과. 나중에 접속한 클라이언트에도
+    # 지난 라운드를 보내기 위해 쌓아 둔다.
+    "evals": [],
 }
+
+# 평가 로그를 몇 라운드까지 들고 있을지. 라운드 수보다 넉넉하게 둔다.
+EVAL_HISTORY_MAX = 60
 
 _shared_lock = threading.Lock()
 
@@ -345,6 +352,8 @@ def stream():
             "nodes": _shared["nodes"],
             "thresholds": _shared["thresholds"],
             "model_round": _shared["model_round"],
+            # 접속 전에 끝난 라운드의 평가도 같이 보낸다.
+            "evals": list(_shared["evals"]),
         }
 
     try:
@@ -1301,6 +1310,22 @@ IGNORE_STALE_CONTROL = os.getenv("FL_DASH_IGNORE_STALE", "1") != "0"
 _stale_control_warned = False
 
 
+def _is_stale_payload(content: dict) -> bool:
+    """
+    지난 실행이 남긴 CIN 인지 본다. _is_stale_control 과 기준은 같고
+    경고를 찍지 않는다. 평가 결과처럼 조용히 걸러야 하는 곳에서 쓴다.
+    """
+    if not IGNORE_STALE_CONTROL:
+        return False
+
+    try:
+        ts = float(content.get("timestamp", 0))
+    except (TypeError, ValueError):
+        return False
+
+    return 0 < ts < DASHBOARD_STARTED_AT
+
+
 def _is_stale_control(content: dict) -> bool:
     """
     지난 실행이 남긴 라운드 명령인지 본다.
@@ -1499,10 +1524,17 @@ def _poll_thread() -> None:
                 om2m.get_latest_content_instance(fl_inference_path)
             )
             if (ev and ev.get("type") == "global-eval"
-                    and int(ev.get("round", -1)) > last_eval_round):
+                    and int(ev.get("round", -1)) > last_eval_round
+                    and not _is_stale_payload(ev)):
                 last_eval_round = int(ev["round"])
                 ev = dict(ev)
                 ev["type"] = "eval"
+                # 접속 중인 쪽에 보내고, 나중에 접속한 쪽도 지난 라운드를
+                # 볼 수 있게 쌓아 둔다. 새로고침하면 그동안의 라운드가
+                # 통째로 사라지던 것이 이것이다.
+                with _shared_lock:
+                    _shared["evals"].append(ev)
+                    del _shared["evals"][:-EVAL_HISTORY_MAX]
                 _broadcast(ev)
                 print(f"  [Eval] R{last_eval_round} "
                       f"AUROC={ev.get('auroc')} "
