@@ -29,6 +29,36 @@ StateDict = Dict[str, torch.Tensor]
 # "samples" 샘플 수 비례 — 표준 FedAvg
 WEIGHTING = os.getenv("FL_AGG_WEIGHTING", "uniform").strip().lower()
 
+# BatchNorm 층을 평균에서 뺄지 (FedBN).
+#
+# [왜]
+# BatchNorm 은 배치의 평균/분산으로 정규화하고 그 통계를 running_mean /
+# running_var 에 쌓는다. 그건 그 사업장 데이터의 통계다. 사업장마다 바닥도
+# 로봇도 다르므로 그 통계도 다르다. 평균을 내면 어느 사업장의 것도 아닌
+# 값이 된다.
+#
+# 이 코드베이스는 입력 정규화를 이미 사업장별로 한다. 공유로 바꿔 재 봤더니
+# 2노드 FedAvg 에서 AUROC 0.6752 -> 0.5772 로 떨어졌고 50 회 비교 전부
+# 사업장별이 이겼다. BatchNorm 통계도 같은 성격인데 그것만 평균내고 있었다.
+#
+# 실측(2노드 FedAvg, 시드 4개): 평균을 내면 10R평균 0.6745 / R10 0.6850,
+# 빼면 0.6815 / 0.7080. 오경보는 41 -> 36. 차이는 작지만 방향이 일관되고,
+# base 는 R3 에서 평평해지는 반면 FedBN 은 R10 까지 계속 오른다.
+#
+# FL_FEDBN=0 으로 예전 동작(전부 평균)으로 되돌린다.
+FEDBN = os.getenv("FL_FEDBN", "1") not in ("0", "false", "False")
+
+
+def bn_prefixes(state) -> tuple:
+    """
+    state_dict 에서 BatchNorm 층의 접두사를 찾는다.
+
+    running_mean 은 BatchNorm 에만 있으므로 그 키로 층을 특정한다.
+    모델 클래스를 몰라도 되고, 층 이름이 바뀌어도 따라간다.
+    """
+    return tuple(k[: -len("running_mean")]
+                 for k in state if k.endswith("running_mean"))
+
 
 class Aggregator:
     """FedAvg Aggregator (모델 비의존적)"""
@@ -79,8 +109,14 @@ class Aggregator:
         weights = self._weights(counts)
 
         global_state: StateDict = {}
+        bn = bn_prefixes(states[0]) if FEDBN else ()
         for key in states[0].keys():
             ref = states[0][key]
+            if bn and key.startswith(bn):
+                # BatchNorm 은 사업장에 남긴다. 여기 담는 값은 글로벌 모델을
+                # 평가할 때만 쓰이고, 각 사업장은 자기 것을 계속 쓴다.
+                global_state[key] = ref.clone()
+                continue
             if not torch.is_floating_point(ref):
                 # 정수 버퍼(num_batches_tracked 등)는 평균을 내면 뜻이 깨진다.
                 # 첫 노드 것을 그대로 쓴다.

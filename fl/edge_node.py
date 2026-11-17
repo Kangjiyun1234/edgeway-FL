@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from aggregator import FEDBN
 from config import TrainConfig, AEConfig
 from model_cvae import CVAE1D
 
@@ -138,6 +139,21 @@ class AEEdgeNode:
                 for k, v in self.model.state_dict().items()}
 
     def set_state_dict(self, state: StateDict) -> None:
+        """
+        글로벌 가중치를 싣는다.
+
+        FedBN 이 켜져 있으면 BatchNorm 층만 자기 것을 지킨다. 집계 쪽에서
+        빼는 것만으로는 부족하다. 글로벌 모델에는 어떤 값이든 들어 있고,
+        그걸 그대로 실으면 이 사업장의 통계가 덮인다. 양쪽이 다 막아야
+        사업장별 BatchNorm 이 유지된다.
+        """
+        if FEDBN:
+            own = self.model.state_dict()
+            bn = tuple(k[: -len("running_mean")]
+                       for k in own if k.endswith("running_mean"))
+            if bn:
+                state = {k: (own[k] if k.startswith(bn) else v)
+                         for k, v in state.items()}
         self.model.load_state_dict(state)
         self.model.to(self.device)
 
