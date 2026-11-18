@@ -407,7 +407,8 @@ VERDICT_CNT = os.getenv("FL_VERDICT_CNT", "cnt-verdict")
 VERDICT_MNI = int(os.getenv("FL_VERDICT_MNI", "500"))
 VERDICT_ENABLED = os.getenv("FL_VERDICT", "1") not in ("0", "false", "False")
 
-# 이 라운드 전에는 판정을 내지 않는다. 대시보드 표시도 같이 막는다.
+# 판정을 내도 되는 첫 라운드. 이 라운드부터 CIN 을 올리고 경보를 띄운다.
+# 기본 6 이면 R1~R5 는 아무것도 안 나가고, R6 부터 나간다.
 #
 # 초반 라운드의 임계값은 거의 학습되지 않은 모델로 잰 것이라 판정이
 # 의미를 갖지 못한다. 어디부터 쓸 만한지 8시드로 쟀다(2노드 FedAvg):
@@ -423,14 +424,15 @@ VERDICT_ENABLED = os.getenv("FL_VERDICT", "1") not in ("0", "false", "False")
 #
 # R5 부터 라운드 간 상승폭(+0.0039)이 시드 간 편차(±0.0066)보다 작아진다.
 # 즉 그 뒤의 변화는 학습 때문인지 시드 운인지 구분되지 않는다. 임계값
-# 변동률도 R6 부터 9~13% 구간에 들어앉는다. 그래서 5 로 둔다.
+# 변동률도 R6 부터 9~13% 구간에 들어앉는다. R5 까지를 안정화 구간으로
+# 보고, 판정은 그 다음인 R6 부터 낸다.
 #
 # 처음엔 AUROC 만 보고 3 으로 뒀는데, R3 은 임계값이 R1 다음으로 불안정한
 # 지점이었다. 판정을 가르는 건 AUROC 가 아니라 임계값이다.
 #
 # 10 라운드를 다 돌려도 임계값 변동률은 9% 아래로 안 내려간다. 5 는
 # "더 나빠지지 않는 구간의 시작"이지 "흔들림이 없어지는 지점"이 아니다.
-VERDICT_START_ROUND = int(os.getenv("FL_VERDICT_START_ROUND", "5"))
+VERDICT_START_ROUND = int(os.getenv("FL_VERDICT_START_ROUND", "6"))
 
 
 # 판정을 구독해 갈 앱들. 기본은 사업장별 판정 앱(CJUDGE-AE-i).

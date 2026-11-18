@@ -4,7 +4,15 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AMR 바닥 이상 점검 — 연합학습</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="/vendor/chart.umd.js"></script>
+<script>
+// 로컬 파일이 없으면 CDN 으로 물러선다. 받아둔 PC 에서는 바깥으로 안 나간다.
+// document.write 를 쓰는 건 뒤 스크립트가 Chart 를 바로 쓰기 때문이다.
+if (!window.Chart) {
+  document.write('<scr' + 'ipt src="https://cdnjs.cloudflare.com/ajax/libs/'
+    + 'Chart.js/4.4.1/chart.umd.js"><\/scr' + 'ipt>');
+}
+</script>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -106,9 +114,17 @@
   .fault-dot {
     display: none; width: 8px; height: 8px; border-radius: 50%;
     background: var(--fault-line); margin-left: 7px; flex: none;
+    margin-right: auto;   /* 이름 바로 옆. 배지는 오른쪽 끝으로 */
     box-shadow: 0 0 0 0 rgba(226, 75, 74, 0.6);
   }
   .fault-dot.show { display: inline-block; animation: faultPulse 1.1s ease-out infinite; }
+  /* 안정화 구간: 라운드가 돌면 파랑, 이상이 잡히면 빨강 */
+  .fault-dot.calm { background: #378add; animation-name: calmPulse; }
+  @keyframes calmPulse {
+    0%   { opacity: 1;    box-shadow: 0 0 0 0   rgba(55, 138, 221, 0.6); }
+    70%  { opacity: 0.35; box-shadow: 0 0 0 6px rgba(55, 138, 221, 0); }
+    100% { opacity: 1;    box-shadow: 0 0 0 0   rgba(55, 138, 221, 0); }
+  }
   @keyframes faultPulse {
     0%   { opacity: 1;   box-shadow: 0 0 0 0   rgba(226, 75, 74, 0.6); }
     70%  { opacity: 0.35; box-shadow: 0 0 0 6px rgba(226, 75, 74, 0); }
@@ -706,6 +722,9 @@ let faulted     = false;
 let faultRound  = null;
 let mn3Consec   = 0;
 let verdictStartRound = 1;   // 서버가 init 에서 알려준다
+let faultShown  = false;     // 아래쪽 상세를 이미 켰는지
+let faultDetail = '';
+let warmupRed   = false;     // 안정화 구간에서 한 번이라도 잡혔는지
 const K_FAULT   = 3;
 let lossHistory = {};
 let scoreIdx    = 0;   // 스트리밍 샘플 카운터
@@ -714,12 +733,45 @@ let onsetIdx    = null; // mn3_label=1이 처음 나온 샘플 인덱스
 // ═══════════════════════════════════════════════════
 // 이벤트 핸들러
 // ═══════════════════════════════════════════════════
+/*
+ * 안정화 구간(1 ~ verdictStartRound)의 점.
+ *
+ * 이상치는 그 구간 뒤에 나오게 해 뒀으므로, 여기서 잡히는 건 모델이 아직
+ * 덜 자란 탓이다. 경보로 올리지 않고 점 하나로만 보여 준다.
+ *   라운드가 돌면   파랑
+ *   그래도 잡히면   빨강
+ * 구간이 끝나면 점을 지우고, 그때부터는 평소대로 경보를 띄운다.
+ */
+function updateWarmupDot(round) {
+  // verdictStartRound 는 '판정을 내도 되는 첫 라운드'다.
+  // 그 앞(1 ~ start-1)이 안정화 구간이고, 여기서만 점을 띄운다.
+  const dot = document.getElementById('fault-dot-mn3');
+  if (!dot) return;
+  if (round >= verdictStartRound || round < 1) {
+    dot.classList.remove('show', 'calm');
+    dot.title = '';
+    return;
+  }
+  dot.classList.add('show');
+  dot.classList.toggle('calm', !warmupRed);
+  dot.title = warmupRed
+    ? `안정화 중 (R${round}/${verdictStartRound - 1}) — 신호가 잡혔지만 모델이 `
+      + '덜 자란 구간이라 경보로 올리지 않는다'
+    : `안정화 중 (R${round}/${verdictStartRound - 1})`;
+}
+
 function applyState(evt) {
   // init / round 이벤트 공통 처리
   if (evt.verdict_start_round !== undefined) {
     verdictStartRound = toNumber(evt.verdict_start_round, 1);
   }
   const round     = toNumber(evt.round, 0);
+  // 안정화 구간이 끝나면 거기서 잡힌 건 없던 일로 한다. 모델이 덜 자란
+  // 탓이고, 진짜 이상치는 그 뒤에 온다.
+  if (round >= verdictStartRound && faulted && !faultShown) {
+    faulted = false; mn3Consec = 0; onsetIdx = null;
+  }
+  updateWarmupDot(round);
   const maxRounds = Math.max(1, Math.floor(toNumber(evt.max_rounds, config_maxRounds || 10)));
   const state     = evt.fl_state  || 'FL_READY';
   const nodes     = evt.nodes     || {};
@@ -818,12 +870,21 @@ function handleScore(evt) {
   // 거의 학습되지 않은 모델로 잡은 것이라 화면에 띄울 근거가 없다.
   // MN 이 CSE 에 판정을 안 올리는 기준과 같은 값을 쓴다.
   const curRound = toNumber(evt.round, 0);
-  if (!faulted && evt.mn3 !== undefined && curRound >= verdictStartRound) {
+  if (!faulted && evt.mn3 !== undefined) {
     const score = toNumber(evt.mn3, null);
     const thr = firstFinite(evt.mn3_thr, thresholds.mn3, 1.0);
     if (score !== null && score > thr) {
       mn3Consec++;
-      if (mn3Consec >= K_FAULT) triggerFault(scoreIdx);
+      if (mn3Consec >= K_FAULT) {
+        if (curRound < verdictStartRound) {
+          // 안정화 구간. 점만 빨갛게 하고 경보는 올리지 않는다.
+          warmupRed = true;
+          updateWarmupDot(curRound);
+          mn3Consec = 0;
+        } else {
+          triggerFault(scoreIdx);
+        }
+      }
     } else {
       mn3Consec = 0;
     }
@@ -870,21 +931,21 @@ function triggerFault(detectSampleIdx) {
     auroc !== '—' ? `AUROC: ${auroc}` : null,
   ].filter(Boolean).join('  ·  ');
 
-  document.getElementById('alert-detail').textContent = detail;
+  faultDetail = detail;
+  showFaultDetail();
+}
+
+// 차트 카드 쪽 상세. 판정 시작 라운드가 되면 켠다.
+function showFaultDetail() {
+  if (faultShown || !faulted) return;
+  faultShown = true;
+  document.getElementById('alert-detail').textContent = faultDetail;
   document.getElementById('alert-strip').classList.add('show');
-
-  // 화면을 덮는 배너 대신 mn3 이름 옆 점만 깜박인다.
-  // 배너는 띄우지 않고 상세는 카드 안 alert-strip 에 남긴다.
-  const dot = document.getElementById('fault-dot-mn3');
-  if (dot) { dot.classList.add('show'); dot.title = '이상 감지 — ' + detail; }
-
-  // 노드 + 차트 카드
   setNode('mn3', 'fault', 'Fault!');
-  document.getElementById('cc-mn3').className      = 'chart-card hl-red';
-  document.getElementById('rfill').style.background = '#e24b4a';
-  document.getElementById('pill-dot').className     = 'pill-dot alert';
+  document.getElementById('cc-mn3').className        = 'chart-card hl-red';
+  document.getElementById('rfill').style.background  = '#e24b4a';
+  document.getElementById('pill-dot').className      = 'pill-dot alert';
   document.getElementById('pill-label').textContent  = 'Fault detected';
-
   if (faultRound) updateDots(faultRound, builtDots, faultRound);
 }
 
@@ -1144,6 +1205,8 @@ function handleEval(e) {
 
 document.getElementById('btn-reconnect').addEventListener('click', () => {
   faulted    = false;
+  faultShown = false;
+  warmupRed  = false;
   faultRound = null;
   mn3Consec  = 0;
   lossHistory = {};
@@ -1151,6 +1214,8 @@ document.getElementById('btn-reconnect').addEventListener('click', () => {
   onsetIdx   = null;
   document.getElementById('fault-banner').classList.remove('show');
   document.getElementById('summary-overlay').classList.remove('show');
+  const _d = document.getElementById('fault-dot-mn3');
+  if (_d) { _d.classList.remove('show', 'calm'); _d.title = ''; }
 
   // 평가 로그도 비운다. 다시 접속하면 서버가 쌓아 둔 걸 보내 준다.
   evalSeen.clear();

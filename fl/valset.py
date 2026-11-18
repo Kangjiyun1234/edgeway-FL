@@ -74,6 +74,27 @@ def load(path: Optional[str] = None):
         print(f"  ⚠ 검증셋 로드 실패 ({p}): {e}")
         return None
 
+    # 조건 폭이 모자라면 채운다.
+    #
+    # 적재 상태(empty/light/heavy)를 cond 에 넣으면서 폭이 8 -> 11 이 됐다.
+    # 예전에 뜬 검증셋은 8 폭이라 그대로 넣으면 모델이 모양 때문에 죽고,
+    # 평가가 통째로 건너뛰어진다(라운드별 AUROC 가 영영 안 뜬다).
+    #
+    # 모자란 자리는 'empty' 로 채운다. 이 검증셋은 전부 to_pick 구간이고
+    # lift.eff 가 4561 에 붙어 있어 실제로 빈 차 주행이다. 추정이 아니라
+    # 확인한 값이다.
+    want = int(getattr(config, "AE_CFG", None).cond_dim)
+    if C.shape[1] < want:
+        pad = np.zeros((len(C), want - C.shape[1]), dtype=np.float32)
+        if pad.shape[1] >= 1:
+            pad[:, 0] = 1.0            # LOAD_STATES[0] == "empty"
+        C = np.concatenate([C, pad], axis=1)
+        print(f"  · 검증셋 조건 폭을 {C.shape[1] - pad.shape[1]} -> {want} 로 "
+              f"채웠다 (빈 차 기준). 새로 뜨면 이 줄은 사라진다.")
+    elif C.shape[1] > want:
+        print(f"  ⚠ 검증셋 조건 폭 {C.shape[1]} > 모델 {want}. 앞쪽만 쓴다.")
+        C = C[:, :want]
+
     if len(X) == 0 or len(np.unique(Y)) < 2:
         print(f"  ⚠ 검증셋이 비었거나 한 클래스뿐이다 ({p})")
         return None

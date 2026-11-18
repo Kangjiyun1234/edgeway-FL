@@ -53,7 +53,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from flask import Flask, Response
+from flask import Flask, Response, send_from_directory
 from sklearn.metrics import roc_auc_score
 
 import config
@@ -252,6 +252,19 @@ def _broadcast(event: dict) -> None:
 # ════════════════════════════════════════════════════════
 # HTTP Endpoint
 # ════════════════════════════════════════════════════════
+
+@app.route("/vendor/<path:name>")
+def vendor(name: str):
+    """
+    외부 CDN 대신 저장소 안의 라이브러리를 내준다.
+
+    Chart.js 를 cdnjs 에서 받게 두면 <head> 에서 파싱이 막혀, 캠퍼스 밖에서
+    열 때 그게 다 받아질 때까지 화면이 비어 있다. 망이 막혀 있으면 타임아웃
+    까지 기다린다. 시연 중에 바깥 망에 기대지 않도록 여기서 내준다.
+    """
+    return send_from_directory(PROJECT_ROOT / "vendor", name,
+                               max_age=86400)
+
 
 @app.route("/")
 def index():
