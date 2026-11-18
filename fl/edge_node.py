@@ -33,6 +33,13 @@ from aggregator import FEDBN
 # 주의: 이걸 켜면 임계값의 n_sigma 도 같이 올려야 한다. 이유와 실측은
 # config.THRESHOLD_N_SIGMA 주석에 있다.
 COND_NORM = os.getenv("FL_COND_NORM", "1") not in ("0", "false", "False")
+
+# 점수를 어디서 재는가.
+#   diff  : |diff(x) - diff(x_hat)| 를 채널마다 학습 기준으로 z 화 -> 최대 (기본)
+#   recon : |x - x_hat| 를 채널 평균 (예전 방식)
+# 세 고장 모두 가속도계의 1 샘플 떨림으로 나타나는데 원신호 오차는 저주파
+# 궤적 복원 오차에 덮인다. 실측은 model_cvae.channel_diff_error 주석 참조.
+SCORE_MODE = os.getenv("FL_SCORE_MODE", "diff").strip().lower()
 from config import TrainConfig, AEConfig
 from model_cvae import CVAE1D
 
@@ -126,6 +133,12 @@ class AEEdgeNode:
         # 채널마다 channel_norm 으로 나누는 것과 같은 생각을 조건 축에 쓴다.
         self.cond_norm: Optional[dict] = None
         self.cond_norm_fallback: float = 1.0
+
+        # SCORE_MODE="diff" 용 기준. {조건칸: (채널별 중앙값, 채널별 MAD)}
+        # 채널마다·조건마다 떨림의 정상 수준이 달라서, 한 기준으로 재면
+        # 회전 구간이나 떨림이 원래 큰 채널이 점수를 지배한다.
+        self.diff_ref: Optional[dict] = None
+        self.diff_ref_global: Optional[tuple] = None
         # 정상 데이터로 잡은 임계값
         self.threshold: Optional[float] = None
 
@@ -327,22 +340,47 @@ class AEEdgeNode:
             return None
 
         self.model.eval()
-        errs = []
+        errs, derrs = [], []
         with torch.no_grad():
             for i in range(0, self.num_train_samples, self.train_cfg.batch_size):
                 xb = self.train_ds.tensors[0][i:i + self.train_cfg.batch_size].to(self.device)
                 cb = (self.train_ds.tensors[1][i:i + self.train_cfg.batch_size].to(self.device)
                       if self.cond_dim else None)
                 errs.append(self.model.channel_error(xb, cb).cpu())
+                if SCORE_MODE == "diff":
+                    derrs.append(self.model.channel_diff_error(xb, cb).cpu())
 
         E = torch.cat(errs)                       # (N, C)
         self.channel_norm = E.median(dim=0).values    # 채널별 기준 오차
 
-        scores = self._aggregate(E)
+        if SCORE_MODE == "diff":
+            # 차분 오차의 '정상 수준' 을 채널 x 조건칸 마다 잡는다.
+            # 조건칸 표본이 적으면(8 개 미만) 전체 기준으로 물러선다.
+            D = torch.cat(derrs).numpy()              # (N, C)
+            cond_np = (self.train_ds.tensors[1][:len(D)].cpu().numpy()
+                       if self.cond_dim else None)
+            gm = np.median(D, axis=0)
+            gd = np.median(np.abs(D - gm), axis=0) * 1.4826 + 1e-9
+            self.diff_ref_global = (gm, gd)
+            self.diff_ref = {}
+            if cond_np is not None:
+                keys = self.cell_key(cond_np)
+                for k in np.unique(keys):
+                    m = keys == k
+                    if m.sum() < 8:
+                        continue
+                    md = np.median(D[m], axis=0)
+                    self.diff_ref[int(k)] = (
+                        md, np.median(np.abs(D[m] - md), axis=0) * 1.4826 + 1e-9)
+            scores = torch.from_numpy(self._diff_scores(D, cond_np))
+            print(f"    ◦ 점수 방식 diff (차분 오차 채널 z 최대) · "
+                  f"조건칸 기준 {len(self.diff_ref)}개")
+        else:
+            scores = self._aggregate(E)
 
         # 조건별 기준값을 학습 점수에서 잡는다. 그 다음 임계값은 '나눈'
         # 점수로 잡아야 추론 때와 단위가 같아진다.
-        if COND_NORM and self.cond_dim:
+        if COND_NORM and self.cond_dim and SCORE_MODE != "diff":
             raw = scores.cpu().numpy()
             keys = self.cond_key(
                 self.train_ds.tensors[1][:len(raw)].cpu().numpy())
@@ -399,6 +437,34 @@ class AEEdgeNode:
         return (np.argmax(C[:, :5], 1) * 10
                 + np.argmax(C[:, 5:8], 1)).astype(np.int64)
 
+    @staticmethod
+    def cell_key(cond: np.ndarray) -> np.ndarray:
+        """cond 원핫(nav 5 + speed 3 + 적재 3)을 조건칸 번호 하나로 접는다.
+
+        cond_key 와 달리 적재까지 넣는다. 떨림은 싣고 있는 무게에 따라
+        정상 수준이 달라서, 적재를 빼면 '무거워서 큰 것' 이 이상으로 샌다.
+        """
+        C = np.asarray(cond, dtype=np.float32)
+        if C.ndim != 2 or C.shape[1] < 8:
+            return np.zeros(len(C), dtype=np.int64)
+        k = np.argmax(C[:, :5], 1) * 9 + np.argmax(C[:, 5:8], 1) * 3
+        if C.shape[1] >= 11:
+            k = k + np.argmax(C[:, 8:11], 1)
+        return k.astype(np.int64)
+
+    def _diff_scores(self, E: np.ndarray, cond: Optional[np.ndarray]) -> np.ndarray:
+        """채널별 차분 오차 (N, C) -> 점수 (N,). 학습 기준으로 z 화 후 최대."""
+        if self.diff_ref_global is None:
+            return E.max(axis=1)
+        gm, gd = self.diff_ref_global
+        keys = (self.cell_key(cond) if cond is not None
+                else np.zeros(len(E), dtype=np.int64))
+        Z = np.empty_like(E)
+        for i, k in enumerate(keys):
+            md, mad = (self.diff_ref or {}).get(int(k), (gm, gd))
+            Z[i] = (E[i] - md) / mad
+        return Z.max(axis=1)
+
     def _apply_cond_norm(self, scores: np.ndarray,
                          cond: Optional[np.ndarray]) -> np.ndarray:
         """점수를 그 조건의 기준으로 나눈다. 기준이 없으면 그대로 둔다."""
@@ -436,17 +502,29 @@ class AEEdgeNode:
         )
 
         self.model.eval()
-        all_scores, all_labels = [], []
+        all_scores, all_labels, all_cond = [], [], []
 
         with torch.no_grad():
             for xb, cb, yb in val_loader:
                 xb = xb.to(self.device)
                 cb_ = cb.to(self.device) if self.cond_dim else None
-                all_scores.append(self._aggregate(
-                    self.model.channel_error(xb, cb_)).cpu())
+                if SCORE_MODE == "diff":
+                    # 운영 점수와 같은 자로 잰다. 둘이 다르면 로컬 화면의
+                    # val AUROC 와 실제 판정이 어긋난다.
+                    all_scores.append(
+                        self.model.channel_diff_error(xb, cb_).cpu())
+                    all_cond.append(cb.cpu())
+                else:
+                    all_scores.append(self._aggregate(
+                        self.model.channel_error(xb, cb_)).cpu())
                 all_labels.append(yb)
 
-        scores = torch.cat(all_scores).numpy()
+        if SCORE_MODE == "diff":
+            scores = self._diff_scores(
+                torch.cat(all_scores).numpy(),
+                torch.cat(all_cond).numpy() if all_cond else None)
+        else:
+            scores = torch.cat(all_scores).numpy()
         labels = torch.cat(all_labels).numpy()
 
         normal = scores[labels == 0]
@@ -471,10 +549,18 @@ class AEEdgeNode:
             for i in range(0, len(X), self.train_cfg.batch_size):
                 xb = X[i:i + self.train_cfg.batch_size]
                 cb = C[i:i + self.train_cfg.batch_size] if self.cond_dim else None
-                out.append(self._aggregate(
-                    self.model.channel_error(xb, cb)).cpu().numpy())
+                if SCORE_MODE == "diff":
+                    out.append(self.model.channel_diff_error(xb, cb).cpu().numpy())
+                else:
+                    out.append(self._aggregate(
+                        self.model.channel_error(xb, cb)).cpu().numpy())
 
-        return self._apply_cond_norm(np.concatenate(out), cond)
+        E = np.concatenate(out)
+        if SCORE_MODE == "diff":
+            # 조건칸별 z 화가 조건 정규화 역할까지 하므로 따로 안 나눈다.
+            return self._diff_scores(
+                E, cond if cond is not None else C.cpu().numpy())
+        return self._apply_cond_norm(E, cond)
 
     @staticmethod
     def aggregate_by_run(

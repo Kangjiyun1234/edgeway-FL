@@ -125,6 +125,41 @@ def load(path: Optional[str] = None):
     return _cache
 
 
+# 점수 방식. edge_node 와 같은 환경 변수를 본다. 두 쪽이 다른 자로
+# 재면 라운드별 숫자와 운영 판정이 어긋난다.
+SCORE_MODE = os.getenv("FL_SCORE_MODE", "diff").strip().lower()
+
+
+def _cell_key(C: np.ndarray) -> np.ndarray:
+    """cond 원핫(nav 5 + speed 3 + 적재 3) -> 조건칸 번호."""
+    C = np.asarray(C, dtype=np.float32)
+    if C.ndim != 2 or C.shape[1] < 8:
+        return np.zeros(len(C), dtype=np.int64)
+    k = np.argmax(C[:, :5], 1) * 9 + np.argmax(C[:, 5:8], 1) * 3
+    if C.shape[1] >= 11:
+        k = k + np.argmax(C[:, 8:11], 1)
+    return k.astype(np.int64)
+
+
+def _cell_zmax(D: np.ndarray, C: np.ndarray, min_cell: int = 8) -> np.ndarray:
+    """채널별 값 (N, C) -> 조건칸별 z 화 -> 채널 최대 (N,)."""
+    gm = np.median(D, axis=0)
+    gd = np.median(np.abs(D - gm), axis=0) * 1.4826 + 1e-9
+    keys = _cell_key(C)
+    ref = {}
+    for k in np.unique(keys):
+        m = keys == k
+        if m.sum() < min_cell:
+            continue
+        md = np.median(D[m], axis=0)
+        ref[int(k)] = (md, np.median(np.abs(D[m] - md), axis=0) * 1.4826 + 1e-9)
+    Z = np.empty_like(D)
+    for i, k in enumerate(keys):
+        md, mad = ref.get(int(k), (gm, gd))
+        Z[i] = (D[i] - md) / mad
+    return Z.max(axis=1)
+
+
 def _auroc(scores: np.ndarray, labels: np.ndarray) -> float:
     if len(np.unique(labels)) < 2:
         return 0.5
@@ -176,11 +211,20 @@ def evaluate(model_path: str, n_sigma: float = None) -> Optional[dict]:
     X, C, y = ds["X"], ds["C"], ds["y"]
 
     with torch.no_grad():
-        E = model.channel_error(X, C if cfg.cond_dim else None)
-        # 채널별 규모가 달라 그냥 평균내면 큰 채널이 점수를 지배한다.
-        # 기준은 검증셋 전체의 채널 평균이다. 라벨을 쓰지 않는다.
-        E = E / (E.mean(dim=0) + 1e-12)
-        scores = E.mean(dim=1).cpu().numpy()
+        if SCORE_MODE == "diff":
+            # 차분 오차. 채널 x 조건칸 마다 '그 칸의 중앙값/MAD' 로 z 화한
+            # 뒤 채널 최대를 쓴다. 기준은 검증셋 자체에서 뽑는다. 여기에는
+            # 학습 노드가 없어서 학습 데이터 기준을 쓸 수 없고, 이상이
+            # 소수라 중앙값/MAD 는 거의 움직이지 않는다. 라벨은 안 쓴다.
+            D = model.channel_diff_error(
+                X, C if cfg.cond_dim else None).cpu().numpy()
+            scores = _cell_zmax(D, C.cpu().numpy())
+        else:
+            E = model.channel_error(X, C if cfg.cond_dim else None)
+            # 채널별 규모가 달라 그냥 평균내면 큰 채널이 점수를 지배한다.
+            # 기준은 검증셋 전체의 채널 평균이다. 라벨을 쓰지 않는다.
+            E = E / (E.mean(dim=0) + 1e-12)
+            scores = E.mean(dim=1).cpu().numpy()
 
     # 임계값도 라벨 없이 전체에서 뽑는다. 다만 평균/표준편차가 아니라
     # 중앙값/MAD 를 쓴다.
