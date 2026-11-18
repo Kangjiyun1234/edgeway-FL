@@ -104,10 +104,19 @@ def load(path: Optional[str] = None):
     std = X.std(axis=(0, 2), keepdims=True) + 1e-8
     Xn = (X - mean) / std
 
+    # 이상 종류. 종류마다 난이도가 크게 달라서(실측: 바닥 0.95 /
+    # 휠 돌기 0.69 / 베어링 0.55) 합친 숫자 하나만 보면 어느 쪽이 안
+    # 되는지 안 보인다. 없으면 None 으로 두고 전체 숫자만 낸다.
+    try:
+        ft = z["fault_type"].astype(str) if "fault_type" in z.files else None
+    except Exception:
+        ft = None
+
     _cache = {
         "X": torch.from_numpy(Xn),
         "C": torch.from_numpy(C),
         "y": Y,
+        "fault_type": ft,
         "path": p,
     }
     print(f"  ✓ 검증셋 {len(Y)}개 "
@@ -194,7 +203,22 @@ def evaluate(model_path: str, n_sigma: float = None) -> Optional[dict]:
     thr_mean = float(scores.mean() + n_sigma * scores.std())
 
     norm, anom = scores[y == 0], scores[y == 1]
+
+    # 종류별. 각 종류를 '정상' 하고만 비교한다. 종류끼리 섞으면 어려운
+    # 종류가 쉬운 종류의 숫자를 깎는다.
+    by_fault = {}
+    ft = ds.get("fault_type")
+    if ft is not None:
+        for name in sorted(set(ft[y == 1].tolist())):
+            m = (ft == name) | (y == 0)
+            by_fault[name] = {
+                "auroc": round(_auroc(scores[m], (ft[m] == name).astype(int)), 4),
+                "detected": int((scores[ft == name] > thr).sum()),
+                "n": int((ft == name).sum()),
+            }
+
     return {
+        "by_fault": by_fault,
         "auroc": round(_auroc(scores, y), 4),
         "threshold": round(thr, 4),
         "threshold_mean3s": round(thr_mean, 4),
@@ -212,11 +236,16 @@ def evaluate(model_path: str, n_sigma: float = None) -> Optional[dict]:
 
 
 def summary_line(m: dict) -> str:
-    """로그 한 줄."""
+    """로그 한 줄. 종류별 숫자가 있으면 뒤에 붙인다."""
+    tail = ""
+    if m.get("by_fault"):
+        tail = "  [" + " ".join(
+            f"{k} {v['auroc']:.3f}({v['detected']}/{v['n']})"
+            for k, v in sorted(m["by_fault"].items())) + "]"
     return (f"AUROC {m['auroc']:.4f}  "
             f"탐지 {m['detected']}/{m['n_anomaly']}  "
             f"오경보 {m['false_alarms']}/{m['n_normal']}  "
             f"정상 {m['mean_normal']:.3f} vs 이상 {m['mean_anomaly']:.3f}  "
             f"thr {m['threshold']:.3f}"
             f"(평균3σ {m['threshold_mean3s']:.3f} -> "
-            f"{m['detected_mean3s']}/{m['false_alarms_mean3s']})")
+            f"{m['detected_mean3s']}/{m['false_alarms_mean3s']})" + tail)

@@ -47,18 +47,26 @@ def load_capture(d):
         for line in open(f, encoding="utf-8"):
             if not line.strip():
                 continue
-            con = (json.loads(line).get("con") or {})
+            obj = json.loads(line)
+            con = (obj.get("con") or {})
             sig = sch.window_from_con(con)
             if sig is None:
                 skipped += 1
                 continue
+            # CIN 의 lbl 에서 정답을 읽는다. amr_ingest._labels_of 와 같은 규칙.
+            #   lbl: ["cond:bearing", "run:...", "load:250", ...]
+            kv = {x.split(":", 1)[0]: x.split(":", 1)[1]
+                  for x in (obj.get("lbl") or []) if ":" in x}
             ts = [x for x in (con.get("t_sim") or []) if x is not None]
             rows.append(dict(
                 robot=str(con.get("robot") or "?"),
                 nav=str(con.get("nav") or ""),
                 seq=int(con.get("seq") or 0),
                 t=float(np.mean(ts)) if ts else float("nan"),
-                fault=con.get("fault"),      # 아이작심이 넣어 주면 이걸 쓴다
+                # 정답은 두 곳에서 올 수 있다. lbl 의 cond 가 우선이다.
+                cond=kv.get("cond"),
+                load_lbl=kv.get("load"),
+                fault=con.get("fault"),
                 sig=sig,
             ))
     return rows, skipped
@@ -74,6 +82,11 @@ def main() -> int:
                     help="조건 칸 하한. 이보다 적은 칸은 버린다")
     ap.add_argument("--max-cell", type=int, default=40,
                     help="조건 칸 상한. 넘으면 무작위로 줄인다")
+    ap.add_argument("--only", default="",
+                    help="이 접두사로 시작하는 로봇만 쓴다 (예: siteC). "
+                         "글로벌 모델 학습에 쓰이는 사업장을 검증셋에 "
+                         "넣으면 점수가 부풀려지므로 기본은 로컬 전용 "
+                         "사업장만 쓰는 것이다")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
 
@@ -90,8 +103,18 @@ def main() -> int:
     seq = np.array([r["seq"] for r in rows])
 
     # ── 라벨 ───────────────────────────────────────────────
+    # 우선순위: lbl 의 cond -> con 의 fault -> --anomaly
+    fault_name = np.array([r["cond"] or "" for r in rows])
+    has_cond = any(fault_name != "")
     has_field = any(r["fault"] is not None for r in rows)
-    if has_field:
+    if has_cond:
+        y = (fault_name != "normal").astype(np.int64)
+        # exclude 는 아이작심이 '쓰지 말라' 고 표시한 구간이다. 통째로 뺀다.
+        drop_ex = fault_name == "exclude"
+        print(f"  라벨: lbl 의 cond 사용. "
+              + ", ".join(f"{k} {v}" for k, v in
+                          collections.Counter(fault_name.tolist()).most_common()))
+    elif has_field:
         y = np.array([1 if r["fault"] else 0 for r in rows], dtype=np.int64)
         print(f"  라벨: CIN 의 fault 필드 사용 (이상 {int(y.sum())}창)")
     else:
@@ -109,9 +132,22 @@ def main() -> int:
             print(f"  라벨: {rb} {lo:.0f}~{hi if hi < 1e9 else float('inf'):.0f}초"
                   f" -> 이상 {int(m.sum())}창")
 
+    if not has_cond:
+        fault_name = np.where(y == 1, "anomaly", "normal")
+        drop_ex = np.zeros(len(rows), dtype=bool)
+
+    # ── 로봇 걸러내기 ──────────────────────────────────────
+    # 학습에 쓰는 사업장을 검증셋에 넣으면 '이미 본 데이터' 로 채점하게
+    # 되어 점수가 부풀려진다. mn3(사업장 C)는 로컬 전용이라 글로벌 모델에
+    # 가중치를 안 올리므로, 거기 데이터로 채점해야 누수가 없다.
+    inc = np.ones(len(rows), dtype=bool)
+    if a.only:
+        inc = np.array([r.startswith(a.only) for r in robot])
+        print(f"  로봇 필터 '{a.only}': {int(inc.sum())}/{len(rows)}창 남김")
+
     # ── 주행 중만. 정지 구간은 재구성이 쉬워 평가가 쉬워진다 ──
     mov = sch.moving_mask(X)
-    keep = mov
+    keep = mov & inc & ~drop_ex
     print(f"  주행 {int(mov.sum())} / 정지 {int((~mov).sum())} -> 주행만 쓴다")
 
     # ── 조건 칸 균형 ───────────────────────────────────────
@@ -151,6 +187,10 @@ def main() -> int:
         a.out,
         signals=X[sel], cond=cond[sel], labels=y[sel],
         robot=robot[sel], nav=nav[sel], seq=seq[sel],
+        # 이상 종류. 종류마다 난이도가 완전히 달라서(실측 AUROC
+        # floor 0.95 / wknob 0.69 / bearing 0.55) 하나로 합친 숫자만
+        # 보면 어느 쪽이 안 되는지 안 보인다.
+        fault_type=fault_name[sel],
         speed=np.array([sch.speed_of(x) for x in X[sel]], dtype=np.float32),
     )
 
@@ -166,6 +206,8 @@ def main() -> int:
         c = collections.Counter(arr.tolist())
         print(f"  {name}: " + " / ".join(
             f"{labels[k]} {v} ({v/sel.sum():.0%})" for k, v in sorted(c.items())))
+    ft = collections.Counter(fault_name[sel].tolist())
+    print(f"  이상 종류: " + " / ".join(f"{k} {v}" for k, v in ft.most_common()))
     cc = collections.Counter(cell[sel].tolist())
     print(f"  조건 칸 {len(cc)}/45, 10창 이상 {sum(1 for v in cc.values() if v>=10)}개")
 

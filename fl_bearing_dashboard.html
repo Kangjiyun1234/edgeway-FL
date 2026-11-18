@@ -338,6 +338,15 @@ if (!window.Chart) {
   .evallog-body .row:first-child { color: var(--text); }
   .evallog-body .row b { color: var(--text); font-weight: 600; }
   .evallog-body .empty { padding: 10px 16px; color: var(--text3); font-size: 11px; }
+  /* 이상 종류별 줄. 종류마다 난이도가 달라서 합친 AUROC 하나만 보면
+     어느 쪽이 안 되는지 안 보인다. 해당 라운드 줄 바로 아래에 붙인다. */
+  .evallog-body .subrow {
+    display: flex; flex-wrap: wrap; gap: 4px 10px;
+    padding: 0 16px 5px 50px; font-size: 11px; color: var(--text3);
+    font-variant-numeric: tabular-nums;
+  }
+  .evallog-body .subrow i { font-style: normal; color: var(--text2); }
+  .evallog-body .subrow b { color: var(--text2); font-weight: 600; }
   .sep { flex: 1; }
   .btn {
     font-size: 12px; padding: 6px 14px;
@@ -1000,6 +1009,12 @@ function renderGlobalEval(ev) {
         <div class="summary-metric-v">${fmt(mNo, 2)} &rarr; ${fmt(mAn, 2)}<span style="font-size:11px;font-weight:500;color:var(--text3);"> &nbsp;&Delta;${fmt(sep, 2)}</span></div>
       </div>
     </div>
+    ${faultChips(ev.by_fault)
+        ? `<div class="summary-note" style="padding-bottom:0;">
+             종류별 AUROC (탐지/창) &nbsp; ${faultChips(ev.by_fault)
+                 .replace(/<span>/g, '<span style="margin-right:14px;">')}
+           </div>`
+        : ''}
     <div class="summary-note">
       Threshold ${fmt(thr, 4)} &middot; median + 3 &middot; MAD &middot; 1.4826.
       Labelled set, so these are the only AUROC / false-alarm figures on this page.
@@ -1179,6 +1194,17 @@ function connect() {
 // ───────────────────────────────────────────────────
 const evalSeen = new Set();
 
+// by_fault = { floor: {auroc, detected, n}, ... }. 없으면 빈 문자열.
+function faultChips(byFault) {
+  if (!byFault || typeof byFault !== 'object') return '';
+  return Object.keys(byFault).sort().map(k => {
+    const v = byFault[k] || {};
+    const a = Number(v.auroc);
+    return `<span><i>${k}</i> <b>${isFinite(a) ? a.toFixed(3) : '—'}</b>` +
+           ` ${v.detected}/${v.n}</span>`;
+  }).join('');
+}
+
 function handleEval(e) {
   if (e.round == null || evalSeen.has(e.round)) return;
   evalSeen.add(e.round);
@@ -1198,6 +1224,15 @@ function handleEval(e) {
     `vs 이상 ${Number(e.mean_anomaly).toFixed(3)}</span>`;
   // 최신이 위로 오게 맨 앞에 꽂는다.
   body.insertBefore(row, body.firstChild);
+
+  // 종류별 숫자가 오면 그 라운드 줄 바로 아래에 한 줄 더 붙인다.
+  const chips = faultChips(e.by_fault);
+  if (chips) {
+    const sub = document.createElement('div');
+    sub.className = 'subrow';
+    sub.innerHTML = chips;
+    body.insertBefore(sub, row.nextSibling);
+  }
 
   document.getElementById('evallog-meta').textContent =
     `정상 ${e.n_normal} / 이상 ${e.n_anomaly} · 최신 R${e.round} AUROC ${Number(e.auroc).toFixed(4)}`;
