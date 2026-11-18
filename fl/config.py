@@ -411,6 +411,43 @@ VERDICT_ENABLED = os.getenv("FL_VERDICT", "1") not in ("0", "false", "False")
 VERDICT_START_ROUND = int(os.getenv("FL_VERDICT_START_ROUND", "3"))
 
 
+# 판정을 구독해 갈 앱들. 기본은 사업장별 판정 앱(CJUDGE-AE-i).
+#
+# 로봇 AE 는 Isaac 이 만들고 AE-ID 를 CSE 가 배정하므로 따로 읽어오지만,
+# 이쪽은 우리가 정하는 이름이라 규칙으로 만든다.
+JUDGE_AE_PREFIX = os.getenv("FL_JUDGE_AE_PREFIX", "JUDGE-AE")
+
+# 구독자에게 CREATE 도 줄지.
+#
+# <subscription> 을 부모 밑에 만들 때 CREATE 가 필요한지 RETRIEVE 로 되는지는
+# CSE 구현이 정한다. ACME 문서에서 확인하지 못했다. 필요한데 안 주면 구독이
+# 403 으로 막히고, 안 필요한데 주면 그 앱이 판정을 위조할 수 있다.
+# 판정 앱은 우리 쪽 구성요소라 기본을 1 로 두되, 확인되면 0 으로 내리면 된다.
+# fl/demo_verdict_sub.py 가 이걸 실제로 재 준다.
+VERDICT_SUB_CREATE = os.getenv("FL_VERDICT_SUB_CREATE", "1") not in (
+    "0", "false", "False")
+
+
+def judge_ae_name(node: str) -> str:
+    """mn3 -> JUDGE-AE-3"""
+    return f"{JUDGE_AE_PREFIX}-{node[2:]}"
+
+
+def judge_ae_id(node: str) -> str:
+    """mn3 -> CJUDGE-AE-3"""
+    return f"C{judge_ae_name(node)}"
+
+
+def verdict_subscribers(node: str) -> list:
+    """
+    이 사업장 판정을 구독할 수 있는 AE-ID 목록.
+    FL_VERDICT_SUBSCRIBERS 로 쉼표 구분해 더 넣을 수 있다.
+    """
+    extra = [x.strip() for x in
+             os.getenv("FL_VERDICT_SUBSCRIBERS", "").split(",") if x.strip()]
+    return list(dict.fromkeys([judge_ae_id(node)] + extra))
+
+
 def analysis_ae_name(node: str) -> str:
     """mn1 -> ANALYSIS-AE-1"""
     return f"{ANALYSIS_AE_PREFIX}-{node[2:]}"

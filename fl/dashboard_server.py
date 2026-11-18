@@ -194,6 +194,13 @@ _shared: dict = {
 
     "anomaly_start_round": ANOMALY_START_ROUND,
 
+    # 이 라운드 전에는 화면에도 이상 표시를 안 한다.
+    # MN 쪽 판정(CIN)을 막는 기준과 같은 값을 쓴다. 둘이 어긋나면
+    # CSE 에는 아무것도 없는데 화면만 빨개지는 일이 생긴다.
+    "verdict_start_round": int(
+        getattr(config, "VERDICT_START_ROUND", 1)
+    ),
+
     # 라운드별 고정 검증셋 평가 결과. 나중에 접속한 클라이언트에도
     # 지난 라운드를 보내기 위해 쌓아 둔다.
     "evals": [],
@@ -317,6 +324,7 @@ def health():
             "summary_sent": _shared["summary_sent"],
 
             "anomaly_node": ANOMALY_NODE,
+            "verdict_start_round": _shared["verdict_start_round"],
             "anomaly_start_round": (
                 ANOMALY_START_ROUND
             ),

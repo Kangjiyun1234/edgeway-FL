@@ -102,6 +102,21 @@
   .node-badge.ok       { background: var(--ok-bg); color: var(--ok-text); }
   .node-badge.training { background: var(--tr-bg); color: var(--tr-text); }
   .node-badge.fault    { background: var(--fd-bg); color: var(--fd-text); }
+  /* 이상 감지 표시. 배너 대신 이름 옆에서 조용히 깜박인다. */
+  .fault-dot {
+    display: none; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--fault-line); margin-left: 7px; flex: none;
+    box-shadow: 0 0 0 0 rgba(226, 75, 74, 0.6);
+  }
+  .fault-dot.show { display: inline-block; animation: faultPulse 1.1s ease-out infinite; }
+  @keyframes faultPulse {
+    0%   { opacity: 1;   box-shadow: 0 0 0 0   rgba(226, 75, 74, 0.6); }
+    70%  { opacity: 0.35; box-shadow: 0 0 0 6px rgba(226, 75, 74, 0); }
+    100% { opacity: 1;   box-shadow: 0 0 0 0   rgba(226, 75, 74, 0); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .fault-dot.show { animation: none; opacity: 1; }
+  }
   .node-role { font-size: 11px; color: var(--text2); margin-bottom: 4px; }
   .node-stat { font-size: 11px; color: var(--text3); }
 
@@ -401,6 +416,7 @@
       <div class="node ok" id="nd-mn3">
         <div class="node-header">
           <span class="node-name">mn3</span>
+          <span class="fault-dot" id="fault-dot-mn3" title="이상 감지"></span>
           <span class="node-badge ok" id="nb-mn3">Monitoring</span>
         </div>
         <div class="node-role">사업장 C · 로봇 2대 · 로컬 전용(FedAvg 미기여)</div>
@@ -689,6 +705,7 @@ let thresholds  = { mn1: null, mn2: null, mn3: null };
 let faulted     = false;
 let faultRound  = null;
 let mn3Consec   = 0;
+let verdictStartRound = 1;   // 서버가 init 에서 알려준다
 const K_FAULT   = 3;
 let lossHistory = {};
 let scoreIdx    = 0;   // 스트리밍 샘플 카운터
@@ -699,6 +716,9 @@ let onsetIdx    = null; // mn3_label=1이 처음 나온 샘플 인덱스
 // ═══════════════════════════════════════════════════
 function applyState(evt) {
   // init / round 이벤트 공통 처리
+  if (evt.verdict_start_round !== undefined) {
+    verdictStartRound = toNumber(evt.verdict_start_round, 1);
+  }
   const round     = toNumber(evt.round, 0);
   const maxRounds = Math.max(1, Math.floor(toNumber(evt.max_rounds, config_maxRounds || 10)));
   const state     = evt.fl_state  || 'FL_READY';
@@ -793,7 +813,12 @@ function handleScore(evt) {
   }
 
   // mn3 fault 감지 (K회 연속 threshold 초과)
-  if (!faulted && evt.mn3 !== undefined) {
+  //
+  // 판정 시작 라운드 전에는 아무 표시도 하지 않는다. 그때의 임계값은
+  // 거의 학습되지 않은 모델로 잡은 것이라 화면에 띄울 근거가 없다.
+  // MN 이 CSE 에 판정을 안 올리는 기준과 같은 값을 쓴다.
+  const curRound = toNumber(evt.round, 0);
+  if (!faulted && evt.mn3 !== undefined && curRound >= verdictStartRound) {
     const score = toNumber(evt.mn3, null);
     const thr = firstFinite(evt.mn3_thr, thresholds.mn3, 1.0);
     if (score !== null && score > thr) {
@@ -848,12 +873,10 @@ function triggerFault(detectSampleIdx) {
   document.getElementById('alert-detail').textContent = detail;
   document.getElementById('alert-strip').classList.add('show');
 
-  // 상단 배너
-  document.getElementById('banner-detail').textContent =
-    delay !== null
-      ? `Detection delay: ${delay} samples after fault onset  ·  Threshold: ${thrVal}  ·  AUROC: ${auroc}`
-      : `Threshold: ${thrVal}  ·  AUROC: ${auroc}`;
-  document.getElementById('fault-banner').classList.add('show');
+  // 화면을 덮는 배너 대신 mn3 이름 옆 점만 깜박인다.
+  // 배너는 띄우지 않고 상세는 카드 안 alert-strip 에 남긴다.
+  const dot = document.getElementById('fault-dot-mn3');
+  if (dot) { dot.classList.add('show'); dot.title = '이상 감지 — ' + detail; }
 
   // 노드 + 차트 카드
   setNode('mn3', 'fault', 'Fault!');
@@ -863,8 +886,6 @@ function triggerFault(detectSampleIdx) {
   document.getElementById('pill-label').textContent  = 'Fault detected';
 
   if (faultRound) updateDots(faultRound, builtDots, faultRound);
-
-  playAlertBeep();
 }
 
 document.getElementById('banner-close').addEventListener('click', () => {

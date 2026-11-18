@@ -372,10 +372,13 @@ def setup_analysis_ae(node: str, cse: str) -> None:
 
     권한
       분석 앱   전권 (자기 리소스)
-      로봇 AE   RETRIEVE + NOTIFY + DISCOVERY  -> 구독해서 판정을 받는다
-      학습 앱   RETRIEVE + DISCOVERY           -> 대시보드가 읽는다
+      판정 앱   RETRIEVE + NOTIFY + DISCOVERY (+ CREATE)  -> 구독해서 받는다
+      로봇 AE   RETRIEVE + NOTIFY + DISCOVERY             -> 구독해서 받는다
+      학습 앱   RETRIEVE + DISCOVERY                      -> 대시보드가 읽는다
 
     로봇에 CREATE 를 주지 않는 것이 요점이다. 판정은 분석 앱만 쓴다.
+    판정 앱(CJUDGE-AE-i)에만 CREATE 를 같이 주는데, <subscription> 생성에
+    CREATE 가 필요한 CSE 가 있어서다. config.VERDICT_SUB_CREATE 참고.
     """
     ae_name = config.analysis_ae_name(node)
     ae_id = config.analysis_ae_id(node)
@@ -397,6 +400,16 @@ def setup_analysis_ae(node: str, cse: str) -> None:
         {"acor": [origin_mn(node)],
          "acop": ACOP_RETRIEVE | ACOP_DISCOVERY},
     ]
+
+    # 판정 앱. 구독을 걸어 알림으로 받아 간다.
+    subs = config.verdict_subscribers(node)
+    if subs:
+        acop = ACOP_RETRIEVE | ACOP_NOTIFY | ACOP_DISCOVERY
+        if getattr(config, "VERDICT_SUB_CREATE", True):
+            acop |= ACOP_CREATE
+        pv.append({"acor": subs, "acop": acop})
+        print(f"  판정 구독자: {', '.join(subs)}  (acop={acop})")
+
     if robots:
         pv.append({"acor": robots,
                    "acop": ACOP_RETRIEVE | ACOP_NOTIFY | ACOP_DISCOVERY})
