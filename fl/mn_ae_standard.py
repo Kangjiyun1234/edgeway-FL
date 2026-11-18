@@ -81,7 +81,11 @@ class MNAETrainer:
         #     <MN-CSE>/siteA_AMR_1/telemetry/<cin>
         # 사업장 하나가 FL 노드 하나이므로 로봇 대수만큼의 컨테이너를
         # 여기서 모아 "한 공장의 데이터"로 합친다.
+        # Isaac Sim 이 라벨을 달아 올리므로 디스커버리로 찾는다. 기동
+        # 시점에는 아직 아무것도 없을 수 있어서, 여기서는 config 로
+        # 한 번 채워 두고 _refresh_telemetry() 가 실제 목록으로 바꾼다.
         self.robot_names = config.robot_names(self.node_name)
+        self.telemetry_discovered = False
         # 로봇별로 어디까지 읽었는지. 라운드마다 그 뒤만 읽는다.
         # 비워 두면 첫 라운드는 최근 분량을 받는다.
         self.telemetry_cursor = {}
@@ -98,6 +102,7 @@ class MNAETrainer:
             f"{mn_cse}/{rb}/{config.ROBOT_TELEMETRY_CNT}"
             for rb in self.robot_names
         ]
+        self._refresh_telemetry(quiet=True)
         self.local_model_cnt   = "cnt-local-model"
         self.local_model_path  = f"{mn_cse}/{self.ae_name}/{self.local_model_cnt}"
 
@@ -591,6 +596,76 @@ class MNAETrainer:
     # ---------------------------
     # Sensor data load (AE 버전)
     # ---------------------------
+    def _refresh_telemetry(self, quiet: bool = False) -> bool:
+        """
+        이 사업장의 telemetry 컨테이너를 라벨 디스커버리로 다시 찾는다.
+
+        왜 경로를 박지 않나
+          <MN-CSE>/{site}_AMR_{i}/telemetry 를 조립하면 로봇 대수와 이름
+          규칙이 코드에 박힌다. 로봇이 늘거나 이름이 바뀌면 코드를 고쳐야
+          하고, 늦게 올라온 로봇은 영영 안 보인다. Isaac Sim 이 컨테이너에
+          라벨을 달아 주므로 (?fu=1&ty=3&lbl=site:siteC&lbl=type:telemetry)
+          그때그때 찾는다.
+
+        찾은 게 없으면 기존 목록을 그대로 둔다. 디스커버리가 잠깐 실패했을
+        때 멀쩡한 경로까지 날리면 그 라운드를 통째로 잃는다.
+        반환: 목록이 바뀌었으면 True.
+        """
+        if not getattr(config, "USE_DISCOVERY", True):
+            return False
+
+        labels = config.telemetry_labels(self.node_name)
+        try:
+            uril = om2m.discover_by_labels(
+                self.mn_cse_name, labels, ty=3, lim=200)
+        except Exception as e:
+            if not quiet:
+                print(f"    ⚠ telemetry 디스커버리 실패(기존 경로 유지): {e}")
+            return False
+
+        found = {}
+        for raw in uril:
+            parts = [x for x in om2m.strip_prefix(raw).split("/") if x]
+            if len(parts) < 2:
+                continue
+            # CSE 마다 돌려주는 형태가 다르다. '/<cse-id>/<cse-rn>/...' 처럼
+            # 앞에 뭐가 더 붙어 올 수 있어서 우리 CSE 이름부터 잘라 쓴다.
+            # 못 찾으면 로봇 AE 이름으로 직접 조립한다.
+            robot = parts[-2]
+            if self.mn_cse_name in parts:
+                i = parts.index(self.mn_cse_name)
+                path = "/".join(parts[i:])
+            else:
+                path = f"{self.mn_cse_name}/{robot}/{parts[-1]}"
+            found[robot] = path
+
+        if not found:
+            if not quiet and not self.telemetry_discovered:
+                print(f"    ⓘ 라벨 {labels} 로 찾은 telemetry 가 없다. "
+                      f"경로 조립으로 진행한다")
+            return False
+
+        robots = sorted(found)
+        paths = [found[r] for r in robots]
+
+        # 경로가 실제로 열리는지 하나만 확인한다. 디스커버리 응답 형태를
+        # 잘못 해석했는데 그대로 바꿔치우면 그 라운드를 통째로 잃는다.
+        if not om2m.resource_exists(paths[0]):
+            if not quiet:
+                print(f"    ⚠ 디스커버리 경로가 안 열린다 ({paths[0]}) "
+                      f"-> 기존 경로 유지")
+            return False
+        changed = (robots != self.robot_names or paths != self.telemetry_paths)
+        if changed and not quiet:
+            added = [r for r in robots if r not in self.robot_names]
+            print(f"    ✓ 디스커버리: {len(robots)}대 "
+                  f"({', '.join(robots)})"
+                  + (f"  새로 발견 {', '.join(added)}" if added else ""))
+        self.robot_names = robots
+        self.telemetry_paths = paths
+        self.telemetry_discovered = True
+        return changed
+
     def _wait_for_robots(self) -> bool:
         """
         Isaac Sim이 이 사업장의 로봇 AE와 telemetry를 올릴 때까지 기다린다.
@@ -615,6 +690,8 @@ class MNAETrainer:
         next_log = 0.0
 
         while True:
+            # 늦게 올라온 로봇도 다음 조회에서 잡히도록 매번 다시 찾는다.
+            self._refresh_telemetry()
             ready = [
                 rb for rb, path in zip(self.robot_names, self.telemetry_paths)
                 if om2m.resource_exists(path)
@@ -843,6 +920,11 @@ class MNAETrainer:
 
         if not getattr(config, "FL_SENSOR_FROM_CSE", True):
             return self._load_sensor_data_from_pkl(round_num)
+
+        # 라운드마다 다시 찾는다. 중간에 올라온 로봇이 그 라운드부터
+        # 들어오고, 빠진 로봇은 목록에서 사라진다.
+        if self._refresh_telemetry():
+            self._subscribe_to_telemetry()
 
         # 라운드마다 사업장당 이만큼 모일 때까지 기다린다.
         # 상한(site_cap)과 같은 값이어야 라운드마다 정확히 같은 양이 된다.

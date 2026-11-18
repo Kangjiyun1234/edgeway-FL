@@ -40,6 +40,16 @@ COND_NORM = os.getenv("FL_COND_NORM", "1") not in ("0", "false", "False")
 # 세 고장 모두 가속도계의 1 샘플 떨림으로 나타나는데 원신호 오차는 저주파
 # 궤적 복원 오차에 덮인다. 실측은 model_cvae.channel_diff_error 주석 참조.
 SCORE_MODE = os.getenv("FL_SCORE_MODE", "diff").strip().lower()
+
+# 조건 칸 기준 z 화. edge_node 는 단독 실험에서도 돌아야 해서 없으면
+# recon 으로 물러선다(z 화 없이는 diff 점수가 의미가 없다).
+try:
+    from amr_schema import robust_ref as _robust_ref, apply_ref as _apply_ref
+except Exception:                                   # pragma: no cover
+    _robust_ref = _apply_ref = None
+    if SCORE_MODE == "diff":
+        print("  ⚠ amr_schema 를 못 들여왔다 -> FL_SCORE_MODE=recon 으로 진행")
+        SCORE_MODE = "recon"
 from config import TrainConfig, AEConfig
 from model_cvae import CVAE1D
 
@@ -139,6 +149,7 @@ class AEEdgeNode:
         # 회전 구간이나 떨림이 원래 큰 채널이 점수를 지배한다.
         self.diff_ref: Optional[dict] = None
         self.diff_ref_global: Optional[tuple] = None
+        self.diff_alive: Optional[np.ndarray] = None
         # 정상 데이터로 잡은 임계값
         self.threshold: Optional[float] = None
 
@@ -359,22 +370,15 @@ class AEEdgeNode:
             D = torch.cat(derrs).numpy()              # (N, C)
             cond_np = (self.train_ds.tensors[1][:len(D)].cpu().numpy()
                        if self.cond_dim else None)
-            gm = np.median(D, axis=0)
-            gd = np.median(np.abs(D - gm), axis=0) * 1.4826 + 1e-9
-            self.diff_ref_global = (gm, gd)
-            self.diff_ref = {}
-            if cond_np is not None:
-                keys = self.cell_key(cond_np)
-                for k in np.unique(keys):
-                    m = keys == k
-                    if m.sum() < 8:
-                        continue
-                    md = np.median(D[m], axis=0)
-                    self.diff_ref[int(k)] = (
-                        md, np.median(np.abs(D[m] - md), axis=0) * 1.4826 + 1e-9)
+            keys = (self.cell_key(cond_np) if cond_np is not None
+                    else np.zeros(len(D), dtype=np.int64))
+            (self.diff_ref, self.diff_ref_global,
+             self.diff_alive) = _robust_ref(D, keys)
             scores = torch.from_numpy(self._diff_scores(D, cond_np))
+            dead = int((~self.diff_alive).sum())
             print(f"    ◦ 점수 방식 diff (차분 오차 채널 z 최대) · "
-                  f"조건칸 기준 {len(self.diff_ref)}개")
+                  f"조건칸 기준 {len(self.diff_ref)}개"
+                  + (f" · 상수 채널 {dead}개 제외" if dead else ""))
         else:
             scores = self._aggregate(E)
 
@@ -456,13 +460,10 @@ class AEEdgeNode:
         """채널별 차분 오차 (N, C) -> 점수 (N,). 학습 기준으로 z 화 후 최대."""
         if self.diff_ref_global is None:
             return E.max(axis=1)
-        gm, gd = self.diff_ref_global
         keys = (self.cell_key(cond) if cond is not None
                 else np.zeros(len(E), dtype=np.int64))
-        Z = np.empty_like(E)
-        for i, k in enumerate(keys):
-            md, mad = (self.diff_ref or {}).get(int(k), (gm, gd))
-            Z[i] = (E[i] - md) / mad
+        Z = _apply_ref(E, keys, self.diff_ref or {},
+                       self.diff_ref_global, self.diff_alive)
         return Z.max(axis=1)
 
     def _apply_cond_norm(self, scores: np.ndarray,

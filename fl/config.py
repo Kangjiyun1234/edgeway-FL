@@ -104,12 +104,47 @@ ROBOT_STATUS_CNT = os.getenv("FL_ROBOT_STATUS_CNT", "status")
 
 
 def robot_names(node: str):
-    """한 사업장의 로봇 AE 이름 목록. siteA_AMR_1 … siteA_AMR_4"""
+    """한 사업장의 로봇 AE 이름 목록. siteA_AMR_1 … siteA_AMR_4
+
+    디스커버리가 안 될 때의 되돌아갈 자리다. 평소에는
+    telemetry_labels() 로 찾은 것을 쓴다.
+    """
     site = SITE_OF_NODE.get(node, node)
     return [
         f"{site}_AMR_{i}"
         for i in range(1, ROBOTS_PER_NODE.get(node, 0) + 1)
     ]
+
+
+# ── 리소스 라벨 ──────────────────────────────────────────
+#
+# 경로를 코드에 박아 두면 로봇이 늘거나 이름 규칙이 바뀔 때마다 코드를
+# 고쳐야 한다. 라벨을 달아 두고 디스커버리(?fu=1&lbl=...)로 찾으면
+# Isaac Sim 이 올린 그대로를 그때그때 읽는다.
+#
+# Isaac Sim 쪽이 telemetry 컨테이너에 다는 라벨 (합의한 형태):
+#   ["site:siteC", "robot:AMR_2", "ae:siteC_AMR_2",
+#    "type:telemetry", "siteC:telemetry"]
+# 우리는 이 중 site 와 type 두 개로 찾는다. 나머지는 사람이 읽기 위한
+# 것이거나 더 좁히고 싶을 때 쓴다.
+LABEL_TYPE_TELEMETRY = os.getenv("FL_LBL_TELEMETRY", "type:telemetry")
+# 디스커버리를 끄고 예전처럼 경로를 조립하고 싶을 때 0 으로 둔다.
+USE_DISCOVERY = os.getenv("FL_USE_DISCOVERY", "1") not in ("0", "false", "False")
+
+
+def site_label(node: str) -> str:
+    """'site:siteC'"""
+    return f"site:{SITE_OF_NODE.get(node, node)}"
+
+
+def telemetry_labels(node: str):
+    """그 사업장의 telemetry 컨테이너를 찾는 라벨 묶음 (AND 조건)."""
+    return [site_label(node), LABEL_TYPE_TELEMETRY]
+
+
+def resource_labels(node: str, kind: str):
+    """우리가 만드는 리소스에 달 라벨. kind 는 'local-model' 같은 것."""
+    return [site_label(node), f"type:{kind}", f"node:{node}"]
 
 CLASS_NAMES = ["정상", "이상"]
 NUM_CLASSES = 2

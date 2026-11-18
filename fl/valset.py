@@ -46,6 +46,7 @@ from typing import Optional
 import numpy as np
 import torch
 
+import amr_schema as _sch
 import config
 from model_cvae import CVAE1D
 
@@ -142,22 +143,14 @@ def _cell_key(C: np.ndarray) -> np.ndarray:
 
 
 def _cell_zmax(D: np.ndarray, C: np.ndarray, min_cell: int = 8) -> np.ndarray:
-    """채널별 값 (N, C) -> 조건칸별 z 화 -> 채널 최대 (N,)."""
-    gm = np.median(D, axis=0)
-    gd = np.median(np.abs(D - gm), axis=0) * 1.4826 + 1e-9
+    """채널별 값 (N, C) -> 조건칸별 z 화 -> 채널 최대 (N,).
+
+    기준 계산은 amr_schema 와 공유한다. 학습 쪽과 다른 자를 쓰면
+    라운드별 숫자와 운영 판정이 어긋난다.
+    """
     keys = _cell_key(C)
-    ref = {}
-    for k in np.unique(keys):
-        m = keys == k
-        if m.sum() < min_cell:
-            continue
-        md = np.median(D[m], axis=0)
-        ref[int(k)] = (md, np.median(np.abs(D[m] - md), axis=0) * 1.4826 + 1e-9)
-    Z = np.empty_like(D)
-    for i, k in enumerate(keys):
-        md, mad = ref.get(int(k), (gm, gd))
-        Z[i] = (D[i] - md) / mad
-    return Z.max(axis=1)
+    ref, glob, alive = _sch.robust_ref(D, keys, min_cell=min_cell)
+    return _sch.apply_ref(D, keys, ref, glob, alive).max(axis=1)
 
 
 def _auroc(scores: np.ndarray, labels: np.ndarray) -> float:

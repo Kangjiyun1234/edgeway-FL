@@ -359,17 +359,22 @@ def create_container(
     mni: int = 1000,
     mbs: int = 10_000_000,
     acpi: Optional[List[str]] = None,
+    labels: Optional[List[str]] = None,
 ) -> Optional[Dict]:
     """
     Container 생성.
     mbs: max byte size (기본 10MB — 가중치 CIN이 들어갈 여유)
     acpi: ACP ri 목록. 지정 시 생성과 동시에 acpi 연결 시도,
           실패하면 생성 후 UPDATE로 재시도.
+    labels: 리소스 라벨(lbl). 경로를 박아 두는 대신 디스커버리로 찾게
+          해 주는 열쇠다. 예: ["site:siteC", "type:local-model"].
     """
     url = _url(parent_path)
     cnt_obj: Dict[str, Any] = {"rn": container_name, "mni": mni, "mbs": mbs}
     if acpi:
         cnt_obj["acpi"] = acpi
+    if labels:
+        cnt_obj["lbl"] = list(labels)
 
     payload = {"m2m:cnt": cnt_obj}
     try:
@@ -537,6 +542,56 @@ def discover_uril_by_label(container_path: str, label: str, lim: int = 20) -> Li
                 uril = data.get("m2m:uril", [])
                 if isinstance(uril, list) and uril:
                     return uril
+        except Exception:
+            continue
+    return []
+
+
+def discover_by_labels(
+    parent_path: str,
+    labels: List[str],
+    ty: Optional[int] = None,
+    lim: int = 200,
+    match_all: bool = True,
+) -> List[str]:
+    """
+    라벨로 리소스를 찾는다 (?fu=1&lbl=...). 경로 문자열 목록을 돌려준다.
+
+    왜 쓰나
+      리소스 경로를 코드에 박아 두면, 로봇이 늘거나 이름 규칙이 바뀌면
+      코드를 고쳐야 한다. 라벨로 찾으면 Isaac Sim 이 올린 그대로를
+      그때그때 읽는다. 늦게 올라온 로봇도 다음 조회에서 잡힌다.
+
+    labels    : ["site:siteC", "type:telemetry"] 처럼 여러 개
+    ty        : 2 AE / 3 container / 4 contentInstance. None 이면 전부
+    match_all : True 면 모든 라벨을 만족해야 한다(fo=1 AND).
+                False 면 하나만 맞아도 된다(fo=2 OR).
+
+    CSE 마다 fo 와 라벨 인코딩 처리가 조금씩 달라서 몇 가지 형태를
+    차례로 시도하고, 처음 성공한 것을 쓴다.
+    """
+    if not labels:
+        return []
+    base = _url(parent_path)
+    ty_q = f"&ty={ty}" if ty is not None else ""
+    raw = "".join(f"&lbl={l}" for l in labels)
+    enc = "".join(f"&lbl={requests.utils.quote(l, safe='')}" for l in labels)
+    fo = "&fo=1" if match_all else "&fo=2"
+
+    candidates = [
+        f"{base}?fu=1&lim={lim}{ty_q}{fo}{raw}",
+        f"{base}?fu=1&lim={lim}{ty_q}{fo}{enc}",
+        f"{base}?fu=1&lim={lim}{ty_q}{raw}",
+        f"{base}?fu=1&lim={lim}{ty_q}{enc}",
+    ]
+    for url in candidates:
+        try:
+            r = _request_with_retry("get", url, headers=_headers(), timeout=15)
+            if r.status_code != 200:
+                continue
+            uril = r.json().get("m2m:uril", [])
+            if isinstance(uril, list) and uril:
+                return uril
         except Exception:
             continue
     return []

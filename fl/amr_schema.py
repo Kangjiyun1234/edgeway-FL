@@ -247,3 +247,66 @@ def moving_mask(X: np.ndarray) -> np.ndarray:
     if len(X) == 0:
         return np.zeros(0, dtype=bool)
     return np.array([speed_of(w) >= MIN_SPEED for w in X])
+
+
+# ════════════════════════════════════════════════════════
+# 채널별 값을 조건 칸 기준으로 z 화하는 공용 루틴
+#
+# 학습 쪽(edge_node)과 평가 쪽(valset)이 같은 자를 써야 라운드별
+# 숫자와 운영 판정이 어긋나지 않는다. 그래서 여기 한 곳에 둔다.
+#
+# [MAD 하한이 왜 필요한가]
+# 어떤 채널은 캡처 내내 상수다(예: 적재 안 하는 주행의 lift.pos).
+# 그 채널의 MAD 는 0 이고, 0 에 가까운 값으로 나누면 z 가 10^7 까지
+# 튄다. 실제로 그래서 모든 사업장이 똑같이 "이상" 으로 보였다.
+# 두 가지로 막는다.
+#   - 전체가 상수인 채널은 아예 뺀다(z=0). 정보가 없는 채널이다.
+#   - 칸의 MAD 는 그 채널 전체 MAD 의 일정 비율 아래로 못 내려간다.
+#     칸 표본이 적어 우연히 몰려 있을 때 터지는 것을 막는다.
+# ════════════════════════════════════════════════════════
+
+MAD_K = 1.4826          # 정규분포에서 MAD 를 표준편차와 같은 자로
+MAD_FLOOR_REL = 0.1     # 칸 MAD 하한 = 채널 전체 MAD 의 10%
+
+
+def _mad(A, axis=0):
+    med = np.median(A, axis=axis)
+    return med, np.median(np.abs(A - med), axis=axis) * MAD_K
+
+
+def robust_ref(D, keys, min_cell: int = 8):
+    """채널별 값 (N, C) -> (칸별 기준, 전체 기준, 살아있는 채널 마스크).
+
+    D    : (N, C) 창마다 채널마다 하나씩인 값
+    keys : (N,)   조건 칸 번호
+    반환 : ({칸: (중앙값, MAD)}, (중앙값, MAD), 유효채널 bool (C,))
+    """
+    D = np.asarray(D, dtype=np.float64)
+    g_med, g_mad = _mad(D)
+    alive = g_mad > 0                      # 전체가 상수인 채널은 버린다
+    floor = np.where(alive, g_mad * MAD_FLOOR_REL, np.inf)
+    g_mad = np.maximum(g_mad, floor)
+
+    ref = {}
+    keys = np.asarray(keys)
+    for k in np.unique(keys):
+        m = keys == k
+        if m.sum() < min_cell:
+            continue
+        md, mad = _mad(D[m])
+        ref[int(k)] = (md, np.maximum(mad, floor))
+    return ref, (g_med, g_mad), alive
+
+
+def apply_ref(D, keys, ref, glob, alive):
+    """robust_ref 의 기준으로 z 화 (N, C). 죽은 채널은 0 으로 둔다."""
+    D = np.asarray(D, dtype=np.float64)
+    g_med, g_mad = glob
+    keys = (np.asarray(keys) if keys is not None
+            else np.zeros(len(D), dtype=np.int64))
+    Z = np.empty_like(D)
+    for i, k in enumerate(keys):
+        md, mad = ref.get(int(k), (g_med, g_mad))
+        Z[i] = (D[i] - md) / mad
+    Z[:, ~alive] = 0.0
+    return Z.astype(np.float32)

@@ -192,6 +192,26 @@ def verify_robot_aes(node: str) -> Dict[str, bool]:
     site = config.SITE_OF_NODE.get(node, node)
     want = config.ROBOTS_PER_NODE.get(node, 0)
 
+    # 먼저 라벨로 telemetry 컨테이너를 찾는다. 이름 규칙에 기대지 않는다.
+    labels = config.telemetry_labels(node)
+    tel_paths = {}
+    for raw in om2m.discover_by_labels(cse, labels, ty=3, lim=200):
+        parts = [x for x in om2m.strip_prefix(raw).split("/") if x]
+        if len(parts) >= 2:
+            tel_paths[parts[-2]] = om2m.strip_prefix(raw)
+
+    if tel_paths:
+        print(f"  라벨 디스커버리 {labels}: {len(tel_paths)}/{want}대")
+        found: Dict[str, bool] = {}
+        for rb in sorted(tel_paths):
+            found[rb] = True
+            print(f"    ✓ {tel_paths[rb]}")
+        if len(found) < want:
+            print(f"    ⚠ {want}대 중 {len(found)}대만 라벨이 붙어 있다.")
+        return found
+
+    # 라벨이 없으면 예전처럼 이름으로 찾는다(Isaac 이 아직 라벨을 안 다는 경우).
+    print(f"  ⓘ 라벨 {labels} 로 못 찾았다. 이름 규칙으로 되돌아간다")
     uril = om2m.discover(cse, ty=2, lim=200)
     robots = sorted({
         p.rstrip("/").split("/")[-1]
@@ -314,10 +334,14 @@ def setup_in_resources(nodes: List[str], acps: Dict[str, str]) -> None:
 
     ae = f"{cse}/{config.IN_AE_NAME}"
 
-    def cnt(parent: str, name: str, mni: int, acp_key: Optional[str]) -> None:
+    # 라벨을 달아 둔다. 경로를 박는 대신 ?fu=1&lbl=... 로 찾게 하는
+    # 열쇠다. type: 은 무엇인지, scope:in 은 중앙 리소스라는 뜻이다.
+    def cnt(parent: str, name: str, mni: int, acp_key: Optional[str],
+            kind: Optional[str] = None) -> None:
         om2m.create_container(
             parent, name, mni=mni,
             acpi=[acps[acp_key]] if acp_key and acps.get(acp_key) else None,
+            labels=["scope:in", f"type:{kind or name.removeprefix('cnt-')}"],
         )
         print(f"  ✓ {name}  (mni={mni})")
         time.sleep(SETTLE)
@@ -333,6 +357,8 @@ def setup_in_resources(nodes: List[str], acps: Dict[str, str]) -> None:
             updates, f"cnt-{node}", mni=50,
             acpi=([acps[f"dropbox-{node}"]]
                   if acps.get(f"dropbox-{node}") else None),
+            labels=["scope:in", "type:local-updates",
+                    f"node:{node}", config.site_label(node)],
         )
         print(f"    ✓ cnt-local-updates/cnt-{node}")
         time.sleep(SETTLE)
@@ -425,6 +451,7 @@ def setup_analysis_ae(node: str, cse: str) -> None:
         f"{cse}/{ae_name}", config.VERDICT_CNT,
         mni=config.VERDICT_MNI,
         acpi=[acp_ri] if acp_ri else None,
+        labels=config.resource_labels(node, "verdict"),
     )
     print(f"  ✓ {ae_name}/{config.VERDICT_CNT}  (mni={config.VERDICT_MNI})")
     time.sleep(SETTLE)
@@ -458,6 +485,7 @@ def setup_mn_resources(node: str) -> Dict[str, bool]:
     om2m.create_container(
         ae, "cnt-local-model", mni=5,
         acpi=[acp_ri] if acp_ri else None,
+        labels=config.resource_labels(node, "local-model"),
     )
     print("  ✓ cnt-local-model  (mni=5)")
     time.sleep(SETTLE)
@@ -466,6 +494,7 @@ def setup_mn_resources(node: str) -> Dict[str, bool]:
     om2m.create_container(
         ae, "cnt-net-status", mni=100,
         acpi=[acp_ri] if acp_ri else None,
+        labels=config.resource_labels(node, "net-status"),
     )
     print("  ✓ cnt-net-status  (mni=100)")
     time.sleep(SETTLE)
