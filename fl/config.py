@@ -16,6 +16,8 @@ AE는 Isaac Sim 쪽에서 등록하므로 이 코드는 AE를 만들지 않는�
 """
 
 import os
+
+import amr_schema as _sch   # 조건 벡터 차원의 단일 출처
 from dataclasses import dataclass
 
 
@@ -34,7 +36,9 @@ class AEConfig:
     n_channels: int = 38
 
     # 조건 벡터: nav 그룹(5) + 속도 버킷(3). amr_schema.COND_DIM 과 같아야 한다.
-    cond_dim: int = 8
+    # amr_schema 가 정한다. nav 5 + speed 3 + 적재 3 = 11.
+    # 여기서 숫자를 박으면 스키마가 늘 때 조용히 어긋난다.
+    cond_dim: int = _sch.COND_DIM
 
     # 잠재 차원과 은닉 채널. 이 조합에서 90,806 파라미터이고
     # fp16+gzip+base64로 약 217KB라 contentInstance 하나에 들어간다.
@@ -403,12 +407,30 @@ VERDICT_CNT = os.getenv("FL_VERDICT_CNT", "cnt-verdict")
 VERDICT_MNI = int(os.getenv("FL_VERDICT_MNI", "500"))
 VERDICT_ENABLED = os.getenv("FL_VERDICT", "1") not in ("0", "false", "False")
 
-# 이 라운드 전에는 판정을 내지 않는다.
+# 이 라운드 전에는 판정을 내지 않는다. 대시보드 표시도 같이 막는다.
 #
 # 초반 라운드의 임계값은 거의 학습되지 않은 모델로 잰 것이라 판정이
-# 의미를 갖지 못한다. 고정 검증셋 측정에서 AUROC 가 R1 0.615 -> R3 0.683
-# 까지 오르고 그 뒤로 평평했으므로 기본값을 3 으로 둔다.
-VERDICT_START_ROUND = int(os.getenv("FL_VERDICT_START_ROUND", "3"))
+# 의미를 갖지 못한다. 어디부터 쓸 만한지 8시드로 쟀다(2노드 FedAvg):
+#
+#   R    AUROC    직전대비    임계 편차   임계 변동률
+#   R1  0.6201        —         0.991        25%
+#   R2  0.6631   +0.0431        0.381        12%
+#   R3  0.6832   +0.0201        0.597        18%   <- 임계가 되레 튄다
+#   R4  0.6917   +0.0085        0.483        15%
+#   R5  0.6956   +0.0039        0.382        12%   <- 상승폭 < 시드편차
+#   R6  0.6907   -0.0049        0.295         9%
+#   R10 0.7036   +0.0051        0.307         9%
+#
+# R5 부터 라운드 간 상승폭(+0.0039)이 시드 간 편차(±0.0066)보다 작아진다.
+# 즉 그 뒤의 변화는 학습 때문인지 시드 운인지 구분되지 않는다. 임계값
+# 변동률도 R6 부터 9~13% 구간에 들어앉는다. 그래서 5 로 둔다.
+#
+# 처음엔 AUROC 만 보고 3 으로 뒀는데, R3 은 임계값이 R1 다음으로 불안정한
+# 지점이었다. 판정을 가르는 건 AUROC 가 아니라 임계값이다.
+#
+# 10 라운드를 다 돌려도 임계값 변동률은 9% 아래로 안 내려간다. 5 는
+# "더 나빠지지 않는 구간의 시작"이지 "흔들림이 없어지는 지점"이 아니다.
+VERDICT_START_ROUND = int(os.getenv("FL_VERDICT_START_ROUND", "5"))
 
 
 # 판정을 구독해 갈 앱들. 기본은 사업장별 판정 앱(CJUDGE-AE-i).

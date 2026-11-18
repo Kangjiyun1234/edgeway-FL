@@ -40,6 +40,7 @@ CH_NAMES = [f"{p}.{c}" for _, p, c in CH_SPEC]
 IS_POS = np.array([c == "pos" for _, _, c in CH_SPEC])
 N_CH = len(CH_SPEC)
 VEL_IDX = CH_NAMES.index("drive.vel")
+LIFT_EFF_IDX = CH_NAMES.index("lift.eff")
 
 T = int(os.getenv("AMR_WINDOW", "60"))
 
@@ -47,7 +48,33 @@ T = int(os.getenv("AMR_WINDOW", "60"))
 NAV_GROUPS = ["stop", "straight", "turn", "loadunload", "other"]
 N_NAV = len(NAV_GROUPS)
 N_SPD = 3
-COND_DIM = N_NAV + N_SPD
+
+# 적재 상태. 아이작심이 무게를 안 보내므로 nav 의 '구간' 에서 읽는다.
+#   to_pick*  픽업하러 가는 길  -> 빈 차
+#   to_drop*  내려놓으러 가는 길 -> 적재
+#   loading / unloading        -> 싣고 내리는 중
+# 짐을 실으면 관성이 커져 IMU 가속도가 눌리고 drive.eff 가 더 든다.
+# 그 차이를 조건으로 안 주면 전부 '이상' 으로 해석된다.
+LOAD_STATES = ["empty", "light", "heavy"]
+N_LOAD = len(LOAD_STATES)
+
+# lift.eff 경계. 실측 히스토그램(아이작심 1857창, 500 단위):
+#   4500~5000  1166   <- 빈차. 4561 에 아주 좁게 뭉쳐 있다
+#   5000~5500    79
+#   5500~6000    73
+#   6000~6500    80
+#   6500~7000    79
+#   7000~7500   136
+#   7500~8000   137
+#   8000~8500    98
+# 5000 에서 뚝 끊긴다(1166 -> 79). 빈차/적재 경계는 여기가 깨끗하다.
+# 그 위는 5000~8500 에 고르게 퍼져 있다. 짐 무게가 연속으로 변한다는
+# 뜻이라, 적재를 한 칸으로 묶지 않고 가벼움/무거움으로 나눈다.
+LIFT_EDGES = tuple(
+    float(x) for x in os.getenv("AMR_LIFT_EDGES", "5000,6500").split(",")
+)
+
+COND_DIM = N_NAV + N_SPD + N_LOAD
 
 # nav 문자열 -> 그룹. 모르는 값은 'other'.
 NAV_TO_GROUP = {
@@ -78,8 +105,72 @@ EXCLUDE_NAV_TRAIN = {
 }
 
 
+def nav_parts(nav: Optional[str]) -> list:
+    """'to_drop/turn_unload' -> ['to_drop', 'turn_unload']"""
+    return [p for p in str(nav or "").strip().split("/") if p]
+
+
 def nav_group(nav: Optional[str]) -> int:
-    return NAV_TO_GROUP.get(str(nav or "").strip(), 4)
+    """
+    nav 문자열 -> 동작 그룹.
+
+    아이작심은 'to_pick/turn_side' 처럼 구간과 동작을 '/' 로 붙여 보낸다.
+    예전에는 통째로 사전에서 찾아서 못 맞추면 전부 'other' 로 떨어졌다.
+    실측에서 1857건 중 926건(49.9%)이 그렇게 'other' 한 칸에 몰렸고,
+    회전 그룹에는 아무것도 안 들어갔다. 조각으로 나눠서 찾는다.
+
+    뒤 조각(동작)을 앞 조각(구간)보다 우선한다. 'to_drop/turn_out' 은
+    회전이지 직진이 아니다.
+    """
+    raw = str(nav or "").strip()
+    if raw in NAV_TO_GROUP:
+        return NAV_TO_GROUP[raw]
+    for part in reversed(nav_parts(raw)):
+        if part in NAV_TO_GROUP:
+            return NAV_TO_GROUP[part]
+    return 4
+
+
+def load_state_from_nav(nav: Optional[str]) -> int:
+    """
+    nav 문자열만 보고 적재 상태를 고른다. lift.eff 가 없을 때의 보조.
+
+    nav 는 '어느 구간을 달리는 중인가' 지 '지금 무엇을 들고 있는가' 가
+    아니다. 실측에서 to_drop 828창 중 309창(37%)은 lift.eff 가 빈차
+    수준이었고, 로봇 3대는 to_drop 구간을 아예 빈 차로 달렸다.
+    그래서 이건 어디까지나 보조다.
+    """
+    parts = nav_parts(nav)
+    if any(p in ("loading", "unloading") for p in parts):
+        return 1
+    for p in parts:
+        if p.startswith("to_drop"):
+            return 2
+    return 0
+
+
+def load_state(nav: Optional[str] = None,
+               window: Optional[np.ndarray] = None) -> int:
+    """
+    적재 상태 인덱스. lift.eff(측정값)를 1순위로 쓰고, 없으면 nav 로 간다.
+
+    왜 측정값이 먼저인가. nav 는 아이작심이 붙이는 라벨이라 이름이 바뀌면
+    조용히 틀린다. 실제로 'to_pick/turn_side' 같은 복합 라벨 때문에 전체의
+    절반이 'other' 한 칸에 몰려 있었고 아무도 몰랐다. lift.eff 는 짐을
+    들어올리는 데 드는 힘이라 라벨과 무관하게 무게를 따라간다.
+    """
+    if window is not None:
+        try:
+            eff = float(np.nanmean(window[LIFT_EFF_IDX]))
+        except (IndexError, ValueError, TypeError):
+            eff = float("nan")
+        if np.isfinite(eff):
+            if eff < LIFT_EDGES[0]:
+                return 0        # empty
+            if eff < LIFT_EDGES[1]:
+                return 1        # light
+            return 2            # heavy
+    return load_state_from_nav(nav)
 
 
 def speed_of(window: np.ndarray) -> float:
@@ -95,10 +186,18 @@ def speed_bucket(speed: float) -> int:
     return 2
 
 
-def cond_vector(nav: Optional[str], speed: float) -> np.ndarray:
+def cond_vector(nav: Optional[str], speed: float,
+                window: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    조건 벡터. window 를 주면 적재 상태를 lift.eff 로 정한다.
+
+    window 는 window_from_con() 이 돌려준 (C, T) 원신호여야 한다.
+    .pos 채널의 평균을 빼는 가공은 lift.eff 에 영향을 주지 않는다.
+    """
     v = np.zeros(COND_DIM, dtype=np.float32)
     v[nav_group(nav)] = 1.0
     v[N_NAV + speed_bucket(speed)] = 1.0
+    v[N_NAV + N_SPD + load_state(nav, window)] = 1.0
     return v
 
 

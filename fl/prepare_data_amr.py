@@ -224,7 +224,7 @@ def parse(src: str) -> dict:
         if "scn" in labels and "spd" in labels:
             cvec = sch.cond_from_labels(labels["scn"], labels["spd"])
         else:
-            cvec = sch.cond_vector(nav, speed)
+            cvec = sch.cond_vector(nav, speed, sig)
 
         # 평가용 정답. 라벨이 있으면 라벨 우선, 없으면 nav로 판단.
         cond_name = labels.get(
