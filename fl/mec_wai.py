@@ -1,5 +1,5 @@
 """
-fl/mec_wai.py — ETSI MEC028 (WLAN Access Information, WAI) 클라이언트
+fl/mec_wai.py — ETSI GS MEC 028 (WLAN Information API, WAI) 클라이언트
 
 MEC 샌드박스의 각 MEP에 mec028-1(meep-wais)이 떠 있다. 로봇이 어느 AP에
 붙어 있고 신호와 전송률이 어떤지는 여기서 받는다. 우리가 추측하지 않는다.

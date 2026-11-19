@@ -173,7 +173,10 @@ class MNAETrainer:
 
         # MEC 서비스(MEC011 등록·발견, MEC028 링크, MEC013 위치).
         # 링크·위치 기록은 이 사업장 학습 앱의 cnt-net-status 에 남긴다.
-        self.mec = mec_services.SiteMec(self.node_name)
+        self.mec = mec_services.SiteMec(
+            self.node_name,
+            endpoint=mec_services.mec_app.endpoint_for(self.notification_port),
+        )
         self.net_status_path = (
             f"{self.mn_cse_name}/{self.ae_name}/cnt-net-status"
         )

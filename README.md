@@ -19,13 +19,17 @@ opposite responses.
 
 ## 1. Demo scenarios
 
-| # | Scenario | What it shows |
-| --- | --- | --- |
-| 1 | Normal driving | Robots drive their loops; telemetry lands in each site's MN-CSE |
-| 2 | Network anomaly → handover | MEC028 detects a degraded Wi-Fi AP; the robot is moved to another AP and data keeps flowing |
-| 3 | Network anomaly → buffering | No AP is available; windows are queued on the MEP side and replayed on recovery, with zero loss |
-| 4 | Federated learning in real time | Sites A and B train and FedAvg; site C never contributes and still receives the global model |
-| 5 | Anomaly detection: floor vs robot | A second robot is sent into the same zone to tell a floor fault apart from a faulty robot |
+| # | Scenario | What it shows | ETSI MEC API |
+| --- | --- | --- | --- |
+| 1 | Normal driving | Robots drive their loops; telemetry lands in each site's MN-CSE | MEC 011 (site trainer registers as a MEC app, discovers 013/028) |
+| 2 | Network anomaly → handover | MEC028 detects a degraded Wi-Fi AP; the robot is moved to another AP and data keeps flowing | MEC 028 (observe) + sandbox controller (act) |
+| 3 | Network anomaly → buffering | No AP is available; windows are queued on the MEP side and replayed on recovery, with zero loss | MEC 028 (observe) + sandbox controller (act) |
+| 4 | Federated learning in real time | Sites A and B train and FedAvg; site C never contributes and still receives the global model | MEC 028 + MEC 013, read once per round into `cnt-net-status` |
+| 5 | Anomaly detection: floor vs robot | A second robot is sent into the same zone to tell a floor fault apart from a faulty robot | MEC 013 + MEC 028, attached to each verdict as `mec` |
+
+The sandbox controller (`sandbox-ctrl`) is the MEC Sandbox's own control API, not
+an ETSI MEC specification, so it carries no GS number. Section 12 lists every MEC
+service on the MEPs and which of them this repository actually calls.
 
 Scenarios 2 and 3 share one goal: **the link may degrade, but the data must not be
 lost and the FL round must not stall.**
@@ -54,8 +58,8 @@ sandbox — it is a shared CSE operated outside it, reached over Mca.
   │   │  TRAINING-AE-1 │     │  TRAINING-AE-2 │     │  TRAINING-AE-3 │       │
   │   │  ANALYSIS-AE-1 │     │  ANALYSIS-AE-2 │     │  ANALYSIS-AE-3 │       │
   │   │  siteA_AMR_1-4 │     │  siteB_AMR_1-2 │     │  siteC_AMR_1-2 │       │
-  │   │  mec011 013 021│     │       ...      │     │       ...      │       │
-  │   │  028 033 040046│     │                │     │                │       │
+  │   │ MEC 011 013 021│     │       ...      │     │       ...      │       │
+  │   │ 028 033 040 046│     │                │     │                │       │
   │   └────────────────┘     └────────────────┘     └────────────────┘       │
   │     poa-wifi 1..7          poa-wifi 1..7          poa-wifi 1..10         │
   │     robot-a1..a4 UE        robot-b1..b4           robot-c1..c4           │
@@ -66,6 +70,11 @@ sandbox — it is a shared CSE operated outside it, reached over Mca.
           registers robot AEs,                    3 site trainers + coordinator
           publishes telemetry                     + dashboard
 ```
+
+The three site MEPs each run the same seven ETSI MEC services (`mec011-N` …
+`mec046-N` in the scenario); `mep-spare` runs none. This repository calls
+**MEC 011, 013 and 028**; the others are deployed but not used here — see
+section 12.
 
 ### Resources are not processes
 
@@ -583,6 +592,13 @@ POST /<sandbox>/sandbox-ctrl/v1/events/MOBILITY
 POST /<sandbox>/sandbox-ctrl/v1/events/NETWORK-CHARACTERISTICS-UPDATE
 ```
 
+This is AdvantEDGE's own control API, not an ETSI MEC service API — no GS MEC
+number applies. It stands in for what a real network would do on its own.
+`fl/mec_app.py` also reads its `applications` endpoint to look up the app
+instance ID that MEC 011 needs. The instances themselves (`edgeway-fl-a/b/c`)
+are defined by the `edgeway` scenario; the FL side never creates or deletes
+them, the way a real MEC orchestrator would own them.
+
 `fl/mec_sandbox.py` wraps these: degrade an AP, disconnect a robot, hand it over,
 restore. MEC028 names APs by BSSID while the controller names them by element
 name, so `fl/mec_topology.py` holds the translation table (regenerable from the
@@ -593,7 +609,8 @@ scenario YAML via `export_from_yaml()`).
 Degrade the serving AP → detect through MEC028 → pick a target (the robot's own
 neighbor report first, since that is evidence the robot can hear it; otherwise the
 least-loaded AP in the same site; `spare` site last, because leaving the site
-changes MEP and would need MEC021 AMS) → request MOBILITY → confirm the new AP.
+changes MEP and would need MEC021, ETSI GS MEC 021 Application Mobility Service,
+which is deployed but not called here) → request MOBILITY → confirm the new AP.
 
 Staying inside the site keeps the same MN-CSE, so only the path changes.
 
@@ -956,11 +973,23 @@ on the honest side at site C it was also close to noise.
 | oneM2M TS-0004 | AE registration attributes (`rr`, `srv`, `api`) |
 | oneM2M TS-0009 | HTTP binding, mandatory `X-M2M-RI` |
 | oneM2M TR-0084 | federated learning over oneM2M resources |
-| ETSI GS MEC 011 | service registry (app enablement) |
-| ETSI GS MEC 013 | location service |
-| ETSI GS MEC 021 | application mobility (cross-MEP handover) |
-| ETSI GS MEC 028 | WLAN access information — scenarios 2 and 3 |
-| ETSI GS MEC 033 | IoT service |
+
+### ETSI MEC
+
+| Standard | Title | Sandbox service | In this repository |
+| --- | --- | --- | --- |
+| ETSI GS MEC 003 | Framework and Reference Architecture | — | terminology only (MEP, MEC host) |
+| ETSI GS MEC 011 | Edge Platform Application Enablement | `mec011-N` | **called** — `fl/mec_app.py`: `confirm_ready` → `registrations` (app support, `isInsByMec=false`), `GET services` (service management) to find 013 and 028 |
+| ETSI GS MEC 013 | Location API | `mec013-N` | **called** — `fl/mec_loc.py`, queries `users` / `zones`; zone and AP go into `cnt-net-status` and verdicts |
+| ETSI GS MEC 021 | Application Mobility Service API | `mec021-N` | not called; would be needed for a cross-MEP handover to `spare` (section 5) |
+| ETSI GS MEC 028 | WLAN Information API (WAI) | `mec028-N` | **called** — `fl/mec_wai.py`, queries `ap_information` / `sta_information`; scenarios 2 and 3, and once per round via `fl/mec_services.py` |
+| ETSI GS MEC 033 | IoT API | `mec033-N` | not called |
+| ETSI GS MEC 040 | Federation enablement APIs | `mec040-N` | not called |
+| ETSI GS MEC 046 | Sensor-sharing API | `mec046-N` | not called |
+
+`N` is the MEP index (1 = mep-a, 2 = mep-b, 3 = mep-c). The MEC Sandbox
+controller (`sandbox-ctrl/v1/events/…`) is not in this table because it is not an
+ETSI MEC specification.
 
 CSE: [ACME](https://github.com/ankraft/ACME-oneM2M-CSE).
 Network emulation: [AdvantEDGE / ETSI MEC Sandbox](https://github.com/InterDigitalInc/AdvantEDGE).

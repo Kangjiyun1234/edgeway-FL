@@ -1,5 +1,5 @@
 """
-fl/mec_loc.py — ETSI MEC013 (Location API) 클라이언트
+fl/mec_loc.py — ETSI GS MEC 013 (Location API) 클라이언트
 
 MEC 샌드박스의 각 MEP에 mec013-1(위치 서비스)이 떠 있다. Isaac Sim 쪽
 브리지가 로봇 pose 를 GIS engine 에 넣어 주므로(robot-a1 같은 UE 위치),

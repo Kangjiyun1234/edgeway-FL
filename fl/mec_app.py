@@ -1,23 +1,30 @@
 """
-fl/mec_app.py — ETSI MEC011 (Application Enablement) 클라이언트
+fl/mec_app.py — ETSI GS MEC 011 (Edge Platform Application Enablement) 클라이언트
 
 사업장 학습 앱(TRAINING-AE-i)을 그 사업장 MEP 의 MEC 앱으로 등록하고,
 MEP 가 제공하는 서비스(MEC013 위치, MEC028 WLAN)의 주소를 서비스
 레지스트리에서 찾는다.
 
 [순서]
-  1) 앱 인스턴스 ID 받기   샌드박스 컨트롤러 Applications API
-       GET  /{sbx}/sandbox-ctrl/v1/applications          있으면 재사용
-       POST /{sbx}/sandbox-ctrl/v1/applications          없으면 만든다
-            {"id", "name", "nodeName": "mep-a", "type": "USER", "persist": false}
-     시나리오에 없는 외부 앱은 이 API 로 ID 를 받는다(AdvantEDGE 문서).
+  1) 앱 인스턴스 ID 찾기   샌드박스 컨트롤러 Applications API (MEC 명세 아님)
+       GET  /{sbx}/sandbox-ctrl/v1/applications
+     앱 인스턴스는 샌드박스 시나리오(edgeway)가 만든다. 여기서는 만들지도
+     지우지도 않고, 이름(edgeway-fl-a)과 MEP(mep-a)로 찾기만 한다.
+     없으면 시나리오가 예전 버전이라는 뜻이다. 등록을 건너뛰고 FL 은 계속한다.
   2) 준비 알림              MEC011 Application Support
        POST /{sbx}/{mep}/mec_app_support/v2/applications/{id}/confirm_ready
             {"indication": "READY"}
-  3) 서비스 발견            MEC011 Service Management
+  3) 앱 등록                MEC011 Application Support
+       POST /{sbx}/{mep}/mec_app_support/v2/registrations
+            {"appName", "appInstanceId", "appProvider",
+             "isInsByMec": false, "endpoint": {"uris": [...]}}
+     MEP 밖에서 도는 앱이라 isInsByMec=false 이고, 그러면 endpoint 가 필수다.
+     이 구현은 2) 보다 먼저 보내면 403 "Waiting for AppReadyConfirmation" 을
+     돌려준다. 그래서 confirm_ready 다음에 보낸다.
+  4) 서비스 발견            MEC011 Service Management
        GET  /{sbx}/{mep}/mec_service_mgmt/v1/services
-  4) 종료                   프로세스가 끝날 때 앱 인스턴스를 지운다
-       DELETE /{sbx}/sandbox-ctrl/v1/applications/{id}
+  5) 종료                   등록만 지운다. 앱 인스턴스는 시나리오 것이라 둔다
+       DELETE /{sbx}/{mep}/mec_app_support/v2/registrations/{id}
 
 [실행 위치]
 학습 앱은 MEP 안이 아니라 사업장 서버(지금은 연구실 서버)에서 돈다.
@@ -29,7 +36,6 @@ MEC 입장에서는 "MEP 에 등록된 외부 MEC 앱" 이다.
 """
 
 import os
-import uuid
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -84,27 +90,13 @@ def list_apps() -> List[dict]:
     return data if isinstance(data, list) else []
 
 
-def ensure_app(name: str, mep: str) -> Optional[str]:
-    """같은 이름·같은 MEP 의 앱이 있으면 그 ID, 없으면 새로 만든다."""
+def find_app(name: str, mep: str) -> Optional[str]:
+    """시나리오가 만든 앱 인스턴스 ID. 같은 이름·같은 MEP 가 없으면 None."""
     for a in list_apps():
         if a.get("name") == name and a.get("nodeName") == mep and a.get("id"):
             return a["id"]
-    body = {"id": str(uuid.uuid4()), "name": name, "nodeName": mep,
-            "type": "USER", "persist": False}
-    r = _req("POST", f"{ctrl_base()}/applications", json=body)
-    if r is None or r.status_code not in (200, 201):
-        if r is not None:
-            print(f"  ✗ 앱 인스턴스 생성 실패: HTTP {r.status_code} {r.text[:160]}")
-        return None
-    try:
-        return (r.json() or {}).get("id") or body["id"]
-    except Exception:
-        return body["id"]
-
-
-def delete_app(app_id: str) -> bool:
-    r = _req("DELETE", f"{ctrl_base()}/applications/{app_id}")
-    return r is not None and r.status_code in (200, 204)
+    print(f"  ✗ 시나리오에 FL 앱 {name}({mep}) 이 없다 — 샌드박스 시나리오를 확인할 것")
+    return None
 
 
 # ── 2) 준비 알림 ────────────────────────────────────────
@@ -125,7 +117,68 @@ def confirm_ready(mep: str, app_id: str) -> bool:
     return False
 
 
-# ── 3) 서비스 발견 ──────────────────────────────────────
+# ── 3) 앱 등록 ──────────────────────────────────────────
+
+APP_PROVIDER = os.getenv("FL_MEC_APP_PROVIDER", "edgeway")
+
+# MEC 앱 이름. MEP 하나에 학습 앱 하나라서 MEP 이름에서 만든다
+# (mep-a -> edgeway-fl-a). 시나리오의 앱 이름과 같아야 find_app 이 찾는다.
+APP_PREFIX = os.getenv("FL_MEC_APP_PREFIX", "edgeway-fl")
+
+
+def app_name(mep: str) -> str:
+    return f"{APP_PREFIX}-{mep.split('-', 1)[-1]}"
+
+
+def endpoint_for(port: int) -> str:
+    """MEC011 등록에 넣는 앱 주소. FL_NOTIFY_HOST(oneM2M poa)와는 따로 둔다."""
+    host = os.getenv("FL_MEC_APP_HOST") or config.NOTIFY_HOST
+    return f"http://{host}:{port}"
+
+
+def register(mep: str, app_id: str, name: str, endpoint: str) -> bool:
+    """
+    confirm_ready 다음에 부른다. 여러 번 불러도 결과가 같다.
+      등록 없음            POST
+      같은 endpoint 로 있음 그대로
+      다른 endpoint 로 있음 PUT 으로 고친다
+    """
+    base = f"{mep_base(mep)}/mec_app_support/v2/registrations"
+    body = {"appName": name, "appInstanceId": app_id,
+            "appProvider": APP_PROVIDER,
+            "appDescription": "Edgeway FL site trainer (AMR telemetry CVAE)",
+            "isInsByMec": False,
+            "endpoint": {"uris": [endpoint]}}
+    r = _req("GET", f"{base}/{app_id}")
+    if r is not None and r.status_code == 200:
+        try:
+            uris = ((r.json() or {}).get("endpoint") or {}).get("uris") or []
+        except Exception:
+            uris = []
+        if endpoint in uris:
+            return True
+        r = _req("PUT", f"{base}/{app_id}", json=body)
+        if r is not None and r.status_code in (200, 204):
+            return True
+        if r is not None:
+            print(f"  ✗ registrations PUT: HTTP {r.status_code} {r.text[:160]}")
+        return False
+    r = _req("POST", base, json=body)
+    if r is None:
+        return False
+    if r.status_code in (200, 201):
+        return True
+    print(f"  ✗ registrations: HTTP {r.status_code} {r.text[:160]}")
+    return False
+
+
+def deregister(mep: str, app_id: str) -> bool:
+    r = _req("DELETE",
+             f"{mep_base(mep)}/mec_app_support/v2/registrations/{app_id}")
+    return r is not None and r.status_code in (200, 204, 404)
+
+
+# ── 4) 서비스 발견 ──────────────────────────────────────
 
 def services(mep: str) -> List[dict]:
     r = _req("GET", f"{mep_base(mep)}/mec_service_mgmt/v1/services")
@@ -182,25 +235,33 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="MEC011 등록·서비스 발견 점검")
     ap.add_argument("--nodes", default=",".join(config.ALL_NODES))
     ap.add_argument("--keep", action="store_true",
-                    help="점검 뒤 앱 인스턴스를 지우지 않는다")
+                    help="점검 뒤 등록을 지우지 않는다 (앱 인스턴스는 어느 쪽이든 그대로 둔다)")
+    ap.add_argument("--endpoint-host", default=None,
+                    help="MEC011 등록에 넣을 앱 주소 (기본 FL_MEC_APP_HOST, 없으면 FL_NOTIFY_HOST)")
+    ap.add_argument("--base-port", type=int, default=5001,
+                    help="mn1 의 포트. mn2, mn3 은 1씩 더한다")
     args = ap.parse_args()
     config.require_sandbox()
     print(f"sandbox-ctrl: {ctrl_base()}")
     for node in [n.strip() for n in args.nodes.split(",") if n.strip()]:
         mep = config.MEP_OF_NODE.get(node, "?")
-        name = f"{config.training_ae_name(node)}"
+        name = app_name(mep)
         print(f"\n=== {node} / {mep} ===")
-        app_id = ensure_app(name, mep)
+        app_id = find_app(name, mep)
         print(f"  앱 인스턴스: {app_id}")
         if app_id:
             print(f"  confirm_ready: {confirm_ready(mep, app_id)}")
+            idx = config.ALL_NODES.index(node) if node in config.ALL_NODES else 0
+            ep = (f"http://{args.endpoint_host}:{args.base_port + idx}"
+                  if args.endpoint_host else endpoint_for(args.base_port + idx))
+            print(f"  registrations: {register(mep, app_id, name, ep)}  ({ep})")
         for s in services(mep):
             print(f"  서비스 {s.get('serName')!s:20s} "
                   f"{(s.get('serCategory') or {}).get('name')!s:14s} "
                   f"{s.get('state')}  {_uri_of(s)}")
         print(f"  발견: {discover(mep)}")
         if app_id and not args.keep:
-            print(f"  앱 인스턴스 삭제: {delete_app(app_id)}")
+            print(f"  등록 삭제: {deregister(mep, app_id)}")
 
 
 if __name__ == "__main__":

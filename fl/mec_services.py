@@ -1,8 +1,9 @@
 """
 fl/mec_services.py — 사업장 학습 앱이 쓰는 MEC 서비스 묶음
 
-  MEC011  학습 앱을 사업장 MEP 의 MEC 앱으로 등록하고, MEC013·MEC028
-          주소를 서비스 레지스트리에서 찾는다.            FL_MEC_APP
+  MEC011  학습 앱을 사업장 MEP 의 MEC 앱으로 등록하고(confirm_ready →
+          registrations), MEC013·MEC028 주소를 서비스
+          레지스트리에서 찾는다.                          FL_MEC_APP
   MEC028  라운드마다 로봇 링크 상태(AP·RSSI·전송률)를 읽어
           TRAINING-AE-i/cnt-net-status 에 남긴다.        FL_MEC_LINK
   MEC013  로봇이 있는 Zone·AP·좌표를 읽어 링크 기록과
@@ -52,14 +53,17 @@ class _Breaker:
 
 
 class SiteMec:
-    def __init__(self, node: str):
+    def __init__(self, node: str, endpoint: Optional[str] = None):
         self.node = node
+        # MEC011 등록에 넣는 앱 주소. 학습 앱의 알림 서버 주소를 쓴다.
+        self.endpoint = endpoint
         self.mep = config.MEP_OF_NODE.get(node, "")
         self.app = _Breaker("MEC011", _on("FL_MEC_APP"))
         self.link = _Breaker("MEC028", _on("FL_MEC_LINK"))
         self.loc = _Breaker("MEC013", _on("FL_MEC_LOCATION"))
         self.app_id: Optional[str] = None
         self.ready = False
+        self.registered = False
         self.discovered: Dict[str, dict] = {}
 
     @property
@@ -73,19 +77,28 @@ class SiteMec:
         if not self.app.enabled:
             return
         print(f"\n  [{self.node}] MEC011 앱 등록 ({self.mep})")
-        name = config.training_ae_name(self.node)
-        self.app_id = mec_app.ensure_app(name, self.mep)
+        name = mec_app.app_name(self.mep)
+        self.app_id = mec_app.find_app(name, self.mep)
         if not self.app_id:
-            print(f"    ⚠ 앱 인스턴스를 못 받았다. MEC013·028 은 기본 주소로 부른다")
+            print(f"    ⚠ 앱 인스턴스가 없어 MEC011 등록을 건너뛴다. MEC013·028 은 기본 주소로 부른다")
             self.app.enabled = False
             return
         print(f"    ✓ 앱 인스턴스 {self.app_id}")
-        # 정상 종료(Ctrl+C 포함) 때 지운다. kill 로 끝나 못 지워도 다음 기동에서
-        # 같은 이름의 인스턴스를 찾아 재사용하므로 쌓이지 않는다.
+        # 정상 종료(Ctrl+C 포함) 때 등록만 지운다. 앱 인스턴스는 시나리오 것이다.
+        # kill 로 끝나 등록이 남아도 다음 기동에서 그대로 확인·재사용한다.
         atexit.register(self.stop)
         self.ready = mec_app.confirm_ready(self.mep, self.app_id)
         print(f"    {'✓' if self.ready else '⚠'} confirm_ready "
               f"{'READY' if self.ready else '실패'}")
+        # 등록은 READY 다음이어야 한다(먼저 보내면 403). 이전 실행의 등록이
+        # 남아 있을 수 있어서 confirm_ready 결과와 상관없이 확인한다.
+        if self.endpoint:
+            self.registered = mec_app.register(
+                self.mep, self.app_id, name, self.endpoint)
+            print(f"    {'✓' if self.registered else '⚠'} registrations "
+                  f"{self.endpoint if self.registered else '실패'}")
+        else:
+            print("    · registrations 건너뜀 (endpoint 없음)")
 
         self.discovered = mec_app.discover(self.mep)
         loc = self.discovered.get("location")
@@ -100,10 +113,10 @@ class SiteMec:
                   f"{(d or {}).get('name')} {(d or {}).get('uri', '(기본 주소 사용)')}")
 
     def stop(self) -> None:
-        if self.app_id:
-            ok = mec_app.delete_app(self.app_id)
-            print(f"  [{self.node}] MEC011 앱 인스턴스 정리: {'✓' if ok else '⚠'}")
-            self.app_id = None
+        if self.app_id and self.registered:
+            ok = mec_app.deregister(self.mep, self.app_id)
+            print(f"  [{self.node}] MEC011 등록 해제: {'✓' if ok else '⚠'}")
+            self.registered = False
 
     # ── MEC013 ──────────────────────────────────────────
     def _location(self, ue: str) -> Optional[dict]:

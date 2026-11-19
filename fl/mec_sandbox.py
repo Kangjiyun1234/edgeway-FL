@@ -4,6 +4,10 @@ fl/mec_sandbox.py — MEC 샌드박스 컨트롤러 이벤트 클라이언트
 명령을 내리는 쪽은 FL이 아니라 샌드박스다. FL/MN-AE는 탐지하고 판정만 하고,
 실제로 로봇을 옮기거나 링크를 망가뜨리는 것은 이 API가 한다.
 
+이 API는 AdvantEDGE(MEC 샌드박스) 자체의 제어 API이고 ETSI MEC 명세가
+아니다. 그래서 GS MEC 번호가 없다. 표준 API는 mec_app.py(MEC011),
+mec_loc.py(MEC013), mec_wai.py(MEC028) 쪽이다.
+
   POST /{sbx}/sandbox-ctrl/v1/events/MOBILITY
        {"name": "...", "type": "MOBILITY",
         "eventMobility": {"elementName": "robot-c2",
