@@ -290,6 +290,12 @@ def setup_in_acps(nodes: List[str]) -> Dict[str, str]:
         {"acor": mn_origins, "acop": ACOP_CREATE | ACOP_DISCOVERY},
     ])
 
+    # 라운드별 검증셋 평가. IN-AE 가 쓰고 대시보드가 읽는다(대시보드는 관리자
+    # 신원). ACP 가 없으면 IN-AE 가 자기 AE-ID 로 돌 때 CIN 을 못 만든다.
+    mk("acp-fl-inference", [
+        {"acor": [admin, ORIGIN_IN_AE], "acop": ACOP_ALL},
+    ])
+
     for node in nodes:
         mk(f"acp-dropbox-{node}", [
             {"acor": [admin, ORIGIN_IN_AE], "acop": ACOP_ALL},
@@ -377,7 +383,7 @@ def setup_in_resources(nodes: List[str], acps: Dict[str, str]) -> None:
 
     # 판정 결과. FL은 명령을 내리지 않고 여기에 써 두기만 한다.
     # 샌드박스/Isaac이 읽어서 2차 로봇 투입·대기장소 이동을 수행한다.
-    cnt(ae, "cnt-fl-inference", 200, None)
+    cnt(ae, "cnt-fl-inference", 200, "fl-inference")
 
 
 # ════════════════════════════════════════════════════════
