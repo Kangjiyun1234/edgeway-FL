@@ -191,6 +191,13 @@ if (!window.Chart) {
   .charts-grid > .chart-card, .bottom-grid > #cc-loss { display: flex; flex-direction: column; min-height: 0; }
   :root { --auroc-h: 18px; }
   .node-plot, .loss-plot { position: relative; flex: 1 1 0; min-height: 40px; }
+  /* 1라운드 점수가 오기 전까지 그래프 자리에 띄우는 안내 */
+  .plot-wait {
+    position: absolute; inset: 0; display: none;
+    align-items: center; justify-content: center;
+    font-size: 14px; color: var(--text-sec, #888);
+  }
+  .waiting-r1 .plot-wait { display: flex; }
 
   .chart-card {
     background: var(--bg); border: 0.5px solid var(--border);
@@ -534,7 +541,7 @@ if (!window.Chart) {
           </span>
         </div>
         <div class="live-val" id="lv-mn1">—</div>
-        <div class="node-plot"><canvas id="c-mn1"></canvas></div>
+        <div class="node-plot"><canvas id="c-mn1"></canvas><div class="plot-wait">Collecting round 1 windows…</div></div>
       </div>
 
       <div class="chart-card hl" id="cc-mn2">
@@ -546,7 +553,7 @@ if (!window.Chart) {
           </span>
         </div>
         <div class="live-val" id="lv-mn2">—</div>
-        <div class="node-plot"><canvas id="c-mn2"></canvas></div>
+        <div class="node-plot"><canvas id="c-mn2"></canvas><div class="plot-wait">Collecting round 1 windows…</div></div>
       </div>
 
       <div class="chart-card hl" id="cc-mn3">
@@ -558,7 +565,7 @@ if (!window.Chart) {
           </span>
         </div>
         <div class="live-val" id="lv-mn3">—</div>
-        <div class="node-plot"><canvas id="c-mn3"></canvas></div>
+        <div class="node-plot"><canvas id="c-mn3"></canvas><div class="plot-wait">Collecting round 1 windows…</div></div>
         <div class="alert-strip" id="alert-strip">
           <div class="alert-strip-top">
             <span class="alert-text">⚠ Fault Detected</span>
@@ -799,6 +806,8 @@ let faultDetail = '';
 let warmupRed   = false;     // 안정화 구간에서 한 번이라도 잡혔는지
 const K_FAULT   = 3;
 let lossHistory = {};
+let scoresSeen  = false; // 이번 실행의 점수를 한 번이라도 받았는지
+let lastStateEvt = null; // 첫 점수가 올 때 라운드 표시를 다시 그리려고 둔다
 let scoreIdx    = 0;   // 스트리밍 샘플 카운터
 let onsetIdx    = null; // mn3_label=1이 처음 나온 샘플 인덱스
 
@@ -837,7 +846,15 @@ function applyState(evt) {
   if (evt.verdict_start_round !== undefined) {
     verdictStartRound = toNumber(evt.verdict_start_round, 1);
   }
-  const round     = toNumber(evt.round, 0);
+  lastStateEvt = evt;
+  const realRound = toNumber(evt.round, 0);
+  if (realRound === 0) scoresSeen = false;
+  // 1라운드 점수는 노드가 그 라운드 창을 다 모아 채점한 뒤에야 온다.
+  // 그 전까지는 라운드를 0 으로 두고 안내 문구만 띄웠다가, 점수가 오면
+  // 라운드 1 표시와 그래프를 같이 띄운다.
+  const waitingR1 = realRound === 1 && !scoresSeen;
+  document.body.classList.toggle('waiting-r1', waitingR1);
+  const round     = waitingR1 ? 0 : realRound;
   // 안정화 구간이 끝나면 거기서 잡힌 건 없던 일로 한다. 모델이 덜 자란
   // 탓이고, 진짜 이상치는 그 뒤에 온다.
   if (round >= verdictStartRound && faulted && !faultShown) {
@@ -926,6 +943,10 @@ function applyThresholds(thr) {
 }
 
 function handleScore(evt) {
+  if (!scoresSeen) {
+    scoresSeen = true;
+    if (lastStateEvt) applyState(lastStateEvt);
+  }
   scoreIdx++;
 
   ['mn1', 'mn2', 'mn3'].forEach(node => {
@@ -1279,6 +1300,9 @@ document.getElementById('btn-reconnect').addEventListener('click', () => {
   faultRound = null;
   mn3Consec  = 0;
   lossHistory = {};
+  scoresSeen = false;
+  lastStateEvt = null;
+  document.body.classList.remove('waiting-r1');
   scoreIdx   = 0;
   onsetIdx   = null;
   document.getElementById('fault-banner').classList.remove('show');
