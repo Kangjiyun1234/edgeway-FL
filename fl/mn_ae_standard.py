@@ -30,6 +30,7 @@ import onem2m_utils as om2m
 import onem2m_pch
 import verdict
 import mec_services
+import mec_iot
 from edge_node import AEEdgeNode
 
 # "이번 라운드는 학습할 수 없다. 다만 노드를 죽일 일은 아니다"를 나타내는 신호.
@@ -89,7 +90,9 @@ class MNAETrainer:
             om2m.set_originator(self.ae_id)
 
         # 이 사업장의 MN-CSE에 바인딩한다. 사업장마다 MEP가 다르다.
-        mn_base, mn_cse = config.mn_endpoint(self.node_name)
+        # 주소는 MEP 의 MEC033 에 등록된 IoT 플랫폼에서 받고, 못 받으면
+        # 기존 규칙(config.mn_endpoint)으로 간다.
+        mn_base, mn_cse = mec_iot.resolve(self.node_name)
         om2m.set_endpoint(mn_base, mn_cse)
         om2m.set_in_endpoint(*config.in_endpoint())
         self.mn_cse_name = mn_cse

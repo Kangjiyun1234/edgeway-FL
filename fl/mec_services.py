@@ -9,6 +9,9 @@ fl/mec_services.py — 사업장 학습 앱이 쓰는 MEC 서비스 묶음
   MEC013  로봇이 있는 Zone·AP·좌표를 읽어 링크 기록과
           판정(cnt-verdict)에 같이 남긴다.               FL_MEC_LOCATION
 
+  (MEC033 은 여기가 아니라 기동 맨 앞, MN-CSE 주소를 정할 때 쓴다.
+   mec_iot.py, FL_MEC_IOT)
+
 셋 다 "보조" 다. 실패해도 FL 라운드는 그대로 간다. 같은 서비스가 연달아
 실패하면(FL_MEC_MAX_FAIL, 기본 3) 그 실행 동안은 더 부르지 않는다.
 학습 시간을 MEC 응답 대기로 잃지 않기 위해서다.

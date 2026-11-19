@@ -21,7 +21,7 @@ opposite responses.
 
 | # | Scenario | What it shows | ETSI MEC API |
 | --- | --- | --- | --- |
-| 1 | Normal driving | Robots drive their loops; telemetry lands in each site's MN-CSE | MEC 011 (site trainer registers as a MEC app, discovers 013/028) |
+| 1 | Normal driving | Robots drive their loops; telemetry lands in each site's MN-CSE | MEC 033 (site app finds its MN-CSE) + MEC 011 (registers as a MEC app, discovers 013/028) |
 | 2 | Network anomaly → handover | MEC028 detects a degraded Wi-Fi AP; the robot is moved to another AP and data keeps flowing | MEC 028 (observe) + sandbox controller (act) |
 | 3 | Network anomaly → buffering | No AP is available; windows are queued on the MEP side and replayed on recovery, with zero loss | MEC 028 (observe) + sandbox controller (act) |
 | 4 | Federated learning in real time | Sites A and B train and FedAvg; site C never contributes and still receives the global model | MEC 028 + MEC 013, read once per round into `cnt-net-status` |
@@ -73,7 +73,7 @@ sandbox — it is a shared CSE operated outside it, reached over Mca.
 
 The three site MEPs each run the same seven ETSI MEC services (`mec011-N` …
 `mec046-N` in the scenario); `mep-spare` runs none. This repository calls
-**MEC 011, 013 and 028**; the others are deployed but not used here — see
+**MEC 011, 013, 028 and 033**; the others are deployed but not used here — see
 section 12.
 
 ### Resources are not processes
@@ -983,7 +983,7 @@ on the honest side at site C it was also close to noise.
 | ETSI GS MEC 013 | Location API | `mec013-N` | **called** — `fl/mec_loc.py`, queries `users` / `zones`; zone and AP go into `cnt-net-status` and verdicts |
 | ETSI GS MEC 021 | Application Mobility Service API | `mec021-N` | not called; would be needed for a cross-MEP handover to `spare` (section 5) |
 | ETSI GS MEC 028 | WLAN Information API (WAI) | `mec028-N` | **called** — `fl/mec_wai.py`, queries `ap_information` / `sta_information`; scenarios 2 and 3, and once per round via `fl/mec_services.py` |
-| ETSI GS MEC 033 | IoT API | `mec033-N` | not called |
+| ETSI GS MEC 033 | IoT API | `mec033-N` | **called** — `fl/mec_iot.py`: `GET registered_iot_platforms` gives each site app its MN-CSE address (checked with a CSEBase retrieve; falls back to the naming rule in `config.mn_endpoint`) |
 | ETSI GS MEC 040 | Federation enablement APIs | `mec040-N` | not called |
 | ETSI GS MEC 046 | Sensor-sharing API | `mec046-N` | not called |
 
