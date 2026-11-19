@@ -134,8 +134,16 @@ none — but nothing in this design depends on it either way.
 | **MEC Sandbox** | MEPs, CSEs, Wi-Fi access points, robot UEs, mobility | The `edgeway` scenario |
 
 `setup_resources_standard.py` deliberately does **not** create the robot AEs. It
-discovers them (`fu=1&ty=2`) and reports whether the expected count is registered,
-so a missing simulator is diagnosed instead of silently papered over.
+finds their `telemetry` containers by label discovery
+(`fu=1&ty=3&lbl=siteX:telemetry`, falling back to `lbl=site:siteX` + `type:telemetry`),
+re-reads each hit to confirm its labels, and reports whether the expected count is
+registered, so a missing simulator is diagnosed instead of silently papered over.
+The site trainers use the same discovery at startup. When nothing is found under
+the labels they fall back to the `siteX_AMR_n/telemetry` naming rule.
+
+The combined label matters because ACME treats several `lbl` values in one query
+as **OR**: asking for `site:siteA` and `type:telemetry` together also returns this
+repository's own containers that carry either label.
 
 ### Division of responsibility
 
@@ -172,6 +180,8 @@ IN-CSE   <in-cse>                            outside the sandbox, shared
 ├── acpCreateRootResources   <ACP>  built in
 ├── acpRetrieveCSEBase       <ACP>  built in
 │
+├── lightbulbAE …            <AE>   other teams' resources on the shared CSE — never touched
+│
 ├── acp-fl-control           <ACP>  IN-AE all · TRAINING-AE-* RETRIEVE+NOTIFY
 ├── acp-global-model         <ACP>  same
 ├── acp-local-updates        <ACP>  IN-AE all · TRAINING-AE-* CREATE
@@ -198,13 +208,18 @@ IN-CSE   <in-cse>                            outside the sandbox, shared
     │   ├── cnt-mn1          <CNT>  mni=50    site A drop-box
     │   │   ├── sub_in_dropbox_mn1  <SUB>  net=3, target IN-AE
     │   │   └── <CIN>  {type, round, train_loss, val_loss, val_auroc,
-    │   │               num_samples, weights, window_scores, threshold}
+    │   │               num_samples, weights, window_scores,
+    │   │               window_labels, threshold}
     │   ├── cnt-mn2          <CNT>  site B drop-box
-    │   └── cnt-mn3          <CNT>  site C — uploads metrics only, no weights
+    │   │   └── sub_in_dropbox_mn2  <SUB>  net=3, target IN-AE
+    │   └── cnt-mn3          <CNT>  site C — uploads fl-inference only, no weights
+    │       └── sub_in_dropbox_mn3  <SUB>  net=3, target IN-AE
     │
     └── cnt-fl-inference     <CNT>  mni=200   per-round model evaluation
-        └── <CIN>  {type:"global-eval", round, auroc, detected, false_alarms,
-                    threshold, mean_normal, mean_anomaly, n_normal, n_anomaly}
+        └── <CIN>  {type:"global-eval", round, model, timestamp, auroc,
+                    baseline_auroc, delta_vs_baseline, detected, false_alarms,
+                    threshold, threshold_mean3s, mean_normal, mean_anomaly,
+                    separation, n_normal, n_anomaly, by_fault}
 ```
 
 ```
@@ -215,18 +230,22 @@ MN-CSE   acme-cse-mn-mep-a-<sandbox>          inside the sandbox, one per MEP
 │
 ├── siteA_AMR_1 … _4         <AE>   ADN-AE, registered by Isaac Sim
 │   ├── telemetry            <CNT>  mni=10000
+│   │      lbl = site:siteA · robot:AMR_1 · ae:siteA_AMR_1
+│   │            · type:telemetry · siteA:telemetry
 │   │   ├── sub-sensor-data-mn1   <SUB>  net=3 → the trainer's poa
 │   │   └── <CIN>  {robot, seq, t_wall, t_sim, nav,
 │   │               pose{x,y,yaw}, 38 signal channels, label}
 │   └── status               <CNT>
 │
-├── acp-cache-mn1            <ACP>  CTRAINING-AE-1 all · CIN-AE RETRIEVE
-├── acp-verdict-mn1          <ACP>  CANALYSIS-AE-1 all · trainer RETRIEVE
-│                                   · robot AEs RETRIEVE+NOTIFY
+├── acp-cache-mn1            <ACP>  CTRAINING-AE-1 all · CIN-AE RETRIEVE+DISCOVERY
+├── acp-verdict-mn1          <ACP>  CANALYSIS-AE-1 all
+│                                   · CTRAINING-AE-1 RETRIEVE+DISCOVERY
+│                                   · robot AEs RETRIEVE+NOTIFY+DISCOVERY
 │
 ├── TRAINING-AE-1            <AE>   CTRAINING-AE-1   training app
-│   │                               poa set, rr=true — the MN-CSE is local,
-│   │                               so notifications arrive directly
+│   │                               poa=http://<host>:5001, rr=true
+│   │                               local notifications are direct by default,
+│   │                               so there is no <pollingChannel> here
 │   ├── cnt-local-model      <CNT>  mni=5     round cache
 │   └── cnt-net-status       <CNT>  mni=100   MEC028 snapshots, buffer state
 │
@@ -237,10 +256,18 @@ MN-CSE   acme-cse-mn-mep-a-<sandbox>          inside the sandbox, one per MEP
                     observed_at, pose{x,y}, round, model, timestamp}
 ```
 
-mep-b and mep-c are identical apart from the robot count (4 / 2 / 2) and the
-node suffix. Site C differs only in *what it uploads*: `fl-inference` carrying
-metrics but no weights, so the coordinator records it and excludes it from the
-average.
+mep-b and mep-c have the same structure apart from the robot count (4 / 2 / 2)
+and the node suffix. Site C (`FL_LOCAL_ONLY_NODES=mn3`) still trains locally and
+still writes verdicts to `ANALYSIS-AE-3/cnt-verdict`; it differs only in *what it
+uploads*:
+
+```
+site A / B  →  cnt-mn1, cnt-mn2   {type:"fl-update", weights, train_loss, num_samples, ...}
+                                   IN-AE puts them into FedAvg
+site C      →  cnt-mn3            {type:"fl-inference", train_loss, num_samples, ...}
+                                   no weights; IN-AE does not wait for it and only
+                                   logs it as [NO-AGG/NOTIFY]
+```
 
 | FL function | oneM2M resource |
 | --- | --- |
@@ -408,7 +435,7 @@ label would leak the answer into the input.
 
 ```
 input    (B, 38, 60)      38 channels × 60 samples @ 60 Hz = 1 s window
-cond     (B, 8)           5 navigation groups + 3 speed bins
+cond     (B, 11)          5 navigation groups + 3 speed bins + 3 load states
 encoder  60 → 30 → 15 → 8
 latent   24
 decoder  8 → 15 → 30 → 60
@@ -416,8 +443,9 @@ loss     ELBO = reconstruction MSE + β·KL   (β = 0.5)
 ```
 
 The condition vector matters: the same vibration means something different when
-turning at speed than when creeping into a load bay. Without conditioning, normal
-cornering reads as a fault.
+turning at speed than when creeping into a load bay, or when the robot is empty
+rather than carrying a heavy load. Without conditioning, normal cornering reads as
+a fault.
 
 Evaluation uses `z = mu` rather than sampling, so thresholds are reproducible.
 
@@ -425,33 +453,63 @@ Channels (38): 3 IMUs × 8 (`ax ay az gx gy gz roll pitch`) + 14 encoder channel
 (drive `pos/vel/eff`, swivel `pos`, 4 rollers × `pos/vel`, lift `pos/eff`).
 Position channels are window-mean-subtracted — absolute position is not a fault signal.
 
+### Input normalization
+
+Inputs are standardized per site by `NormStats` (`fl/amr_schema.py`). The site
+keeps accumulating channel statistics until every load state (empty / light /
+heavy) has 20 windows, or round 5 arrives, and then **freezes** them. Normalizing
+from round 1 alone blew the loss up whenever a later round brought a load state
+the first round had not seen. z values are clipped to ±10.
+
+| Variable | Default |
+| --- | --- |
+| `AMR_NORM_MIN_PER_LOAD` | 20 |
+| `AMR_NORM_FREEZE_ROUND` | 5 |
+| `AMR_NORM_CLIP` | 10 |
+
 ### Anomaly scoring
 
-Per-channel reconstruction error is divided by that channel's **median** error on
-the site's own calibration windows, then averaged across channels. Per-site normalization is necessary:
-each site's floor and each robot's build have a different "normal", and a shared
-statistic makes normal look anomalous.
+The default score (`FL_SCORE_MODE=diff`) compares the *change* between consecutive
+samples, not the raw signal: per channel, `mean_t |Δx − Δx̂|`. All three fault
+types show up as one-sample jolts on the accelerometers, and in the raw-signal
+error those jolts are buried under the low-frequency error of reconstructing the
+trajectory. The first difference keeps the jolt.
 
-Threshold: `median + 3 · MAD · 1.4826` over the site's calibration windows.
+Each channel's error is turned into a robust z score against the reference for its
+**condition cell** (navigation group × speed bin × load state): `(e − median) / MAD`,
+with the cell's MAD floored at 10 % of the channel's overall MAD so a quiet cell
+cannot blow small errors up. A cell with fewer than 8 reference windows falls back
+to the channel's overall reference. The window score is the **maximum** over channels,
+because a floor fault shows up on a few channels, not on the average of 38.
+`FL_SCORE_MODE=recon` restores the older per-channel reconstruction error.
 
-Not `mean + 3σ`. The calibration set is the training set, and the training set is
-contaminated, so the mean and the standard deviation are both dragged upward by
-the very windows the threshold is meant to catch, pushing the threshold above
-them. The median and the MAD barely move until contamination approaches half, and
-the 1.4826 factor rescales the MAD onto the same footing as σ, so `n_sigma` keeps
-meaning what it says.
+Threshold: `median + 8 · MAD · 1.4826` over the reference windows
+(`FL_THRESHOLD_N_SIGMA`, 8 by default; 3 when `FL_COND_NORM=0`).
 
-Measured on an earlier validation set (377 normal / 80 anomalous, since
-replaced), same model, same data:
+Not `mean + 3σ`. The reference windows come from the training stream, and the
+training stream is contaminated, so the mean and the standard deviation are both
+dragged upward by the very windows the threshold is meant to catch. The median and
+the MAD barely move until contamination approaches half, and the 1.4826 factor
+rescales the MAD onto the same footing as σ. The multiplier is 8 rather than 3
+because conditioning concentrates the normal scores and shrinks the MAD with them;
+`fl/config.py` keeps the measurements behind that choice.
 
-```
-mean + 3σ          threshold 8.730    detected  6/80    false alarms 0/377
-median + 3·MAD     threshold 2.320    detected 26/80    false alarms 0/377
-```
+### Verdict: score before training, against a frozen reference
 
-The per-channel baseline that normalizes the error is a median for the same
-reason: taken as a mean, a channel where anomalies spike hard raises its own
-baseline and suppresses exactly the signal it should expose.
+A round's windows are scored by the **previous round's detector before the site
+trains on them**. Scoring after training let a fault be absorbed: the model learned
+the faulty windows first and then judged them normal (a run that scored 200–400
+against a fixed reference scored 9–11 once absorbed, under a threshold of 15–17).
+
+- **Frozen reference.** The reference pool (rounds 1–5) is frozen at
+  `FL_REF_FREEZE_ROUND` (5). After that, references and thresholds come only from
+  that pool, so later anomalies cannot move the bar.
+- **Flagged windows are not trained on.** Once the pool is frozen, windows above
+  the threshold are left out of that round's training (`FL_EXCLUDE_FLAGGED=1`),
+  as long as at least 8 windows remain.
+- **Verdict rule.** Three consecutive windows above the threshold from the same
+  robot (`K=3`) produce one verdict per robot, from round `FL_VERDICT_START_ROUND`
+  (6) onward. Earlier rounds are a warm-up and never alarm.
 
 ### Measuring a round against a fixed set
 
@@ -488,8 +546,9 @@ floor     → move it to the standby area
 fault
 ```
 
-The verdict is written to `cnt-fl-inference`. Dispatching the second robot and
-moving the faulty one are sandbox actions, not FL actions.
+The verdict is written to `ANALYSIS-AE-i/cnt-verdict` on the site's own MN-CSE.
+Dispatching the second robot and moving the faulty one are sandbox actions, not FL
+actions.
 
 ---
 
@@ -588,7 +647,8 @@ fl/
   model_codec.py             weight codec (fp16+gzip+base64, sha256, chunking)
   edge_node.py               local training (trimmed loss), calibration, scoring
   aggregator.py              FedAvg
-  onem2m_utils.py            oneM2M client, dual-CSE routing, discovery
+  onem2m_utils.py            oneM2M client, dual-CSE routing, label discovery
+  onem2m_pch.py              <pollingChannel> receiver for firewalled AEs
   amr_ingest.py              CIN → training windows (per robot, per site)
   prepare_data_amr.py        offline JSONL → pkl
   setup_resources_standard.py   resource/ACP/subscription setup, AE verification
@@ -601,8 +661,13 @@ fl/
   personalize.py             local fine-tuning for the non-contributing node
   valset.py                  fixed validation set, per-round model scoring
   valset_amr.npz             the validation windows themselves
+  build_valset.py            builds valset_amr.npz from Isaac Sim captures
   verdict.py                 writes floor verdicts to the analysis app's container
   dashboard_server.py        dashboard backend
+  check_telemetry.py         diagnostic: how full each robot's telemetry container is
+  probe_cra.py               diagnostic: reproduces the trainer's incremental fetch
+  probe_drop.py              diagnostic: CINs dropped while building windows
+  demo_verdict_sub.py        diagnostic: verdict subscription path end to end
 
 fl_bearing_dashboard.html    dashboard front end
 FL-diagrams/                 PlantUML sequence/structure diagrams
@@ -610,8 +675,11 @@ out/FL-diagrams/             rendered diagrams
 archive/femto/               previous FEMTO bearing demo, kept for reference
 archive/legacy/              superseded entry points
 env.local.example            environment template (copy to .env.local)
+requirements.txt             Python dependencies
 run_fl.sh                    start the whole demo
+run_experiment1.sh           experiment 1: ten rounds end to end, no detection
 clean_fl.sh                  reset resources and local artifacts
+logs/                        per-run logs (git-ignored)
 ```
 
 ---
@@ -675,18 +743,28 @@ to `source` it no longer sends every request to the wrong CSE.
 | `FL_SENSOR_MIN_WINDOWS` | `50` | windows a site waits for before a round proceeds |
 | `FL_SENSOR_BACKLOG_SEC` | `0` | `0` uses everything already in the containers; a positive value only what arrived within that many seconds; negative skips the backlog entirely |
 | `FL_LABEL_FOR_TRAIN` | `0` | `1` trains on label-selected normals (supervised) |
-| `FL_TRIM_RATIO` | `0.15` | fraction of each batch dropped by loss; `0` disables |
+| `FL_TRIM_RATIO` | `0` | fraction of each batch dropped by loss; `0` disables |
 | `FL_TRIM_WARMUP_EPOCHS` | `2` | epochs before trimming starts |
 | `FL_VERDICT` | `1` | `0` stops writing verdicts to the MN-CSE |
+| `FL_VERDICT_START_ROUND` | `6` | first round allowed to post a verdict |
+| `FL_REF_FREEZE_ROUND` | `5` | round at which the reference pool is frozen |
+| `FL_EXCLUDE_FLAGGED` | `1` | leave above-threshold windows out of training |
+| `FL_SCORE_MODE` | `diff` | `recon` for plain reconstruction error |
+| `FL_THRESHOLD_N_SIGMA` | `8` | MAD multiplier of the threshold (`3` with `FL_COND_NORM=0`) |
+| `FL_MIN_STEPS` | `200` | minimum optimizer steps per local round; epochs are raised to reach it |
+| `FL_DP` | `0` | `1` turns per-batch clipping + noise back on (comparison only) |
+| `FL_LBL_SITE_TELEMETRY` | `{site}:telemetry` | combined label used to discover telemetry |
 | `FL_VALSET_PATH` | `fl/valset_amr.npz` | fixed validation set |
 | `FL_SENSOR_CIN_LIMIT_PER_ROBOT` | `150` | CINs fetched per robot per round |
 | `FL_MAX_CIN_BYTES` | 4 MB | embed ceiling before falling back |
 | `FL_CHUNK_WEIGHTS` | `0` | fragment weights across CINs |
 | `FL_CREATE_AES` | `0` | robot AEs come from Isaac Sim |
 
-Model and training defaults: `seq_len=60`, `n_channels=38`, `cond_dim=8`,
-`latent_dim=24`, `hidden=48`, `beta=0.5`; 10 global rounds, 10 local epochs,
-batch 32, lr 1e-3.
+Model and training defaults: `seq_len=60`, `n_channels=38`, `cond_dim=11`,
+`latent_dim=24`, `hidden=48`, `beta=0.5`; 10 global rounds, 10 local epochs
+(raised as needed to reach `FL_MIN_STEPS`), batch 32, lr 1e-3. Differential
+privacy is off by default: with per-batch clipping the added noise was 3–8× the
+clipped gradient, and the global model converged to near-zero output.
 
 ### MEC028 judgement thresholds
 
@@ -804,16 +882,24 @@ assigns robots to sites by the `siteA_*` / `siteB_*` / `siteC_*` prefix, or by
 
 Stated plainly, because the measurements are what they are.
 
-**Federated learning has not yet been measured on the real three-site run.**
-A two-node rehearsal — two separate captures standing in for two sites, scored
-against the shipped validation set — does show rounds helping: AUROC 0.615 at
-round 1, 0.683 by round 3, then flat through round 10, with false alarms falling
-from 53 to 41 of 318 normal windows. A single node on the same data is flat from
-the start, so the gain comes from the aggregation rather than from more training.
-Three sites on live telemetry may behave differently, and that run has not been
-measured. Earlier figures in this section compared FedAvg against a model-free
-z-score baseline; they predate the validation set and the scoring changes and have
-not been reproduced.
+**One live three-site run detected the injected fault, with caveats.** On
+2026-11-19 (11:36 run, live Isaac Sim telemetry, ten rounds), a floor fault on
+`siteC_AMR_2` starting around 11:45:15 was flagged in round 8 and the verdict was
+posted at 11:46:11 (score 33.2, threshold 15.23); `siteC_AMR_1` raised none. The
+same run also showed:
+
+- **Two false alarms at site A** (rounds 6 and 10), both in low-speed turn cells
+  (`to_pick/turn_in`, `to_pick/turn_start`) that the frozen reference pool barely
+  covers.
+- **Site A lags behind its robots.** Four robots produce about 1.3 windows/s while
+  a round takes 50, so the backlog grew from 143 to 469 windows and site A was
+  about 5.5 minutes behind by round 10.
+- **The validation AUROC falls below the no-model baseline after round 2**
+  (baseline 0.8323 in `diff` mode), so the per-round gain on the fixed set is not
+  yet shown.
+
+One run is not a measurement. Earlier two-node rehearsals predate the current
+scoring and are not reproduced here.
 
 **Site C is data-starved.** Only one robot has usable data, 25 moving windows.
 The design calls for four. Normal driving at site A's scale (~400 windows) and
@@ -829,9 +915,9 @@ scenario 2 will either miss the degradation or flag healthy links.
 
 **Each site normalizes its inputs by its own statistics, and sharing them makes
 things worse.** A global model carries no normalization statistics: every site
-computes channel means and standard deviations from its first round of data and
-reuses them, so FedAvg is averaging weights learned in three differently scaled
-input spaces. Pooling the statistics and giving every site the same ruler is the
+accumulates its own channel means and standard deviations and freezes them (see
+Input normalization), so FedAvg is averaging weights learned in three differently
+scaled input spaces. Pooling the statistics and giving every site the same ruler is the
 obvious fix, and it was measured: on a two-node FedAvg rehearsal (five seeds, ten
 rounds, two separate captures as the two sites) shared statistics scored AUROC
 0.5772 against 0.6752 for per-site statistics, losing in all fifty comparisons.
