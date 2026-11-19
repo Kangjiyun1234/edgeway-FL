@@ -1,5 +1,5 @@
 """
-fl/mec_wai.py — ETSI MEC028 (WLAN Access Information, WAI) 클라이언트
+fl/mec_wai.py — ETSI GS MEC 028 (WLAN Information API, WAI) 클라이언트
 
 MEC 샌드박스의 각 MEP에 mec028-1(meep-wais)이 떠 있다. 로봇이 어느 AP에
 붙어 있고 신호와 전송률이 어떤지는 여기서 받는다. 우리가 추측하지 않는다.
@@ -40,6 +40,9 @@ UL_MIN_KBPS = float(os.getenv("FL_UL_MIN_KBPS", "500"))   # 상향 최소 전송
 
 TIMEOUT = float(os.getenv("FL_MEC_TIMEOUT_SEC", "8"))
 
+# MEC011 서비스 발견으로 찾은 주소가 있으면 그걸 쓴다. mep -> base url
+DISCOVERED: Dict[str, str] = {}
+
 
 def _verify():
     return config.TLS_VERIFY
@@ -53,6 +56,8 @@ def wai_base(mep: str) -> str:
     override = os.getenv(f"FL_WAI_BASE_{mep.replace('-', '_').upper()}")
     if override:
         return override.rstrip("/")
+    if mep in DISCOVERED:
+        return DISCOVERED[mep]
     scheme = os.getenv("FL_SANDBOX_SCHEME", "https")
     return (f"{scheme}://{config.SANDBOX_HOST}"
             f"/{config.SANDBOX_NAME}/{mep}/wai/v2")
