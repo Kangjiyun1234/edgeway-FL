@@ -95,7 +95,8 @@ if (!window.Chart) {
     letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 8px;
   }
 
-  .nodes-row { display: grid; grid-template-columns: repeat(3, 313px); gap: 10px; }
+  /* 노드 카드 3장이 라운드 진행 바와 같은 폭을 쓴다. 칸은 아래 차트 줄과 같은 3등분. */
+  .nodes-row { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; }
   /* 맨 위: Edge nodes 라벨 → 노드 카드 3장 → 라운드 진행. 왼쪽 정렬.
      아래 차트 줄과 같은 3칸 격자를 써서, 라운드 진행은 mn1~mn2 차트 폭(2칸)에 맞춘다. */
   .top-row { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); column-gap: 10px; }
@@ -208,6 +209,8 @@ if (!window.Chart) {
   .chart-name { font-size: 22px; font-weight: 600; color: var(--text); }
   .chart-unseen { font-size: 12px; font-weight: 500; color: var(--tr-bar); margin-left: 4px; }
   .chart-tag  { font-size: 12px; color: var(--text3); }
+  /* 오른쪽 위: threshold 아래에 val_loss. */
+  .chart-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
   .live-val   { font-size: 22px; font-weight: 600; color: var(--text); margin-bottom: 8px; transition: color 0.3s; }
   .live-val.danger { color: #a32d2d; }
 
@@ -485,7 +488,6 @@ if (!window.Chart) {
           <span class="node-badge ok" id="nb-mn1">Normal</span>
         </div>
         <div class="node-role">Site A · 4 robots · in aggregation</div>
-        <div class="node-stat" id="ns-mn1">Waiting</div>
       </div>
       <div class="node ok" id="nd-mn2">
         <div class="node-header">
@@ -493,7 +495,6 @@ if (!window.Chart) {
           <span class="node-badge ok" id="nb-mn2">Normal</span>
         </div>
         <div class="node-role">Site B · 2 robots · in aggregation</div>
-        <div class="node-stat" id="ns-mn2">Waiting</div>
       </div>
       <div class="node ok" id="nd-mn3">
         <div class="node-header">
@@ -502,7 +503,6 @@ if (!window.Chart) {
           <span class="node-badge ok" id="nb-mn3">Monitoring</span>
         </div>
         <div class="node-role">Site C · 2 robots · no FedAvg contribution</div>
-        <div class="node-stat" id="ns-mn3">Waiting</div>
       </div>
     </div>
 
@@ -528,39 +528,36 @@ if (!window.Chart) {
       <div class="chart-card hl" id="cc-mn1">
         <div class="chart-head">
           <span class="chart-name">mn1</span>
-          <span class="chart-tag" id="thr-mn1">threshold —</span>
+          <span class="chart-meta">
+            <span class="chart-tag" id="thr-mn1">threshold —</span>
+            <span class="chart-tag" title="Mean anomaly score of this round's normal windows, scored after local training (same scale as the threshold). Not a training loss: lower means the model reproduces this site's normal driving better.">val_loss <span id="vl-mn1">—</span></span>
+          </span>
         </div>
         <div class="live-val" id="lv-mn1">—</div>
-        <div class="auroc-row">
-          <span class="auroc-chip">AUROC <span id="au-mn1">—</span></span>
-          <span class="auroc-chip">val_loss <span id="vl-mn1">—</span></span>
-        </div>
         <div class="node-plot"><canvas id="c-mn1"></canvas></div>
       </div>
 
       <div class="chart-card hl" id="cc-mn2">
         <div class="chart-head">
           <span class="chart-name">mn2</span>
-          <span class="chart-tag" id="thr-mn2">threshold —</span>
+          <span class="chart-meta">
+            <span class="chart-tag" id="thr-mn2">threshold —</span>
+            <span class="chart-tag" title="Mean anomaly score of this round's normal windows, scored after local training (same scale as the threshold). Not a training loss: lower means the model reproduces this site's normal driving better.">val_loss <span id="vl-mn2">—</span></span>
+          </span>
         </div>
         <div class="live-val" id="lv-mn2">—</div>
-        <div class="auroc-row">
-          <span class="auroc-chip">AUROC <span id="au-mn2">—</span></span>
-          <span class="auroc-chip">val_loss <span id="vl-mn2">—</span></span>
-        </div>
         <div class="node-plot"><canvas id="c-mn2"></canvas></div>
       </div>
 
       <div class="chart-card hl" id="cc-mn3">
         <div class="chart-head">
           <span class="chart-name">mn3 <span class="chart-unseen" title="Local only: fine-tunes the global model on its own normal data, never sees fault data, and does not send weights to FedAvg.">local only</span></span>
-          <span class="chart-tag" id="thr-mn3">threshold —</span>
+          <span class="chart-meta">
+            <span class="chart-tag" id="thr-mn3">threshold —</span>
+            <span class="chart-tag" title="Mean anomaly score of this round's normal windows, scored after local training (same scale as the threshold). Not a training loss: lower means the model reproduces this site's normal driving better.">val_loss <span id="vl-mn3">—</span></span>
+          </span>
         </div>
         <div class="live-val" id="lv-mn3">—</div>
-        <div class="auroc-row">
-          <span class="auroc-chip">AUROC <span id="au-mn3">—</span></span>
-          <span class="auroc-chip">val_loss <span id="vl-mn3">—</span></span>
-        </div>
         <div class="node-plot"><canvas id="c-mn3"></canvas></div>
         <div class="alert-strip" id="alert-strip">
           <div class="alert-strip-top">
@@ -882,27 +879,33 @@ function applyState(evt) {
 
   // 노드별 메트릭 + 글로벌 loss 계산
   const nodeList = Object.keys(nodes);
+  // 글로벌 loss 는 FedAvg 에 들어가는 노드(mn1·mn2)가 '같은 라운드'를 다 올렸을 때,
+  // 그 업로드의 라운드 번호로 찍는다. 전에는 화면의 현재 라운드로 찍어서,
+  // R1 결과를 읽은 시점에 이미 R2 가 시작돼 있으면 R1 값이 R2 자리에 들어갔다.
+  const FEDAVG_NODES = ['mn1', 'mn2'];
+  const upRounds = FEDAVG_NODES.map(n => nodes[n] ? toNumber(nodes[n].round, 0) : 0);
+  const upRound  = upRounds.every(r => r > 0 && r === upRounds[0]) ? upRounds[0] : 0;
   if (nodeList.length > 0) {
     let totalSamples = 0, weightedLoss = 0;
     nodeList.forEach(node => {
       const d = nodes[node];
       const samples = toNumber(d.num_samples, 0);
       const trainLoss = toNumber(d.train_loss, 0);
-      totalSamples  += samples;
-      weightedLoss  += trainLoss * samples;
+      if (FEDAVG_NODES.includes(node)) {
+        totalSamples  += samples;
+        weightedLoss  += trainLoss * samples;
+      }
 
       const au = document.getElementById('au-' + node);
       const vl = document.getElementById('vl-' + node);
-      const ns = document.getElementById('ns-' + node);
       if (au) au.textContent = fmt(d.val_auroc, 3);
       if (vl) vl.textContent = fmt(d.val_loss, 4);
-      if (ns) ns.textContent = `R${d.round ?? '—'}  n=${d.num_samples ?? '—'}`;
     });
 
-    if (totalSamples > 0 && round > 0 && !lossHistory[round]) {
+    if (totalSamples > 0 && upRound > 0 && !lossHistory[upRound]) {
       const avgLoss = weightedLoss / totalSamples;
-      lossHistory[round] = avgLoss;
-      pushLoss(round, avgLoss);
+      lossHistory[upRound] = avgLoss;
+      pushLoss(upRound, avgLoss);
       setLV('loss', avgLoss.toFixed(4), false);
     }
   }
