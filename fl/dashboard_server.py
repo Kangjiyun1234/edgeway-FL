@@ -717,6 +717,12 @@ def _node_scores_from_cse(node: str):
     if not content:
         return None
 
+    # 드롭박스는 실행마다 비우지 않는다. 이 대시보드가 뜨기 전에 올라온 CIN 은
+    # 지난 실행의 마지막 라운드 점수라, 그걸 쓰면 라운드 0 에서 그래프가 먼저
+    # 그려졌다.
+    if _is_stale_payload(content):
+        return None
+
     raw = content.get("window_scores")
     if not raw:
         return None
@@ -764,13 +770,22 @@ def _reload_scores_if_needed() -> None:
 
     with _shared_lock:
         current_scores_round = _shared["scores_round"]
+        # 노드별로 마지막에 올린 라운드. 바뀌면 새 점수가 올라온 것이다.
+        uploads = tuple(sorted(
+            (node, data.get("round", 0))
+            for node, data in _shared["nodes"].items()
+        ))
+        last_uploads = _shared.get("scores_uploads")
 
     has_new_model = (
         model_round > current_model_round
         and model_path is not None
     )
     # 글로벌 모델이 아직 없어도(Round 1) MN-AE 가 올린 점수는 있다.
-    has_new_round = current_fl_round > current_scores_round
+    # 라운드 번호만 보면, 라운드 N 의 점수는 노드가 다 올린 뒤에도 N+1 이
+    # 시작될 때까지 안 읽혀 그래프가 한 라운드씩 늦었다. 업로드가 바뀌어도 읽는다.
+    has_new_round = (current_fl_round > current_scores_round
+                     or uploads != last_uploads)
 
     if not has_new_model and not has_new_round:
         return
@@ -926,6 +941,13 @@ def _reload_scores_if_needed() -> None:
             with _shared_lock:
                 _shared["model_round"] = model_round
 
+        # 이번 실행 업로드가 아직 없는 동안(라운드 0, 1라운드 학습 중) 매 tick
+        # 다시 읽지 않게, 본 상태를 기록해 둔다. 노드가 올리면 uploads 가
+        # 바뀌어 그때 다시 읽는다.
+        with _shared_lock:
+            _shared["scores_round"] = current_fl_round
+            _shared["scores_uploads"] = uploads
+
         print(
             "  ⚠ [Scores] 읽을 점수가 없다 "
             "(PKL 없음 + 드롭박스 비어 있음). 기존 값 유지."
@@ -956,6 +978,7 @@ def _reload_scores_if_needed() -> None:
             )
 
         _shared["scores_round"] = current_fl_round
+        _shared["scores_uploads"] = uploads
 
         _shared["summary_sent"] = False
 
@@ -1579,6 +1602,10 @@ def _poll_thread() -> None:
                     )
 
                     if not node_content:
+                        continue
+
+                    # 지난 실행이 남긴 업로드(이 대시보드 기동 전)는 이번 판 것이 아니다.
+                    if _is_stale_payload(node_content):
                         continue
 
                     nodes[node] = {
