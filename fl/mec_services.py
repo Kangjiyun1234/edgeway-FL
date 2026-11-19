@@ -171,7 +171,8 @@ class SiteMec:
             "timestamp": time.time(),
             "sources": [s for s, b in (("MEC028", self.link),
                                        ("MEC013", self.loc)) if b.enabled],
-            "mec_app": {"appInstanceId": self.app_id, "ready": self.ready},
+            "mec_app": {"appInstanceId": self.app_id, "ready": self.ready,
+                        "registered": self.registered},
             "summary": summary,
             "robots": robots,
         }
@@ -204,7 +205,8 @@ def main() -> None:
     args = ap.parse_args()
     config.require_sandbox()
     for node in [n.strip() for n in args.nodes.split(",") if n.strip()]:
-        m = SiteMec(node)
+        idx = config.ALL_NODES.index(node) if node in config.ALL_NODES else 0
+        m = SiteMec(node, endpoint=mec_app.endpoint_for(5001 + idx))
         m.start()
         snap = m.link_snapshot(0)
         print(json.dumps(snap, ensure_ascii=False, indent=1)[:2000])

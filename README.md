@@ -256,7 +256,7 @@ MN-CSE   acme-cse-mn-mep-a-<sandbox>          inside the sandbox, one per MEP
 │   │                               local notifications are direct by default,
 │   │                               so there is no <pollingChannel> here
 │   ├── cnt-local-model      <CNT>  mni=5     round cache
-│   └── cnt-net-status       <CNT>  mni=100   MEC028 snapshots, buffer state
+│   └── cnt-net-status       <CNT>  mni=100   MEC028/MEC013 snapshots, buffer state
 │
 └── ANALYSIS-AE-1            <AE>   CANALYSIS-AE-1   analysis app
     └── cnt-verdict          <CNT>  mni=500   stays inside the site
@@ -561,12 +561,63 @@ actions.
 
 ---
 
-## 5. Network scenarios over ETSI MEC
+## 5. ETSI MEC integration and network scenarios
 
-Each MEP runs `mec028-1` (`meep-wais`), AdvantEDGE's implementation of
-**ETSI GS MEC 028** (WLAN Access Information API).
+Each site MEP runs seven ETSI MEC services (section 12). The site app — the one
+process per site that is both `TRAINING-AE-i` and `ANALYSIS-AE-i` — uses four of
+them. It is the only part of the system that is *located* at a MEP: the
+coordinator talks to the shared IN-CSE outside the sandbox and belongs to no MEP,
+so it is not a MEC application.
 
-### Observation — MEC028
+### The site app as a MEC application — MEC 033, MEC 011
+
+On start-up, before it touches the MN-CSE, each site app does this against its
+own MEP:
+
+| Step | API | Call | Why |
+| --- | --- | --- | --- |
+| 1 | MEC 033 | `GET /iots/v1/registered_iot_platforms` | the MN-CSE is the IoT platform registered at this MEP; its name and URI become the site app's CSE endpoint |
+| 2 | sandbox controller | `GET /sandbox-ctrl/v1/applications` | find the app instance the `edgeway` scenario defines for this MEP (`edgeway-fl-a/b/c`) |
+| 3 | MEC 011 | `POST /mec_app_support/v2/applications/{id}/confirm_ready` | tell the MEP the instance is running |
+| 4 | MEC 011 | `POST /mec_app_support/v2/registrations` | register as a MEC app: `isInsByMec=false`, `endpoint` = the app's notification server |
+| 5 | MEC 011 | `GET /mec_service_mgmt/v1/services` | discover the MEC 013 and MEC 028 URIs at this MEP |
+
+Details that matter:
+
+- **Step 1 is checked, not trusted.** The URI from MEC 033 is rebased onto
+  `FL_SANDBOX_HOST` and a CSEBase retrieve must answer before it is used;
+  otherwise the site app falls back to the naming rule in `config.mn_endpoint`.
+  On the current sandbox both give the same address for all three sites.
+- **The FL side never creates or deletes app instances.** They belong to the
+  scenario, the way a real MEC orchestrator would own them. If the scenario has
+  no `edgeway-fl-<x>` on that MEP, MEC 011 is skipped with a warning and
+  training carries on.
+- **Step 3 must come before step 4.** This implementation answers a registration
+  sent first with `403 Waiting for AppReadyConfirmation`. Step 4 is idempotent:
+  an existing registration with the same endpoint is left alone, one with a
+  different endpoint is updated with `PUT`.
+- **On exit only the registration is removed** (`DELETE /registrations/{id}`);
+  the instance stays.
+- **Registration does not change the data path.** Telemetry, models and verdicts
+  still go over Mca to the CSEs. What registration adds is that the MEP knows the
+  app exists, and that the app finds MEC 013 and MEC 028 through the service
+  registry instead of hard-coded paths.
+
+### Every round — MEC 028, MEC 013
+
+Once per round each site app reads MEC 028 link state and MEC 013 location for
+its robots and writes one snapshot to `TRAINING-AE-i/cnt-net-status`
+(`sources`, `mec_app`, per-robot AP, RSSI, link verdict, zone, coordinates).
+Every verdict CIN also carries a `mec` field with the robot's zone, AP and link
+state at the time of the verdict, so a floor fault can be placed on the map.
+
+All of this is auxiliary. A service that fails `FL_MEC_MAX_FAIL` times in a row
+is switched off for the rest of the run; rounds never wait on MEC.
+
+### Observation — MEC 028
+
+Each MEP runs `mec028-N` (`meep-wais`), AdvantEDGE's implementation of
+**ETSI GS MEC 028** (WLAN Information API).
 
 ```
 GET /<sandbox>/<mep>/wai/v2/queries/sta/sta_information
@@ -672,7 +723,11 @@ fl/
   in_ae_standard.py          IN-AE coordinator, per-round evaluation
   mn_ae_standard.py          site trainer (TRAINING-AE-i) + analysis app
   mec_topology.py            AP↔BSSID, robot AE↔UE↔MAC tables
+  mec_iot.py                 MEC033 client: MN-CSE address from the IoT platform registry
+  mec_app.py                 MEC011 client: confirm_ready, registration, service discovery
+  mec_loc.py                 MEC013 client: robot zone, AP, coordinates
   mec_wai.py                 MEC028 client and link judgement
+  mec_services.py            the site app's MEC services per round (net-status, verdict context)
   mec_sandbox.py             MEC Sandbox controller events
   net_scenarios.py           scenarios 2 and 3
   personalize.py             local fine-tuning for the non-contributing node
@@ -733,9 +788,17 @@ Derived endpoints, with `<host>` and `<sandbox>` taken from the environment:
 
 ```
 mep-a    https://<host>/<sandbox>/mep-a/meep-acme-mn-cse    acme-cse-mn-mep-a-<sandbox>
+MEC011   https://<host>/<sandbox>/mep-a/mec_app_support/v2
+         https://<host>/<sandbox>/mep-a/mec_service_mgmt/v1
+MEC013   https://<host>/<sandbox>/mep-a/location/v3
 MEC028   https://<host>/<sandbox>/mep-a/wai/v2
+MEC033   https://<host>/<sandbox>/mep-a/iots/v1
 control  https://<host>/<sandbox>/sandbox-ctrl/v1
 ```
+
+The `mep-a` CSE line is the fallback rule; at run time the site app takes the
+address from MEC 033 when it answers (section 5). MEC 013 and MEC 028 URIs found
+through MEC 011 service discovery override the lines above.
 
 **The IN-CSE is not one of these.** It is a shared CSE outside the sandbox, so
 `FL_IN_BASE_URL` and `FL_IN_CSE_NAME` must be set explicitly in `.env.local`
@@ -783,6 +846,20 @@ Model and training defaults: `seq_len=60`, `n_channels=38`, `cond_dim=11`,
 privacy is off by default: with per-batch clipping the added noise was 3–8× the
 clipped gradient, and the global model converged to near-zero output.
 
+### MEC services
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `FL_MEC_IOT` | `1` | `0` skips MEC 033 and uses the CSE naming rule only |
+| `FL_MEC_APP` | `1` | `0` skips MEC 011 (no registration, no service discovery) |
+| `FL_MEC_LINK` | `1` | `0` stops reading MEC 028 each round |
+| `FL_MEC_LOCATION` | `1` | `0` stops reading MEC 013 |
+| `FL_MEC_APP_HOST` | `FL_NOTIFY_HOST` | host put in the MEC 011 registration `endpoint`; kept separate because `FL_NOTIFY_HOST` is also the oneM2M `poa` |
+| `FL_MEC_APP_PREFIX` | `edgeway-fl` | app instance name in the scenario is `<prefix>-a/b/c` |
+| `FL_MEC_APP_PROVIDER` | `edgeway` | `appProvider` in the registration |
+| `FL_MEC_MAX_FAIL` | `3` | consecutive failures before a MEC service is switched off for the run |
+| `FL_MEC_TIMEOUT_SEC` | `4` | per-request timeout for MEC calls |
+
 ### MEC028 judgement thresholds
 
 | Variable | Default | Meaning |
@@ -819,8 +896,14 @@ source .env.local
 
 ```bash
 python3 fl/setup_resources_standard.py --verify   # all four CSEs, resources, robot AEs
+python3 fl/mec_iot.py                             # MEC033: MN-CSE address per site
+python3 fl/mec_services.py --nodes mn1            # MEC011 register → discover → 028/013 once
 python3 fl/mec_wai.py --nodes mn3                 # MEC028 link state
 ```
+
+`mec_iot.py` should print `(규칙 주소와 같음)` — same as the naming rule — for
+every site. `mec_services.py` registers, takes one snapshot and deregisters
+again, so it leaves nothing behind.
 
 `--verify` reports missing robot AEs as a warning: those belong to Isaac Sim, so
 the fix is to start the simulator, not to create them here.
@@ -891,7 +974,8 @@ assigns robots to sites by the `siteA_*` / `siteB_*` / `siteC_*` prefix, or by
 | Dashboard | 7000 |
 
 `node_id` and port must stay aligned: `0 → mn1 → 5001`, `1 → mn2 → 5002`,
-`2 → mn3 → 5003`.
+`2 → mn3 → 5003`. The same port goes into each site app's MEC 011 registration
+`endpoint` (`http://<FL_MEC_APP_HOST>:500N`).
 
 ---
 
@@ -953,6 +1037,14 @@ well. An earlier single-node rehearsal suggested the opposite and was wrong.
 **The validation set comes from one robot at one site.** `siteC_AMR_2`, a single
 continuous run. It says nothing about how the model generalizes across sites,
 which is the whole premise of the federated setup.
+
+**MEC 046 (Sensor Sharing) returns nothing on this sandbox.** `meep-sss` drops
+every IoT platform whose URI has no explicit port: it substitutes 80/443 and then
+`continue`s past the line that would add it. It is deployed but not used here.
+
+**MEC 021 is not exercised.** Handover in scenario 2 stays within one MEP; a
+handover to `mep-spare` would need Application Mobility, which is not
+implemented.
 
 **The sandbox scenario YAML lists four robots at site B** while the code and data
 use two (`ROBOTS_PER_NODE`). The YAML is being corrected.
