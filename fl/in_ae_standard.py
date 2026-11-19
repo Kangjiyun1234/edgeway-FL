@@ -669,7 +669,8 @@ class INAECoordinator:
         if result:
             print(
                 f"  ✓ jobState: {state} "
-                f"(Round {round_num}, model={data['globalModelUri']})"
+                f"(Round {round_num}, {data['securityMode']}, "
+                f"model={data['globalModelUri']})"
             )
         else:
             print(

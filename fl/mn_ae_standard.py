@@ -486,6 +486,14 @@ class MNAETrainer:
             )
 
             fallback = self._get_current_job_state()
+            # /la 에는 지난 실행의 명령이 남아 있을 수 있다. 알림 경로는
+            # 이미 발행 시각으로 거르는데 여기서는 안 걸러서, 이전 실행이
+            # 1라운드에서 멈췄을 때 남긴 FL_TRAINING round=1 을 이번 실행의
+            # 명령으로 받아 IN-AE 가 뜨기도 전에 학습·업로드를 해 버렸다.
+            # IN-AE 는 아직 0라운드라 그 업로드를 round mismatch 로 버리고,
+            # MN 은 이미 2라운드를 기다리므로 1라운드에서 영영 멈춘다.
+            if isinstance(fallback, dict) and self._is_stale_command(fallback):
+                fallback = None
             if self._is_expected_command(fallback, round_num):
                 with self.job_lock:
                     self.latest_job_command = fallback
@@ -997,6 +1005,11 @@ class MNAETrainer:
             n = len(got["signals"])
 
             if n >= want_min:
+                if n_polls <= 1:
+                    # 기다릴 필요가 없었던 경우. 진행 줄이 하나도 안 찍혀서
+                    # 수집이 빠진 것처럼 보이므로 한 줄 남긴다.
+                    print(f"    [{self.node_name}] ✓ 윈도우 {n}/{want_min} "
+                          f"— 첫 조회에서 이미 찼다 (쌓여 있던 분량)")
                 break
 
             # 조회를 10번(약 20초) 해도 하나도 없으면 컨테이너마다 CIN 이 몇 개 있는지
