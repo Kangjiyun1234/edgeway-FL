@@ -608,8 +608,11 @@ function mkLossChart() {
       scales: {
         x: { ticks: { font: { size: 9 }, color: tickColor }, grid: { display: false } },
         y: {
-          min: 0, suggestedMax: 1.5,
-          ticks: { font: { size: 9 }, color: tickColor, maxTicksLimit: 4 },
+          // 값에 맞춰 축을 잡는다. 예전에는 suggestedMax 1.5 로 고정돼 있어
+          // 손실이 0.05~0.15 로 내려오면 바닥에 붙은 직선으로 보였다.
+          // grace 로 위쪽에 15% 여유를 둔다.
+          beginAtZero: true, grace: '15%',
+          ticks: { font: { size: 9 }, color: tickColor, maxTicksLimit: 5 },
           grid: { color: gridColor, drawBorder: false },
         },
       },

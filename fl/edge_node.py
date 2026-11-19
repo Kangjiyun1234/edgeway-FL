@@ -86,6 +86,8 @@ class AEEdgeNode:
         val_cond:   Optional[np.ndarray] = None,
         train_run_id: Optional[np.ndarray] = None,
         val_run_id:   Optional[np.ndarray] = None,
+        calib_signals: Optional[np.ndarray] = None,
+        calib_cond:    Optional[np.ndarray] = None,
     ):
         self.node_id   = node_id
         self.device    = device
@@ -106,6 +108,20 @@ class AEEdgeNode:
 
         self.train_ds = TensorDataset(X_train, C_train)
         self.val_ds   = TensorDataset(X_val, C_val, y_val)
+
+        # 기준·임계값을 잡을 '정상 기준 창'. 주지 않으면 이번 학습 창을 쓴다.
+        #
+        # 이번 학습 창으로 잡으면 그 안에 섞인 이상이 기준을 끌어올린다.
+        # 2026-11-19 10:25 실행에서 siteC_AMR_2 의 이상 창(고정 기준으로
+        # 200~400점)이 R8/R9 학습에 들어가, 학습 뒤 같은 창으로 다시 잡은
+        # 기준 때문에 9~11점으로 내려갔다(임계 15~17). 워밍업 동안 모은
+        # 창을 고정해 두고 그것으로 잡으면 이상이 들어와도 기준이 안 움직인다.
+        if calib_signals is not None and len(calib_signals):
+            self.calib_ds = TensorDataset(
+                self._as_3d(calib_signals),
+                self._as_cond(calib_cond, len(calib_signals)))
+        else:
+            self.calib_ds = None
 
         self.train_run_id = (np.asarray(train_run_id)
                              if train_run_id is not None else None)
@@ -361,15 +377,18 @@ class AEEdgeNode:
             except Exception:
                 n_sigma = float(os.getenv("FL_THRESHOLD_N_SIGMA", "3.0"))
 
-        if self.num_train_samples == 0:
+        ref_ds = self.calib_ds if self.calib_ds is not None else self.train_ds
+        X_ref, C_ref = ref_ds.tensors[0], ref_ds.tensors[1]
+        n_ref = len(X_ref)
+        if n_ref == 0:
             return None
 
         self.model.eval()
         errs, derrs = [], []
         with torch.no_grad():
-            for i in range(0, self.num_train_samples, self.train_cfg.batch_size):
-                xb = self.train_ds.tensors[0][i:i + self.train_cfg.batch_size].to(self.device)
-                cb = (self.train_ds.tensors[1][i:i + self.train_cfg.batch_size].to(self.device)
+            for i in range(0, n_ref, self.train_cfg.batch_size):
+                xb = X_ref[i:i + self.train_cfg.batch_size].to(self.device)
+                cb = (C_ref[i:i + self.train_cfg.batch_size].to(self.device)
                       if self.cond_dim else None)
                 errs.append(self.model.channel_error(xb, cb).cpu())
                 if SCORE_MODE == "diff":
@@ -382,7 +401,7 @@ class AEEdgeNode:
             # 차분 오차의 '정상 수준' 을 채널 x 조건칸 마다 잡는다.
             # 조건칸 표본이 적으면(8 개 미만) 전체 기준으로 물러선다.
             D = torch.cat(derrs).numpy()              # (N, C)
-            cond_np = (self.train_ds.tensors[1][:len(D)].cpu().numpy()
+            cond_np = (C_ref[:len(D)].cpu().numpy()
                        if self.cond_dim else None)
             keys = (self.cell_key(cond_np) if cond_np is not None
                     else np.zeros(len(D), dtype=np.int64))
@@ -391,7 +410,8 @@ class AEEdgeNode:
             scores = torch.from_numpy(self._diff_scores(D, cond_np))
             dead = int((~self.diff_alive).sum())
             print(f"    ◦ 점수 방식 diff (차분 오차 채널 z 최대) · "
-                  f"조건칸 기준 {len(self.diff_ref)}개"
+                  f"조건칸 기준 {len(self.diff_ref)}개 · 기준 창 {n_ref}개"
+                  f"{' (고정 기준 집합)' if self.calib_ds is not None else ''}"
                   + (f" · 상수 채널 {dead}개 제외" if dead else ""))
         else:
             scores = self._aggregate(E)
@@ -400,16 +420,14 @@ class AEEdgeNode:
         # 점수로 잡아야 추론 때와 단위가 같아진다.
         if COND_NORM and self.cond_dim and SCORE_MODE != "diff":
             raw = scores.cpu().numpy()
-            keys = self.cond_key(
-                self.train_ds.tensors[1][:len(raw)].cpu().numpy())
+            keys = self.cond_key(C_ref[:len(raw)].cpu().numpy())
             self.cond_norm_fallback = float(np.median(raw))
             self.cond_norm = {
                 int(k): float(np.median(raw[keys == k]))
                 for k in np.unique(keys)
             }
             scores = torch.from_numpy(
-                self._apply_cond_norm(raw, 
-                    self.train_ds.tensors[1][:len(raw)].cpu().numpy()))
+                self._apply_cond_norm(raw, C_ref[:len(raw)].cpu().numpy()))
             print(f"    ◦ 조건별 기준 {len(self.cond_norm)}개 "
                   f"(중앙값 범위 {min(self.cond_norm.values()):.2f}"
                   f"~{max(self.cond_norm.values()):.2f})")

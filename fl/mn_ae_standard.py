@@ -36,6 +36,12 @@ from edge_node import AEEdgeNode
 # 후자는 그렇지 않다.
 SKIP_ROUND = object()
 
+# 학습 전 판정에서 임계를 넘은 창을 그 라운드 학습에서 뺄지.
+EXCLUDE_FLAGGED = os.getenv("FL_EXCLUDE_FLAGGED", "1") not in ("0", "false", "False")
+# 정상 기준 창을 몇 라운드까지 모으고 고정할지. 정규화 통계와 맞춘다.
+REF_FREEZE_ROUND = int(os.getenv(
+    "FL_REF_FREEZE_ROUND", os.getenv("AMR_NORM_FREEZE_ROUND", "5")))
+
 
 class MNAETrainer:
     def __init__(self, node_id: int, notification_port: int, inject_anomaly: bool = False):
@@ -61,6 +67,17 @@ class MNAETrainer:
         # 담겨 적재 구간에서 |z| 가 수십~수백으로 튀었다.
         import amr_schema as _sch
         self.norm = _sch.NormStats()
+
+        # 판정기. 직전 라운드에 학습·보정을 마친 노드를 그대로 둔다.
+        # 새 창은 이것으로 '학습하기 전에' 채점한다(_prescore_windows).
+        self._detector = None
+        # 기준·임계값을 잡을 정상 기준 창(원신호). 워밍업 라운드 동안 모으고
+        # REF_FREEZE_ROUND 에 고정한다. 고정한 뒤로는 이상이 들어와도 기준이
+        # 따라 올라가지 않는다.
+        self._calib_X: list = []
+        self._calib_C: list = []
+        self._calib_frozen = False
+        self._calib_frozen_round = None
 
         self.ae_name = config.training_ae_name(self.node_name)
         self.ae_id = config.training_ae_id(self.node_name)
@@ -1243,6 +1260,49 @@ class MNAETrainer:
             "0", "false", "False")
         train_mask = (nav_ok & label_ok) if use_label else nav_ok
 
+        # ── 학습 전 판정 ─────────────────────────────────
+        # 직전 라운드의 판정기(모델 + 기준 + 임계값)로 먼저 채점한다.
+        # 예전에는 이번 창으로 학습하고, 그 창으로 기준을 다시 잡고, 그 창을
+        # 채점했다. 이상 창이 학습과 기준에 다 들어가 점수가 눌렸다.
+        pre = self._prescore_windows(Xn, C)
+        flagged = np.zeros(len(Xn), dtype=bool)
+        if pre is not None:
+            scores, thr = pre
+            flagged = scores > thr
+            self.last_windows["pre_scores"] = scores
+            self.last_windows["pre_threshold"] = thr
+            print(f"      ◦ 학습 전 판정: 직전 판정기로 {int(flagged.sum())}/"
+                  f"{len(flagged)}창이 임계 {thr:.2f} 초과 "
+                  f"(최대 {float(scores.max()):.2f})")
+            # 기준이 고정된 뒤에만 학습에서 뺀다. 그 전에는 판정기 자체가
+            # 아직 덜 잡혀 있어서 정상을 잘못 뺄 수 있다.
+            if self._calib_frozen and EXCLUDE_FLAGGED and flagged.any():
+                rest = train_mask & ~flagged
+                if int(rest.sum()) >= 8:
+                    train_mask = rest
+                    print(f"      ◦ 임계 초과 {int(flagged.sum())}창은 이번 학습에서 뺀다")
+                else:
+                    # 거의 전부가 넘으면 빼고 나서 학습할 창이 없다. 그러면
+                    # 라운드가 SKIP 되고 같은 창이 다시 들어와 멈춘다.
+                    # 이 라운드만 그대로 학습한다(기준은 고정이라 안 움직인다).
+                    print(f"      ⚠ {int(flagged.sum())}/{len(flagged)}창이 임계 초과 — "
+                          f"빼면 학습할 창이 모자라 이번엔 빼지 않는다")
+
+        # ── 정상 기준 창 ────────────────────────────────
+        if not self._calib_frozen:
+            keep = train_mask & ~flagged
+            if keep.any():
+                self._calib_X.append(X[keep])
+                self._calib_C.append(C[keep])
+            if round_num >= REF_FREEZE_ROUND:
+                self._calib_frozen = True
+                self._calib_frozen_round = round_num
+                n_ref = sum(len(a) for a in self._calib_X)
+                print(f"      ◦ 정상 기준 창 고정 (R{round_num}, {n_ref}창). "
+                      f"이후 기준·임계값은 이 창으로만 잡는다")
+        calib_X = (np.concatenate(self._calib_X) if self._calib_X else None)
+        calib_C = (np.concatenate(self._calib_C) if self._calib_C else None)
+
         n_train = int(train_mask.sum())
         n_label_anom = int((~label_ok).sum())
 
@@ -1262,7 +1322,25 @@ class MNAETrainer:
             "val_labels": (names != "normal").astype(np.int64),
             "from_cse": True,
             "robots": sorted(set(robot.tolist())),
+            # 기준·임계값용. 정규화는 지금 자로 다시 한다(원신호로 모았다).
+            "calib_signals": (self.norm.apply(calib_X)
+                              if calib_X is not None else None),
+            "calib_cond": calib_C,
         }
+
+    def _prescore_windows(self, Xn, C):
+        """직전 라운드 판정기로 채점한다. (점수, 임계값) 또는 None."""
+        det = self._detector
+        if det is None or len(Xn) == 0:
+            return None
+        thr = getattr(det, "threshold", None)
+        if thr is None:
+            return None
+        try:
+            return np.asarray(det.compute_anomaly_scores(Xn, C)), float(thr)
+        except Exception as e:
+            print(f"      ⚠ 학습 전 판정 실패(학습은 계속): {e}")
+            return None
 
     def _build_ae_node_from_data_dict(self, data_dict: dict) -> AEEdgeNode | None:
         """
@@ -1305,6 +1383,8 @@ class MNAETrainer:
             val_cond      = data_dict.get("val_cond"),
             train_run_id  = data_dict.get("train_run_id"),
             val_run_id    = data_dict.get("val_run_id"),
+            calib_signals = data_dict.get("calib_signals"),
+            calib_cond    = data_dict.get("calib_cond"),
         )
         return edge_node
 
@@ -1673,13 +1753,18 @@ class MNAETrainer:
         if node is None:
             return {}
 
-        try:
-            scores = node.compute_anomaly_scores(w["X"], w["C"])
-        except Exception as e:
-            print(f"    ⚠ 윈도우 점수 계산 실패(업로드는 계속): {e}")
-            return {}
-
-        thr = getattr(node, "threshold", None)
+        # 판정과 같은 점수를 보여 준다(학습 전, 직전 판정기). 첫 라운드처럼
+        # 판정기가 없을 때만 이번 모델로 매긴다.
+        if w.get("pre_scores") is not None:
+            scores = w["pre_scores"]
+            thr = w.get("pre_threshold")
+        else:
+            try:
+                scores = node.compute_anomaly_scores(w["X"], w["C"])
+            except Exception as e:
+                print(f"    ⚠ 윈도우 점수 계산 실패(업로드는 계속): {e}")
+                return {}
+            thr = getattr(node, "threshold", None)
         labels = w.get("labels")
         robots = w.get("robot")
 
@@ -1721,13 +1806,15 @@ class MNAETrainer:
         if not w or w["X"] is None or len(w["X"]) == 0:
             return 0
 
-        node = self.edge_node
-        threshold = getattr(node, "threshold", None)
-        if threshold is None:
+        # 학습 전에 직전 판정기로 매긴 점수만 쓴다. 이번 라운드에 학습한
+        # 모델로 같은 창을 채점하면 이상이 학습에 흡수돼 점수가 눌린다.
+        if w.get("pre_scores") is None:
+            print("  · 판정 보류 — 직전 라운드 판정기가 없다")
             return 0
+        scores = w["pre_scores"]
+        threshold = w["pre_threshold"]
 
         try:
-            scores = node.compute_anomaly_scores(w["X"], w["C"])
             return verdict.publish(
                 node_name=self.node_name,
                 cnt_path=self.verdict_cnt_path,
@@ -2122,8 +2209,11 @@ class MNAETrainer:
                 f"  val_auroc={val_auroc:.4f}"
             )
 
-            # 학습이 끝나 임계값이 갱신된 뒤에 판정한다.
+            # 판정은 이번 창을 학습 '전에' 직전 판정기로 매긴 점수로 한다
+            # (_prescore_windows). 이번에 학습·보정한 노드는 다음 라운드의
+            # 판정기가 된다.
             self._publish_verdicts(round_num)
+            self._detector = self.edge_node
 
             if self.upload_stagger_sec > 0:
                 time.sleep(self.upload_stagger_sec)
