@@ -16,7 +16,7 @@
 #   FL_SENSOR_MIN_WINDOWS=50     라운드당 사업장별 윈도우 수
 #   FL_SENSOR_BACKLOG_SEC=0      0 이면 쌓여 있는 것을 처음부터 전부 쓴다
 #                                양수면 그 초 이내 것만, 음수면 전부 건너뛴다
-#   FL_TRIM_RATIO=0.15           학습에서 손실 상위 몇 %를 뺄지. 0 이면 끔
+#   FL_TRIM_RATIO=0              학습에서 손실 상위 몇 %를 뺄지. 기본 0(끔)
 #   FL_TRIM_WARMUP_EPOCHS=2      그 전 몇 에폭은 자르지 않을지
 #   FL_LABEL_FOR_TRAIN=0         1 이면 정상 라벨만 학습(지도). 기본은 비지도
 #   FL_VERDICT=1                 0 이면 판정을 CSE 에 안 쓴다
@@ -27,7 +27,7 @@
 #   AMR_NORM_FREEZE_ROUND=5      다 안 모여도 이 라운드에 고정
 #   AMR_NORM_CLIP=10             표준화 뒤 |z| 상한. 0 이면 끔
 #
-#   예)  FL_TRIM_RATIO=0 ./run_fl.sh        절사 없이 돌려 A/B 비교
+#   예)  FL_TRIM_RATIO=0.15 ./run_fl.sh     절사를 켜고 돌려 A/B 비교
 #
 #   대시보드를 Isaac 대기보다 먼저 띄운다. 기다리는 동안 상태를 볼 수
 #   있어야 하기 때문이다. 마지막에 두면 로봇이 안 올라올 때 몇 분간
@@ -260,7 +260,7 @@ echo "[4/5] 학습 앱 기동 (사업장 3곳)"
 echo "  설정: 라운드 ${FL_GLOBAL_ROUNDS:-10}"\
 " · 라운드당 ${FL_SENSOR_MIN_WINDOWS:-50}윈도우"\
 " · 백로그 ${FL_SENSOR_BACKLOG_SEC:-0}s"\
-" · 절사 ${FL_TRIM_RATIO:-0.15}"\
+" · 절사 ${FL_TRIM_RATIO:-0}"\
 " · 라벨학습 ${FL_LABEL_FOR_TRAIN:-0}"
 
 # 셋이 한 터미널에 찍으면 줄이 뒤섞여 어느 노드 것인지 알기 어렵다.
