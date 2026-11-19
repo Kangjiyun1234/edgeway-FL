@@ -497,11 +497,11 @@ if (!window.Chart) {
       </div>
       <div class="node ok" id="nd-mn3">
         <div class="node-header">
-          <span class="node-name">mn3</span>
+          <span class="node-name">mn3 <span class="chart-unseen" title="Local only: fine-tunes the global model on its own normal data, never sees fault data, and does not send weights to FedAvg.">local only</span></span>
           <span class="fault-dot" id="fault-dot-mn3" title="Anomaly detected"></span>
           <span class="node-badge ok" id="nb-mn3">Monitoring</span>
         </div>
-        <div class="node-role">Site C · 2 robots · local only <span style="white-space:nowrap">(no FedAvg contribution)</span></div>
+        <div class="node-role">Site C · 2 robots · no FedAvg contribution</div>
         <div class="node-stat" id="ns-mn3">Waiting</div>
       </div>
     </div>
@@ -553,7 +553,7 @@ if (!window.Chart) {
 
       <div class="chart-card hl" id="cc-mn3">
         <div class="chart-head">
-          <span class="chart-name">mn3 <span class="chart-unseen" title="Takes part in training but has never trained on fault data. Fault verdicts come from the global model trained jointly with the other nodes.">unseen fault</span></span>
+          <span class="chart-name">mn3 <span class="chart-unseen" title="Local only: fine-tunes the global model on its own normal data, never sees fault data, and does not send weights to FedAvg.">local only</span></span>
           <span class="chart-tag" id="thr-mn3">threshold —</span>
         </div>
         <div class="live-val" id="lv-mn3">—</div>
