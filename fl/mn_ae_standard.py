@@ -88,6 +88,7 @@ class MNAETrainer:
         # 한 번 채워 두고 _refresh_telemetry() 가 실제 목록으로 바꾼다.
         self.robot_names = config.robot_names(self.node_name)
         self.telemetry_discovered = False
+        self._telemetry_added = []
         # 로봇별로 어디까지 읽었는지. 라운드마다 그 뒤만 읽는다.
         # 비워 두면 첫 라운드는 최근 분량을 받는다.
         self.telemetry_cursor = {}
@@ -499,7 +500,7 @@ class MNAETrainer:
     # ---------------------------
     # oneM2M ops
     # ---------------------------
-    def _subscribe_to_telemetry(self) -> int:
+    def _subscribe_to_telemetry(self, only=None) -> int:
         """
         이 사업장 로봇들의 telemetry 컨테이너에 구독을 건다.
 
@@ -528,6 +529,10 @@ class MNAETrainer:
         ok = 0
         print(f"\n  [{self.node_name}] 로봇 텔레메트리 구독")
         for robot, tel_path in zip(self.robot_names, self.telemetry_paths):
+            # 라운드 중 재탐색에서는 새로 생긴 로봇만 건다. 전부 지우고
+            # 다시 걸면 그 사이 알림을 놓치고, 수집 중인 라운드가 멈칫한다.
+            if only is not None and robot not in only:
+                continue
             if not om2m.resource_exists(tel_path):
                 print(f"    ⚠ {robot}: telemetry 없음 — 건너뜀")
                 continue
@@ -616,35 +621,29 @@ class MNAETrainer:
         if not getattr(config, "USE_DISCOVERY", True):
             return False
 
-        labels = config.telemetry_labels(self.node_name)
+        site = config.SITE_OF_NODE.get(self.node_name, self.node_name)
+        labels = [config.site_telemetry_label(self.node_name)] \
+            + config.telemetry_labels(self.node_name)
         try:
-            uril = om2m.discover_by_labels(
-                self.mn_cse_name, labels, ty=3, lim=200)
+            found = om2m.discover_telemetry(
+                self.mn_cse_name, site,
+                cnt_name=config.ROBOT_TELEMETRY_CNT,
+                type_label=config.LABEL_TYPE_TELEMETRY,
+                combined_label=config.site_telemetry_label(self.node_name),
+            )
         except Exception as e:
             if not quiet:
                 print(f"    ⚠ telemetry 디스커버리 실패(기존 경로 유지): {e}")
             return False
 
-        found = {}
-        for raw in uril:
-            parts = [x for x in om2m.strip_prefix(raw).split("/") if x]
-            if len(parts) < 2:
-                continue
-            # CSE 마다 돌려주는 형태가 다르다. '/<cse-id>/<cse-rn>/...' 처럼
-            # 앞에 뭐가 더 붙어 올 수 있어서 우리 CSE 이름부터 잘라 쓴다.
-            # 못 찾으면 로봇 AE 이름으로 직접 조립한다.
-            robot = parts[-2]
-            if self.mn_cse_name in parts:
-                i = parts.index(self.mn_cse_name)
-                path = "/".join(parts[i:])
-            else:
-                path = f"{self.mn_cse_name}/{robot}/{parts[-1]}"
-            found[robot] = path
-
         if not found:
             if not quiet and not self.telemetry_discovered:
-                print(f"    ⓘ 라벨 {labels} 로 찾은 telemetry 가 없다. "
-                      f"경로 조립으로 진행한다")
+                codes = ", ".join(str(c) for c in om2m.LAST_DISCOVERY_STATUS)
+                print(f"    ⓘ 라벨 {labels} 로 찾은 telemetry 가 없다 "
+                      f"(응답 {codes or '없음'}). 경로 조립으로 진행한다")
+                if any(c == 403 for c in om2m.LAST_DISCOVERY_STATUS):
+                    print(f"      403 이면 {self.ae_id} 에 CSEBase DISCOVERY "
+                          f"권한이 없는 것이다")
             return False
 
         robots = sorted(found)
@@ -658,6 +657,10 @@ class MNAETrainer:
                       f"-> 기존 경로 유지")
             return False
         changed = (robots != self.robot_names or paths != self.telemetry_paths)
+        # 새로 생겼거나 경로가 바뀐 로봇. 구독은 이것만 새로 건다.
+        before = dict(zip(self.robot_names, self.telemetry_paths))
+        self._telemetry_added = [r for r in robots
+                                 if before.get(r) != found[r]]
         if changed and not quiet:
             added = [r for r in robots if r not in self.robot_names]
             print(f"    ✓ 디스커버리: {len(robots)}대 "
@@ -925,8 +928,8 @@ class MNAETrainer:
 
         # 라운드마다 다시 찾는다. 중간에 올라온 로봇이 그 라운드부터
         # 들어오고, 빠진 로봇은 목록에서 사라진다.
-        if self._refresh_telemetry():
-            self._subscribe_to_telemetry()
+        if self._refresh_telemetry() and self._telemetry_added:
+            self._subscribe_to_telemetry(only=self._telemetry_added)
 
         # 라운드마다 사업장당 이만큼 모일 때까지 기다린다.
         # 상한(site_cap)과 같은 값이어야 라운드마다 정확히 같은 양이 된다.
@@ -995,6 +998,18 @@ class MNAETrainer:
 
             if n >= want_min:
                 break
+
+            # 조회를 10번(약 20초) 해도 하나도 없으면 컨테이너마다 CIN 이 몇 개 있는지
+            # 한 번 찍는다. cni 가 0 이면 아무도 안 쓰고 있는 것(Isaac 전송
+            # 또는 잘못 잡은 컨테이너)이고, cni 가 있는데 0 개면 읽는 쪽 문제다.
+            if (n == 0 and n_polls >= 10
+                    and not getattr(self, "_empty_diag_done", False)):
+                self._empty_diag_done = True
+                print(f"    [{self.node_name}] ⓘ 받은 윈도우가 없다. 컨테이너 상태:")
+                for _p in self.telemetry_paths:
+                    _r = (om2m.get_resource(_p) or {}).get("m2m:cnt") or {}
+                    print(f"      {_p}  cni={_r.get('cni', '?')}  "
+                          f"lbl={_r.get('lbl', [])}")
 
             now = time.time()
             if now >= deadline:
@@ -1861,7 +1876,11 @@ class MNAETrainer:
         print(f"\n=== {self.node_name.upper()} Trainer start (AE 버전) ===")
         print(f"  AE:           {self.ae_name}")
         print(f"  telemetry:    {len(self.telemetry_paths)}개 컨테이너 "
-              f"({', '.join(self.robot_names)})")
+              f"({'라벨 디스커버리' if self.telemetry_discovered else '경로 조립'})")
+        # 이름만 찍으면 엉뚱한 컨테이너(status, 우리 AE 의 컨테이너)를
+        # 잡았는지 알 수 없다. 경로를 그대로 찍는다.
+        for _p in self.telemetry_paths:
+            print(f"                {_p}")
         print(f"  local-model:  {self.local_model_path} (Edge cache)")
         print(f"  fl-control:   {self.fl_control_path}")
         print(f"  global-model: {self.global_model_path}")

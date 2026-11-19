@@ -149,6 +149,17 @@ def telemetry_labels(node: str):
     return [site_label(node), LABEL_TYPE_TELEMETRY]
 
 
+# 사업장과 종류를 한 라벨로 묶은 것. 'siteC:telemetry'
+# lbl 을 여러 개 주면 CSE 에 따라 OR 로 해석될 수 있어서 이걸 먼저 쓴다.
+# 자세한 이유는 onem2m_utils.discover_telemetry 주석.
+LABEL_SITE_TELEMETRY_FMT = os.getenv("FL_LBL_SITE_TELEMETRY", "{site}:telemetry")
+
+
+def site_telemetry_label(node: str) -> str:
+    """'siteC:telemetry'"""
+    return LABEL_SITE_TELEMETRY_FMT.format(site=SITE_OF_NODE.get(node, node))
+
+
 def resource_labels(node: str, kind: str):
     """우리가 만드는 리소스에 달 라벨. kind 는 'local-model' 같은 것."""
     return [site_label(node), f"type:{kind}", f"node:{node}"]

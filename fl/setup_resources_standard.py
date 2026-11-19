@@ -193,12 +193,16 @@ def verify_robot_aes(node: str) -> Dict[str, bool]:
     want = config.ROBOTS_PER_NODE.get(node, 0)
 
     # 먼저 라벨로 telemetry 컨테이너를 찾는다. 이름 규칙에 기대지 않는다.
-    labels = config.telemetry_labels(node)
-    tel_paths = {}
-    for raw in om2m.discover_by_labels(cse, labels, ty=3, lim=200):
-        parts = [x for x in om2m.strip_prefix(raw).split("/") if x]
-        if len(parts) >= 2:
-            tel_paths[parts[-2]] = om2m.strip_prefix(raw)
+    # 'siteC:telemetry' 로 먼저 찾고, 결과마다 lbl 을 다시 확인한다.
+    # 우리 컨테이너에도 site: 라벨이 붙어 있어 lbl 을 여러 개 주는 조회는
+    # CSE 가 OR 로 해석하면 그것까지 로봇으로 잡는다.
+    labels = [config.site_telemetry_label(node)] + config.telemetry_labels(node)
+    tel_paths = om2m.discover_telemetry(
+        cse, site,
+        cnt_name=config.ROBOT_TELEMETRY_CNT,
+        type_label=config.LABEL_TYPE_TELEMETRY,
+        combined_label=config.site_telemetry_label(node),
+    )
 
     if tel_paths:
         print(f"  라벨 디스커버리 {labels}: {len(tel_paths)}/{want}대")
@@ -211,7 +215,9 @@ def verify_robot_aes(node: str) -> Dict[str, bool]:
         return found
 
     # 라벨이 없으면 예전처럼 이름으로 찾는다(Isaac 이 아직 라벨을 안 다는 경우).
-    print(f"  ⓘ 라벨 {labels} 로 못 찾았다. 이름 규칙으로 되돌아간다")
+    codes = ", ".join(str(c) for c in om2m.LAST_DISCOVERY_STATUS)
+    print(f"  ⓘ 라벨 {labels} 로 못 찾았다 (응답 {codes or '없음'}). "
+          f"이름 규칙으로 되돌아간다")
     uril = om2m.discover(cse, ty=2, lim=200)
     robots = sorted({
         p.rstrip("/").split("/")[-1]
