@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AMR 바닥 이상 점검 — 연합학습</title>
+<title>AMR Floor Anomaly Monitor — Federated Learning</title>
 <script src="/vendor/chart.umd.js"></script>
 <script>
 // 로컬 파일이 없으면 CDN 으로 물러선다. 받아둔 PC 에서는 바깥으로 안 나간다.
@@ -57,11 +57,15 @@ if (!window.Chart) {
     padding: 24px;
   }
 
-  .root { max-width: 960px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+  /* 전체 화면 폭. 양옆 여백은 화면 폭에 비례(최소 16px, 최대 96px)하고 body 패딩 24px이 더해진다.
+     1920px 화면 기준 한쪽 약 120px. */
+  .root { margin: 0 auto; padding: 0 clamp(16px, 5vw, 96px); display: flex; flex-direction: column; gap: 14px; }
 
   .topbar { display: flex; justify-content: space-between; align-items: center; }
-  .logo-title { font-size: 17px; font-weight: 600; color: var(--text); letter-spacing: -0.02em; }
-  .logo-sub   { font-size: 12px; color: var(--text2); margin-top: 2px; }
+  .logo-title { font-size: 28.5px; font-weight: 600; color: var(--text); letter-spacing: -0.02em; }
+  .logo-sub   { font-size: 16px; color: var(--text2); position: relative; top: 4px; }
+  /* 부제는 타이틀 오른쪽, 글자 아랫선을 맞춘다. */
+  .logo { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
 
   .round-pill {
     display: flex; align-items: center; gap: 8px;
@@ -77,15 +81,21 @@ if (!window.Chart) {
     0%, 100% { opacity: 1; }
     50%       { opacity: 0.35; }
   }
-  .pill-label { font-size: 12px; font-weight: 500; color: var(--text); }
-  .pill-sub   { font-size: 11px; color: var(--text2); }
+  .pill-label { font-size: 14px; font-weight: 500; color: var(--text); }
+  .pill-sub   { font-size: 13px; color: var(--text2); }
 
   .section-label {
-    font-size: 10px; font-weight: 600; color: var(--text2);
+    font-size: 14px; font-weight: 600; color: var(--text2);
     letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 8px;
   }
 
-  .nodes-row { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; }
+  .nodes-row { display: grid; grid-template-columns: repeat(3, 313px); gap: 10px; }
+  /* 맨 위: Edge nodes 라벨 → 노드 카드 3장 → 라운드 진행. 왼쪽 정렬.
+     아래 차트 줄과 같은 3칸 격자를 써서, 라운드 진행은 mn1~mn2 차트 폭(2칸)에 맞춘다. */
+  .top-row { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); column-gap: 10px; }
+  .top-row > .section-label,
+  .top-row > .nodes-row     { grid-column: 1 / -1; }
+  .top-row > .progress-wrap { grid-column: span 2; margin-top: 10px; }
 
   .node {
     background: var(--bg);
@@ -105,8 +115,8 @@ if (!window.Chart) {
   .node.fault::before     { background: var(--fd-bar); }
 
   .node-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px; }
-  .node-name   { font-size: 20px; font-weight: 600; color: var(--text); }
-  .node-badge  { font-size: 10px; font-weight: 600; padding: 3px 8px; border-radius: 10px; }
+  .node-name   { font-size: 22px; font-weight: 600; color: var(--text); }
+  .node-badge  { font-size: 12px; font-weight: 600; padding: 3px 8px; border-radius: 10px; }
   .node-badge.ok       { background: var(--ok-bg); color: var(--ok-text); }
   .node-badge.training { background: var(--tr-bg); color: var(--tr-text); }
   .node-badge.fault    { background: var(--fd-bg); color: var(--fd-text); }
@@ -133,34 +143,46 @@ if (!window.Chart) {
   @media (prefers-reduced-motion: reduce) {
     .fault-dot.show { animation: none; opacity: 1; }
   }
-  .node-role { font-size: 11px; color: var(--text2); margin-bottom: 4px; }
-  .node-stat { font-size: 11px; color: var(--text3); }
+  .node-role { font-size: 14px; color: var(--text2); margin-bottom: 4px; word-break: keep-all; }
+  .node-stat { font-size: 14px; color: var(--text3); }
 
   .progress-wrap {
     background: var(--bg); border: 0.5px solid var(--border);
     border-radius: var(--radius-lg); padding: 16px 18px;
   }
   .round-info { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-  .round-num  { font-size: 26px; font-weight: 600; color: var(--text); }
-  .round-of   { font-size: 13px; color: var(--text2); margin-left: 4px; }
+  .round-num  { font-size: 28px; font-weight: 600; color: var(--text); }
+  .round-of   { font-size: 15px; color: var(--text2); margin-left: 4px; }
   .phase-label {
-    font-size: 11px; color: var(--text2);
+    font-size: 13px; color: var(--text2);
     padding: 3px 10px; border: 0.5px solid var(--border2); border-radius: 10px;
   }
   .track  { height: 6px; background: var(--bg3); border-radius: 3px; overflow: hidden; margin-bottom: 10px; }
   .fill   { height: 100%; border-radius: 3px; background: var(--tr-bar); transition: width 0.6s cubic-bezier(.4,0,.2,1), background 0.4s; }
   .dots   { display: flex; gap: 6px; flex-wrap: wrap; }
   .dot {
-    width: 22px; height: 22px; border-radius: 50%;
+    width: 26px; height: 26px; border-radius: 50%;
     border: 0.5px solid var(--border2);
     display: flex; align-items: center; justify-content: center;
-    font-size: 10px; color: var(--text2); transition: all 0.3s;
+    font-size: 12px; color: var(--text2); transition: all 0.3s;
   }
   .dot.done { background: var(--ok-bar);  border-color: var(--ok-bar);  color: #fff; }
   .dot.cur  { background: var(--tr-bg);   border-color: var(--tr-bar);  color: var(--tr-text); font-weight: 600; }
   .dot.bad  { background: var(--fd-bar);  border-color: var(--fd-bar);  color: #fff; }
 
-  .charts-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; }
+  /* align-items:start — mn3 아래 경고가 붙어도 mn1·mn2 카드는 제 높이를 유지한다. */
+  .charts-grid { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; align-items: start; }
+  /* 아래 줄도 차트 줄과 같은 3칸: 글로벌 loss 는 mn1 아래 1칸, 검증셋 표는 mn2~mn3 아래 2칸. */
+  .bottom-grid { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; }
+  /* 검증셋 표는 줄 수와 상관없이 loss 카드 높이에 맞춘다. contain:size 라 행 높이를 키우지 않고,
+     넘치는 줄은 표 안에서 스크롤한다. 처음부터 빈 표(열 이름만)로 같은 크기를 차지한다. */
+  .bottom-grid > .evallog { grid-column: span 2; display: flex; flex-direction: column; contain: size; }
+  .bottom-grid > .evallog .evallog-body { flex: 1; min-height: 0; max-height: none; }
+  /* 높이 맞춤. mn 카드 = 머리 + 값 + AUROC 줄 + 그래프, loss 카드 = 머리 + 값 + 그래프.
+     loss 그래프를 AUROC 줄(높이 + 아래 여백 8px)만큼 더 키워 두 카드 높이를 같게 한다. */
+  :root { --node-plot-h: 217px; --auroc-h: 18px; }
+  .node-plot { position: relative; height: var(--node-plot-h); }
+  .loss-plot { position: relative; height: calc(var(--node-plot-h) + var(--auroc-h) + 8px); }
 
   .chart-card {
     background: var(--bg); border: 0.5px solid var(--border);
@@ -171,14 +193,14 @@ if (!window.Chart) {
   .chart-card.hl-red { border-color: var(--fault-line); border-width: 1px; }
 
   .chart-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
-  .chart-name { font-size: 13px; font-weight: 600; color: var(--text); }
-  .chart-unseen { font-size: 10px; font-weight: 500; color: var(--tr-bar); margin-left: 4px; }
-  .chart-tag  { font-size: 10px; color: var(--text3); }
-  .live-val   { font-size: 20px; font-weight: 600; color: var(--text); margin-bottom: 8px; transition: color 0.3s; }
+  .chart-name { font-size: 22px; font-weight: 600; color: var(--text); }
+  .chart-unseen { font-size: 12px; font-weight: 500; color: var(--tr-bar); margin-left: 4px; }
+  .chart-tag  { font-size: 12px; color: var(--text3); }
+  .live-val   { font-size: 22px; font-weight: 600; color: var(--text); margin-bottom: 8px; transition: color 0.3s; }
   .live-val.danger { color: #a32d2d; }
 
-  .auroc-row { display: flex; gap: 12px; margin-bottom: 8px; }
-  .auroc-chip { font-size: 10px; color: var(--text2); }
+  .auroc-row { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; height: var(--auroc-h); }
+  .auroc-chip { font-size: 12px; color: var(--text2); }
   .auroc-chip span { font-weight: 600; color: var(--text); }
 
   /* ── 상단 고정 배너 ── */
@@ -198,13 +220,13 @@ if (!window.Chart) {
     from { transform: translateY(-100%); opacity: 0; }
     to   { transform: translateY(0);     opacity: 1; }
   }
-  .banner-icon { font-size: 18px; flex-shrink: 0; }
+  .banner-icon { font-size: 20px; flex-shrink: 0; }
   .banner-main { flex: 1; }
-  .banner-title { font-size: 13px; font-weight: 700; letter-spacing: -0.01em; }
-  .banner-detail { font-size: 11px; opacity: 0.85; margin-top: 1px; }
+  .banner-title { font-size: 15px; font-weight: 700; letter-spacing: -0.01em; }
+  .banner-detail { font-size: 13px; opacity: 0.85; margin-top: 1px; }
   .banner-close {
     background: none; border: none; color: #fff; cursor: pointer;
-    font-size: 18px; opacity: 0.7; padding: 0 4px; line-height: 1;
+    font-size: 20px; opacity: 0.7; padding: 0 4px; line-height: 1;
   }
   .banner-close:hover { opacity: 1; }
 
@@ -236,13 +258,13 @@ if (!window.Chart) {
   }
   .alert-strip.show { display: flex; }
   .alert-strip-top { display: flex; align-items: center; justify-content: space-between; }
-  .alert-text { font-size: 12px; font-weight: 700; color: var(--fd-text); }
+  .alert-text { font-size: 14px; font-weight: 700; color: var(--fd-text); }
   .alert-chip {
-    font-size: 10px; background: var(--fault-line); color: #fff;
+    font-size: 12px; background: var(--fault-line); color: #fff;
     padding: 2px 8px; border-radius: 8px; font-weight: 700;
     animation: pulse 0.8s ease-in-out infinite;
   }
-  .alert-detail { font-size: 10px; color: var(--fd-text); opacity: 0.75; line-height: 1.5; }
+  .alert-detail { font-size: 12px; color: var(--fd-text); opacity: 0.75; line-height: 1.5; }
 
   /* ── Summary 모달 ── */
   .summary-overlay {
@@ -257,7 +279,7 @@ if (!window.Chart) {
   .summary-modal {
     background: var(--bg); border-radius: var(--radius-lg);
     border: 0.5px solid var(--border2); padding: 28px 28px 22px;
-    max-width: 700px; width: 100%;
+    max-width: 860px; width: 100%;
     max-height: 88vh; overflow-y: auto;
     box-shadow: 0 20px 60px rgba(0,0,0,0.30);
   }
@@ -265,11 +287,11 @@ if (!window.Chart) {
     display: flex; justify-content: space-between; align-items: flex-start;
     margin-bottom: 20px;
   }
-  .summary-title { font-size: 17px; font-weight: 700; color: var(--text); }
-  .summary-sub   { font-size: 12px; color: var(--text2); margin-top: 3px; }
+  .summary-title { font-size: 19px; font-weight: 700; color: var(--text); }
+  .summary-sub   { font-size: 14px; color: var(--text2); margin-top: 3px; }
   .summary-close {
     background: none; border: none; color: var(--text2); cursor: pointer;
-    font-size: 20px; padding: 0; line-height: 1;
+    font-size: 22px; padding: 0; line-height: 1;
   }
   .summary-close:hover { color: var(--text); }
 
@@ -278,13 +300,13 @@ if (!window.Chart) {
     background: var(--bg2); border-radius: var(--radius-md);
     border: 0.5px solid var(--border); padding: 14px;
   }
-  .summary-node-name { font-size: 13px; font-weight: 700; color: var(--text); margin-bottom: 10px; }
-  .summary-row { display: flex; justify-content: space-between; align-items: center; font-size: 11px; margin-bottom: 5px; }
+  .summary-node-name { font-size: 15px; font-weight: 700; color: var(--text); margin-bottom: 10px; }
+  .summary-row { display: flex; justify-content: space-between; align-items: center; font-size: 13px; margin-bottom: 5px; }
   .summary-key { color: var(--text2); }
   .summary-val { font-weight: 600; color: var(--text); }
   .summary-val.good { color: var(--ok-bar); }
   .summary-val.warn { color: #e24b4a; }
-  .summary-footer { font-size: 10px; color: var(--text3); text-align: right; }
+  .summary-footer { font-size: 12px; color: var(--text3); text-align: right; }
   .summary-global {
     border: 0.5px solid var(--border); border-radius: var(--radius-lg);
     padding: 12px 14px; margin-bottom: 12px; background: var(--bg);
@@ -293,18 +315,18 @@ if (!window.Chart) {
     display: flex; align-items: baseline; justify-content: space-between;
     margin-bottom: 10px;
   }
-  .summary-global-title { font-size: 12px; font-weight: 700; color: var(--text); }
-  .summary-global-sub { font-size: 10px; color: var(--text3); }
+  .summary-global-title { font-size: 14px; font-weight: 700; color: var(--text); }
+  .summary-global-sub { font-size: 12px; color: var(--text3); }
   .summary-metrics {
     display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;
     font-variant-numeric: tabular-nums;
   }
-  .summary-metric-k { font-size: 10px; color: var(--text2); margin-bottom: 2px; }
-  .summary-metric-v { font-size: 16px; font-weight: 700; color: var(--text); }
+  .summary-metric-k { font-size: 12px; color: var(--text2); margin-bottom: 2px; }
+  .summary-metric-v { font-size: 18px; font-weight: 700; color: var(--text); }
   .summary-metric-v.good { color: var(--ok-bar); }
   .summary-metric-v.warn { color: #e24b4a; }
   .summary-note {
-    font-size: 10px; color: var(--text3); font-style: italic;
+    font-size: 12px; color: var(--text3); font-style: italic;
     margin-top: 8px; line-height: 1.5;
   }
 
@@ -313,7 +335,7 @@ if (!window.Chart) {
     background: var(--bg); border: 0.5px solid var(--border);
     border-radius: var(--radius-lg); padding: 12px 16px;
   }
-  .conn-label { font-size: 12px; font-weight: 500; color: var(--text2); }
+  .conn-label { font-size: 14px; font-weight: 500; color: var(--text2); }
 
   /* 라운드별 평가 로그. 고정 검증셋으로 잰 값이 여기에 쌓인다.
      배경·테두리·글꼴은 차트 카드와 같은 토큰을 쓴다. 전에는 정의되지
@@ -324,38 +346,53 @@ if (!window.Chart) {
   }
   .evallog-head { padding: 13px 16px; border-bottom: 0.5px solid var(--border);
                   display: flex; justify-content: space-between; align-items: baseline; }
-  .evallog-title { font-size: 13px; font-weight: 600; color: var(--text); }
-  .evallog-sub  { font-size: 10px; font-weight: 500; color: var(--text3); }
+  .evallog-title { font-size: 22px; font-weight: 600; color: var(--text); }
+  .evallog-sub  { font-size: 12px; font-weight: 500; color: var(--text3); }
   /* 고정폭 글꼴을 쓰지 않는다. 숫자만 등폭으로 두고 열은 그리드로 맞춘다. */
-  .evallog-body { max-height: 176px; overflow-y: auto; padding: 6px 0;
+  .evallog-body { max-height: 250px; overflow-y: auto; padding: 6px 0;
                   font-variant-numeric: tabular-nums; }
-  .evallog-body .row {
-    display: grid; grid-template-columns: 34px 112px 92px 104px 1fr;
-    gap: 10px; padding: 4px 16px;
-    font-size: 12px; color: var(--text2);
+  .evallog-body .row,
+  .evallog-cols {
+    display: grid;
+    /* 열 폭 비율 = (열 이름과 값 중 긴 쪽 글자 수) + 6. 글자 길이에 비례하게 나누고,
+       +6 은 열 사이 여백 몫이라 짧은 열도 너무 붙지 않는다.
+       Round 5 · AUROC 6(0.8060) · Detected / anomaly 18 · False alarm / normal 20 · Mean score (normal vs anomaly) 30 */
+    grid-template-columns: minmax(0,11fr) minmax(0,12fr) minmax(0,24fr) minmax(0,26fr) minmax(0,36fr);
+    gap: 8px; padding: 5px 16px; white-space: nowrap;
+    font-size: 15px; color: var(--text2);
+  }
+  /* 종류별 열(bearing·floor·wknob …)은 왼쪽 합계 열과 세로선으로 나눈다. */
+  .evallog-body .row > span, .evallog-cols > span { overflow: hidden; text-overflow: ellipsis; }
+  /* 열 이름 줄. 스크롤 영역 밖에 있어서 항상 위에 보인다. */
+  .evallog-cols {
+    padding-top: 7px; padding-bottom: 6px; border-bottom: 0.5px solid var(--border);
+    font-size: 12px; font-weight: 600; color: var(--text3); letter-spacing: 0.02em;
   }
   /* 맨 위가 최신 라운드다. 한 톤 진하게 둔다. */
   .evallog-body .row:first-child { color: var(--text); }
   .evallog-body .row b { color: var(--text); font-weight: 600; }
-  .evallog-body .empty { padding: 10px 16px; color: var(--text3); font-size: 11px; }
-  /* 이상 종류별 줄. 종류마다 난이도가 달라서 합친 AUROC 하나만 보면
-     어느 쪽이 안 되는지 안 보인다. 해당 라운드 줄 바로 아래에 붙인다. */
-  .evallog-body .subrow {
-    display: flex; flex-wrap: wrap; gap: 4px 10px;
-    padding: 0 16px 5px 50px; font-size: 11px; color: var(--text3);
-    font-variant-numeric: tabular-nums;
-  }
-  .evallog-body .subrow i { font-style: normal; color: var(--text2); }
-  .evallog-body .subrow b { color: var(--text2); font-weight: 600; }
+  .evallog-body .empty { padding: 10px 16px; color: var(--text3); font-size: 13px; }
   .sep { flex: 1; }
   .btn {
-    font-size: 12px; padding: 6px 14px;
+    font-size: 14px; padding: 6px 14px;
     border: 0.5px solid var(--border2);
     border-radius: var(--radius-md);
     background: var(--bg2); color: var(--text);
     cursor: pointer; transition: background 0.15s; font-weight: 500;
   }
   .btn:hover { background: var(--bg3); }
+
+  @media (max-width: 1200px) {
+    .top-row > .progress-wrap { grid-column: 1 / -1; }
+    .nodes-row { grid-template-columns: repeat(3, minmax(0,1fr)); }
+  }
+
+  @media (max-width: 1200px) {
+    .bottom-grid { grid-template-columns: minmax(0,1fr); }
+    .bottom-grid > .evallog { grid-column: auto; contain: none; }
+    .bottom-grid > .evallog .evallog-body { flex: none; height: 250px; }
+    .loss-plot { height: 160px; }
+  }
 
   @media (max-width: 760px) {
     body { padding: 16px; }
@@ -365,7 +402,7 @@ if (!window.Chart) {
     }
     .round-pill { width: 100%; }
     .sep { display: none; }
-    .nodes-row, .charts-grid, .summary-grid {
+    .nodes-row, .charts-grid, .bottom-grid, .summary-grid {
       grid-template-columns: 1fr;
     }
     .summary-modal { padding: 20px 18px 18px; }
@@ -378,10 +415,10 @@ if (!window.Chart) {
 <div class="fault-banner" id="fault-banner">
   <span class="banner-icon">⚠</span>
   <div class="banner-main">
-    <div class="banner-title" id="banner-title">바닥 이상 감지 — 사업장 C</div>
+    <div class="banner-title" id="banner-title">Floor anomaly detected — Site C</div>
     <div class="banner-detail" id="banner-detail">Anomaly confirmed</div>
   </div>
-  <button class="banner-close" id="banner-close" title="닫기">✕</button>
+  <button class="banner-close" id="banner-close" title="Close">✕</button>
 </div>
 
 <!-- Summary 모달 -->
@@ -397,8 +434,7 @@ if (!window.Chart) {
     <div class="summary-global" id="summary-global"></div>
     <div class="summary-grid" id="summary-grid"></div>
     <div class="summary-footer">
-      Per-node figures are live stream: no labels, so no AUROC there.<br>
-      Threshold = median + 3 · MAD · 1.4826 &nbsp;·&nbsp; Detection: K=3 consecutive exceedances
+      Threshold = median + 8 · MAD · 1.4826 &nbsp;·&nbsp; Verdict: 3 consecutive exceedances
     </div>
   </div>
 </div>
@@ -407,8 +443,8 @@ if (!window.Chart) {
 
   <!-- 헤더 -->
   <div class="topbar">
-    <div>
-      <div class="logo-title">AMR 바닥 이상 점검</div>
+    <div class="logo">
+      <div class="logo-title">AMR Floor Anomaly Monitor</div>
       <div class="logo-sub">Federated Learning · oneM2M · ETSI MEC · CVAE1D</div>
     </div>
     <div class="round-pill">
@@ -418,8 +454,8 @@ if (!window.Chart) {
     </div>
   </div>
 
-  <!-- 노드 상태 -->
-  <div>
+  <!-- 맨 위 줄: 노드 상태 + 라운드 진행 -->
+  <div class="top-row">
     <div class="section-label">Edge nodes</div>
     <div class="nodes-row">
       <div class="node ok" id="nd-mn1">
@@ -427,40 +463,40 @@ if (!window.Chart) {
           <span class="node-name">mn1</span>
           <span class="node-badge ok" id="nb-mn1">Normal</span>
         </div>
-        <div class="node-role">사업장 A · 로봇 4대 · 집계 참여</div>
-        <div class="node-stat" id="ns-mn1">대기 중</div>
+        <div class="node-role">Site A · 4 robots · in aggregation</div>
+        <div class="node-stat" id="ns-mn1">Waiting</div>
       </div>
       <div class="node ok" id="nd-mn2">
         <div class="node-header">
           <span class="node-name">mn2</span>
           <span class="node-badge ok" id="nb-mn2">Normal</span>
         </div>
-        <div class="node-role">사업장 B · 로봇 2대 · 집계 참여</div>
-        <div class="node-stat" id="ns-mn2">대기 중</div>
+        <div class="node-role">Site B · 2 robots · in aggregation</div>
+        <div class="node-stat" id="ns-mn2">Waiting</div>
       </div>
       <div class="node ok" id="nd-mn3">
         <div class="node-header">
           <span class="node-name">mn3</span>
-          <span class="fault-dot" id="fault-dot-mn3" title="이상 감지"></span>
+          <span class="fault-dot" id="fault-dot-mn3" title="Anomaly detected"></span>
           <span class="node-badge ok" id="nb-mn3">Monitoring</span>
         </div>
-        <div class="node-role">사업장 C · 로봇 2대 · 로컬 전용(FedAvg 미기여)</div>
-        <div class="node-stat" id="ns-mn3">대기 중</div>
+        <div class="node-role">Site C · 2 robots · local only <span style="white-space:nowrap">(no FedAvg contribution)</span></div>
+        <div class="node-stat" id="ns-mn3">Waiting</div>
       </div>
     </div>
-  </div>
 
-  <!-- 라운드 진행 -->
-  <div class="progress-wrap">
-    <div class="round-info">
-      <div>
-        <span class="round-num" id="rnum">0</span>
-        <span class="round-of" id="rof">/ — rounds</span>
+    <!-- 라운드 진행 -->
+    <div class="progress-wrap">
+      <div class="round-info">
+        <div>
+          <span class="round-num" id="rnum">0</span>
+          <span class="round-of" id="rof">/ — rounds</span>
+        </div>
+        <span class="phase-label" id="phase-label">Waiting for FL…</span>
       </div>
-      <span class="phase-label" id="phase-label">Waiting for FL…</span>
+      <div class="track"><div class="fill" id="rfill" style="width:0%"></div></div>
+      <div class="dots" id="dots"></div>
     </div>
-    <div class="track"><div class="fill" id="rfill" style="width:0%"></div></div>
-    <div class="dots" id="dots"></div>
   </div>
 
   <!-- 차트 -->
@@ -478,7 +514,7 @@ if (!window.Chart) {
           <span class="auroc-chip">AUROC <span id="au-mn1">—</span></span>
           <span class="auroc-chip">val_loss <span id="vl-mn1">—</span></span>
         </div>
-        <div style="position:relative;height:100px;"><canvas id="c-mn1"></canvas></div>
+        <div class="node-plot"><canvas id="c-mn1"></canvas></div>
       </div>
 
       <div class="chart-card hl" id="cc-mn2">
@@ -491,12 +527,12 @@ if (!window.Chart) {
           <span class="auroc-chip">AUROC <span id="au-mn2">—</span></span>
           <span class="auroc-chip">val_loss <span id="vl-mn2">—</span></span>
         </div>
-        <div style="position:relative;height:100px;"><canvas id="c-mn2"></canvas></div>
+        <div class="node-plot"><canvas id="c-mn2"></canvas></div>
       </div>
 
       <div class="chart-card hl" id="cc-mn3">
         <div class="chart-head">
-          <span class="chart-name">mn3 <span class="chart-unseen" title="학습에는 참여하지만 고장 데이터는 한 번도 학습하지 않은 노드. 고장 판정은 다른 노드와 함께 학습한 글로벌 모델이 수행한다.">unseen fault</span></span>
+          <span class="chart-name">mn3 <span class="chart-unseen" title="Takes part in training but has never trained on fault data. Fault verdicts come from the global model trained jointly with the other nodes.">unseen fault</span></span>
           <span class="chart-tag" id="thr-mn3">threshold —</span>
         </div>
         <div class="live-val" id="lv-mn3">—</div>
@@ -504,37 +540,43 @@ if (!window.Chart) {
           <span class="auroc-chip">AUROC <span id="au-mn3">—</span></span>
           <span class="auroc-chip">val_loss <span id="vl-mn3">—</span></span>
         </div>
-        <div style="position:relative;height:100px;"><canvas id="c-mn3"></canvas></div>
+        <div class="node-plot"><canvas id="c-mn3"></canvas></div>
         <div class="alert-strip" id="alert-strip">
           <div class="alert-strip-top">
             <span class="alert-text">⚠ Fault Detected</span>
             <span class="alert-chip">ALERT</span>
           </div>
-          <div class="alert-detail" id="alert-detail">분석 중…</div>
+          <div class="alert-detail" id="alert-detail">Analyzing…</div>
         </div>
-      </div>
-
-      <div class="chart-card" id="cc-loss">
-        <div class="chart-head">
-          <span class="chart-name">Global train loss</span>
-          <span class="chart-tag">FedAvg convergence</span>
-        </div>
-        <div class="live-val" id="lv-loss">—</div>
-        <div style="position:relative;height:100px;"><canvas id="c-loss"></canvas></div>
       </div>
 
     </div>
   </div>
 
-  <!-- 라운드별 평가 로그 -->
-  <div class="evallog">
-    <div class="evallog-head">
-      <span class="evallog-title">ROUND EVALUATION — 고정 검증셋</span>
-      <span class="evallog-sub" id="evallog-meta">대기 중</span>
+  <!-- 글로벌 loss + 라운드별 평가 로그 -->
+  <div class="bottom-grid">
+
+    <div class="chart-card" id="cc-loss">
+      <div class="chart-head">
+        <span class="chart-name">Global train loss</span>
+        <span class="chart-tag">FedAvg convergence</span>
+      </div>
+      <div class="live-val" id="lv-loss">—</div>
+      <div class="loss-plot"><canvas id="c-loss"></canvas></div>
     </div>
-    <div class="evallog-body" id="evallog-body">
-      <div class="empty">집계가 끝나면 라운드마다 한 줄씩 쌓입니다.</div>
+
+    <!-- 라운드별 평가 로그 -->
+    <div class="evallog">
+      <div class="evallog-head">
+        <span class="evallog-title">ROUND EVALUATION — Fixed validation set</span>
+        <span class="evallog-sub" id="evallog-meta">Waiting</span>
+      </div>
+      <div class="evallog-cols" id="evallog-cols">
+        <span>Round</span><span>AUROC</span><span>Detected / anomaly</span><span>False alarm / normal</span><span>Mean score (normal vs anomaly)</span>
+      </div>
+      <div class="evallog-body" id="evallog-body"></div>
     </div>
+
   </div>
 
   <!-- 연결 상태 바 -->
@@ -580,7 +622,7 @@ function mkNodeChart(id, color) {
         x: { display: false },
         y: {
           min: 0, suggestedMax: 1.0,
-          ticks: { font: { size: 9 }, color: tickColor, maxTicksLimit: 4 },
+          ticks: { font: { size: 11 }, color: tickColor, maxTicksLimit: 4 },
           grid: { color: gridColor, drawBorder: false },
         },
       },
@@ -606,13 +648,13 @@ function mkLossChart() {
       responsive: true, maintainAspectRatio: false, animation: false,
       plugins: { legend: { display: false } },
       scales: {
-        x: { ticks: { font: { size: 9 }, color: tickColor }, grid: { display: false } },
+        x: { ticks: { font: { size: 11 }, color: tickColor }, grid: { display: false } },
         y: {
           // 값에 맞춰 축을 잡는다. 예전에는 suggestedMax 1.5 로 고정돼 있어
           // 손실이 0.05~0.15 로 내려오면 바닥에 붙은 직선으로 보였다.
           // grace 로 위쪽에 15% 여유를 둔다.
           beginAtZero: true, grace: '15%',
-          ticks: { font: { size: 9 }, color: tickColor, maxTicksLimit: 5 },
+          ticks: { font: { size: 11 }, color: tickColor, maxTicksLimit: 5 },
           grid: { color: gridColor, drawBorder: false },
         },
       },
@@ -767,9 +809,9 @@ function updateWarmupDot(round) {
   dot.classList.add('show');
   dot.classList.toggle('calm', !warmupRed);
   dot.title = warmupRed
-    ? `안정화 중 (R${round}/${verdictStartRound - 1}) — 신호가 잡혔지만 모델이 `
-      + '덜 자란 구간이라 경보로 올리지 않는다'
-    : `안정화 중 (R${round}/${verdictStartRound - 1})`;
+    ? `Warming up (R${round}/${verdictStartRound - 1}) — signal seen, but the model is still `
+      + 'immature here, so no alarm is raised'
+    : `Warming up (R${round}/${verdictStartRound - 1})`;
 }
 
 function applyState(evt) {
@@ -1001,27 +1043,18 @@ function renderGlobalEval(ev) {
       </div>
       <div>
         <div class="summary-metric-k">Detected</div>
-        <div class="summary-metric-v">${textOrDash(det)} / ${textOrDash(nAn)}<span style="font-size:11px;font-weight:500;color:var(--text3);"> &nbsp;${recall}</span></div>
+        <div class="summary-metric-v">${textOrDash(det)} / ${textOrDash(nAn)}<span style="font-size:13px;font-weight:500;color:var(--text3);"> &nbsp;${recall}</span></div>
       </div>
       <div>
         <div class="summary-metric-k">False alarms</div>
-        <div class="summary-metric-v">${textOrDash(fa)} / ${textOrDash(nNo)}<span style="font-size:11px;font-weight:500;color:var(--text3);"> &nbsp;${faRate}</span></div>
+        <div class="summary-metric-v">${textOrDash(fa)} / ${textOrDash(nNo)}<span style="font-size:13px;font-weight:500;color:var(--text3);"> &nbsp;${faRate}</span></div>
       </div>
       <div>
         <div class="summary-metric-k">Normal vs anomaly</div>
-        <div class="summary-metric-v">${fmt(mNo, 2)} &rarr; ${fmt(mAn, 2)}<span style="font-size:11px;font-weight:500;color:var(--text3);"> &nbsp;&Delta;${fmt(sep, 2)}</span></div>
+        <div class="summary-metric-v">${fmt(mNo, 2)} &rarr; ${fmt(mAn, 2)}<span style="font-size:13px;font-weight:500;color:var(--text3);"> &nbsp;&Delta;${fmt(sep, 2)}</span></div>
       </div>
     </div>
-    ${faultChips(ev.by_fault)
-        ? `<div class="summary-note" style="padding-bottom:0;">
-             종류별 AUROC (탐지/창) &nbsp; ${faultChips(ev.by_fault)
-                 .replace(/<span>/g, '<span style="margin-right:14px;">')}
-           </div>`
-        : ''}
-    <div class="summary-note">
-      Threshold ${fmt(thr, 4)} &middot; median + 3 &middot; MAD &middot; 1.4826.
-      Labelled set, so these are the only AUROC / false-alarm figures on this page.
-    </div>`;
+    <div class="summary-note">Threshold ${fmt(thr, 4)}</div>`;
 }
 
 function handleSummary(evt) {
@@ -1052,8 +1085,8 @@ function handleSummary(evt) {
     card.className = 'summary-node-card';
 
     const roleTag = isFaultNode
-      ? `<span style="font-size:10px;color:var(--warn);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Fault Transition</span>`
-      : `<span style="font-size:10px;color:var(--text3);font-weight:600;letter-spacing:.05em;">정상</span>`;
+      ? `<span style="font-size:12px;color:var(--warn);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Fault Transition</span>`
+      : `<span style="font-size:12px;color:var(--text3);font-weight:600;letter-spacing:.05em;">Normal</span>`;
 
     const exceedPct = (exceed !== null && nWindows)
       ? ` <span style="color:var(--text3);font-weight:500;">(${(exceed / nWindows * 100).toFixed(1)}%)</span>`
@@ -1116,12 +1149,6 @@ function handleSummary(evt) {
       </div>`;
     }
 
-    if (!isFaultNode) {
-      rows += `
-      <div class="summary-row" style="margin-top:8px;">
-        <span class="summary-key" style="color:var(--text3);font-style:italic;font-size:11px;">Contributes to global model stability — fault detection not targeted</span>
-      </div>`;
-    }
 
     card.innerHTML = rows;
     grid.appendChild(card);
@@ -1197,17 +1224,6 @@ function connect() {
 // ───────────────────────────────────────────────────
 const evalSeen = new Set();
 
-// by_fault = { floor: {auroc, detected, n}, ... }. 없으면 빈 문자열.
-function faultChips(byFault) {
-  if (!byFault || typeof byFault !== 'object') return '';
-  return Object.keys(byFault).sort().map(k => {
-    const v = byFault[k] || {};
-    const a = Number(v.auroc);
-    return `<span><i>${k}</i> <b>${isFinite(a) ? a.toFixed(3) : '—'}</b>` +
-           ` ${v.detected}/${v.n}</span>`;
-  }).join('');
-}
-
 function handleEval(e) {
   if (e.round == null || evalSeen.has(e.round)) return;
   evalSeen.add(e.round);
@@ -1220,25 +1236,15 @@ function handleEval(e) {
   row.className = 'row';
   row.innerHTML =
     `<span>R${e.round}</span>` +
-    `<span>AUROC <b>${Number(e.auroc).toFixed(4)}</b></span>` +
-    `<span>탐지 <b>${e.detected}</b>/${e.n_anomaly}</span>` +
-    `<span>오경보 <b>${e.false_alarms}</b>/${e.n_normal}</span>` +
-    `<span>정상 ${Number(e.mean_normal).toFixed(3)} ` +
-    `vs 이상 ${Number(e.mean_anomaly).toFixed(3)}</span>`;
+    `<span><b>${Number(e.auroc).toFixed(4)}</b></span>` +
+    `<span><b>${e.detected}</b> / ${e.n_anomaly}</span>` +
+    `<span><b>${e.false_alarms}</b> / ${e.n_normal}</span>` +
+    `<span>${Number(e.mean_normal).toFixed(3)} vs ${Number(e.mean_anomaly).toFixed(3)}</span>`;
   // 최신이 위로 오게 맨 앞에 꽂는다.
   body.insertBefore(row, body.firstChild);
 
-  // 종류별 숫자가 오면 그 라운드 줄 바로 아래에 한 줄 더 붙인다.
-  const chips = faultChips(e.by_fault);
-  if (chips) {
-    const sub = document.createElement('div');
-    sub.className = 'subrow';
-    sub.innerHTML = chips;
-    body.insertBefore(sub, row.nextSibling);
-  }
-
   document.getElementById('evallog-meta').textContent =
-    `정상 ${e.n_normal} / 이상 ${e.n_anomaly} · 최신 R${e.round} AUROC ${Number(e.auroc).toFixed(4)}`;
+    `Normal ${e.n_normal} / anomaly ${e.n_anomaly} · latest R${e.round} AUROC ${Number(e.auroc).toFixed(4)}`;
 }
 
 document.getElementById('btn-reconnect').addEventListener('click', () => {
@@ -1257,9 +1263,8 @@ document.getElementById('btn-reconnect').addEventListener('click', () => {
 
   // 평가 로그도 비운다. 다시 접속하면 서버가 쌓아 둔 걸 보내 준다.
   evalSeen.clear();
-  document.getElementById('evallog-body').innerHTML =
-    '<div class="empty">집계가 끝나면 라운드마다 한 줄씩 쌓입니다.</div>';
-  document.getElementById('evallog-meta').textContent = '대기 중';
+  document.getElementById('evallog-body').innerHTML = '';
+  document.getElementById('evallog-meta').textContent = 'Waiting';
 
   // 차트 초기화
   ['mn1', 'mn2', 'mn3', 'loss'].forEach(k => {
