@@ -171,13 +171,13 @@ def publish(node_name: str,
             )
             if res:
                 total += 1
-                print(f"    ⚠ 판정 {robot}: score={score:.6f} "
-                      f"(임계 {threshold:.6f}, {k}회 연속)")
+                print(f"    ⚠ Verdict {robot}: score={score:.6f} "
+                      f"(threshold {threshold:.6f}, {k} in a row)")
                 if ONCE_PER_ROBOT:
                     # 로봇당 첫 건만. 같은 라운드의 뒤 onset 도 안 올린다.
                     _reported.add((node_name, robot))
                     break
 
     if total:
-        print(f"  ✓ 판정 {total}건 -> {om2m.strip_prefix(cnt_path)}")
+        print(f"  ✓ {total} verdict(s) -> {om2m.strip_prefix(cnt_path)}")
     return total

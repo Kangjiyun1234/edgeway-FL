@@ -54,17 +54,17 @@ if [ -f .env.local ]; then
   # shellcheck disable=SC1091
   . ./.env.local
   set +a
-  echo "  ✓ .env.local 읽음"
+  echo "  ✓ .env.local loaded"
 else
-  echo "  ⚠ .env.local 이 없다. 샌드박스·IN-CSE 주소가 기본값으로 간다."
+  echo "  ⚠ No .env.local. Sandbox and IN-CSE addresses fall back to defaults."
 fi
 
 # torch 가 없으면 MN-AE 가 import 에서 죽는데, 그 로그는 tee 뒤에 묻혀
 # 한참 뒤에야 보인다. 여기서 먼저 막는다.
 if ! python3 -c "import torch" 2>/dev/null; then
   echo
-  echo "  ✗ 지금 python3 에 torch 가 없다: $(command -v python3)"
-  echo "    가상환경을 켜고 다시 실행할 것:"
+  echo "  ✗ The current python3 has no torch: $(command -v python3)"
+  echo "    Activate the virtual environment and run again:"
   echo "      source ~/venv-edgeway/bin/activate"
   exit 1
 fi
@@ -99,7 +99,7 @@ reset_previous_run() {
   local marker="${FL_DEMO_RUN_MARKER:-${base}/.demo_run_started}"
 
   echo
-  echo "[0/5] 지난 실행 정리"
+  echo "[0/5] Cleaning up the previous run"
 
   # 포트를 잡고 있는 지난 실행을 먼저 내린다.
   # 이걸 안 하면 7000(대시보드) 6000(IN-AE) 5001-5003(MN-AE) 이
@@ -124,7 +124,7 @@ reset_previous_run() {
     do
       pkill -KILL -f "$pat" 2>/dev/null || true
     done
-    echo "  ✓ 지난 실행 프로세스 종료 (이름 기준)"
+    echo "  ✓ Previous run processes stopped (by name)"
   fi
 
   # 이름으로 못 잡는 것이 남는다. 다른 경로에서 띄웠거나, 부모가 먼저
@@ -138,7 +138,7 @@ reset_previous_run() {
     pid="$(ss -ltnpH "sport = :${port}" 2>/dev/null \
            | grep -oP 'pid=\K[0-9]+' | head -1 || true)"
     if [ -n "${pid:-}" ]; then
-      echo "  · 포트 ${port} 를 PID ${pid} 가 잡고 있다 -> 내린다"
+      echo "  · Port ${port} is held by PID ${pid} -> stopping it"
       kill -TERM "$pid" 2>/dev/null || true
       busy=1
     fi
@@ -156,9 +156,9 @@ reset_previous_run() {
   fi
 
   if [ "$killed" = "0" ] && [ "$busy" = "0" ]; then
-    echo "  ✓ 남아 있는 프로세스 없음"
+    echo "  ✓ No leftover processes"
   else
-    echo "  ✓ 포트 7000/6000/5001-5003 비움"
+    echo "  ✓ Ports 7000/6000/5001-5003 free"
   fi
 
   rm -rf "${base}/global" "${base}/local" "${base}/cache"
@@ -167,8 +167,8 @@ reset_previous_run() {
   mkdir -p "$(dirname "${marker}")"
   : > "${marker}"
 
-  echo "  ✓ 모델/캐시 비움: ${base}"
-  echo "  ✓ 실행 표식 갱신: ${marker}"
+  echo "  ✓ Models/cache cleared: ${base}"
+  echo "  ✓ Run marker updated: ${marker}"
 }
 
 if [ "${FL_RESET_ON_START:-1}" = "1" ]; then
@@ -177,7 +177,7 @@ fi
 
 start_dashboard() {
   echo
-  echo "[2/5] 대시보드"
+  echo "[2/5] Dashboard"
   python3 -u fl/dashboard_server.py &
   PIDS+=("$!")
   local pid="${PIDS[-1]}"
@@ -200,18 +200,18 @@ start_dashboard() {
   done
 
   if [ "$ok" = "1" ]; then
-    echo "  ✓ 대시보드 응답 확인"
+    echo "  ✓ Dashboard is responding"
   else
     echo
-    echo "  ✗ 대시보드가 뜨지 않았다."
+    echo "  ✗ Dashboard did not start."
     if kill -0 "$pid" 2>/dev/null; then
-      echo "    프로세스는 살아 있는데 7000 이 응답하지 않는다."
+      echo "    The process is alive but port 7000 is not responding."
     else
-      echo "    프로세스가 죽었다. 바로 위에 찍힌 파이썬 오류를 보라."
-      echo "    'Address already in use' 면 7000 을 다른 것이 잡고 있다:"
+      echo "    The process died. See the Python error printed just above."
+      echo "    'Address already in use' means something else holds port 7000:"
       echo "      ss -ltnp | grep 7000"
     fi
-    echo "    FL 자체는 계속 진행한다."
+    echo "    FL itself continues."
     echo
   fi
 }
@@ -219,56 +219,56 @@ start_dashboard() {
 # ── 1. 데이터 경로 준비 ─────────────────────────────────
 
 if [ "$FROM_CSE" = "0" ]; then
-  echo "[1/5] 오프라인 모드: pkl 준비"
-  echo "      AMR_DATA 가 가리키는 telemetry.json 들을 읽는다"
+  echo "[1/5] Offline mode: preparing pkl"
+  echo "      Reading the telemetry.json files under AMR_DATA"
   python3 fl/prepare_data_amr.py
 
   start_dashboard
 
   echo
-  echo "[3/5] Isaac Sim 대기 — 오프라인 모드라 건너뛴다"
+  echo "[3/5] Waiting for Isaac Sim — skipped in offline mode"
 else
-  echo "[1/5] oneM2M 리소스 확인"
+  echo "[1/5] Checking oneM2M resources"
   # 우리 리소스(IN-AE, TRAINING-AE-i, ANALYSIS-AE-i, 컨테이너, ACP)만 본다.
   # 로봇 AE는 Isaac 소유라 여기서 실패로 치지 않는다.
   if ! python3 fl/setup_resources_standard.py --verify; then
     echo
-    echo "  리소스가 빠져 있다. 먼저 생성한다."
+    echo "  Resources are missing. Creating them first."
     python3 fl/setup_resources_standard.py
   fi
 
   start_dashboard
 
   echo
-  echo "[3/5] Isaac Sim 대기"
+  echo "[3/5] Waiting for Isaac Sim"
   # 샌드박스가 뜬 직후에는 MN-CSE만 있고 로봇 AE는 없다. Isaac이 등록한다.
   # 사업장당 최소 FL_MIN_ROBOTS_PER_SITE 대(기본 1)만 준비되면 진행한다.
-  echo "  (기다리는 동안 대시보드는 이미 떠 있다)"
+  echo "  (the dashboard is already up while waiting)"
   if ! python3 fl/setup_resources_standard.py --wait-robots; then
     echo
-    echo "  ⚠ 로봇이 다 준비되지 않았다. 그래도 진행한다."
-    echo "    (뒤늦게 올라온 로봇은 그 라운드부터 포함된다)"
+    echo "  ⚠ Not all robots are ready. Proceeding anyway."
+    echo "    (robots that come up late are included from that round)"
   fi
 fi
 
 # ── 2. 학습 노드 ────────────────────────────────────────
 
 echo
-echo "[4/5] 학습 앱 기동 (사업장 3곳)"
+echo "[4/5] Starting training apps (3 sites)"
 
 # 어떤 설정으로 돌린 실행인지 로그만 보고 알 수 있어야 한다.
-echo "  설정: 라운드 ${FL_GLOBAL_ROUNDS:-10}"\
-" · 라운드당 ${FL_SENSOR_MIN_WINDOWS:-50}윈도우"\
-" · 백로그 ${FL_SENSOR_BACKLOG_SEC:-0}s"\
-" · 절사 ${FL_TRIM_RATIO:-0.15}"\
-" · 라벨학습 ${FL_LABEL_FOR_TRAIN:-0}"
+echo "  Config: rounds ${FL_GLOBAL_ROUNDS:-10}"\
+" · ${FL_SENSOR_MIN_WINDOWS:-50} windows/round"\
+" · backlog ${FL_SENSOR_BACKLOG_SEC:-0}s"\
+" · trim ${FL_TRIM_RATIO:-0.15}"\
+" · label-for-train ${FL_LABEL_FOR_TRAIN:-0}"
 
 # 셋이 한 터미널에 찍으면 줄이 뒤섞여 어느 노드 것인지 알기 어렵다.
 # 줄 앞에 노드 이름을 박아 두었지만, 한 노드만 따로 보고 싶을 때를 위해
 # 파일로도 나눠 남긴다. 터미널 출력은 tee 로 그대로 둔다.
 RUN_LOG_DIR="logs/run_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RUN_LOG_DIR"
-echo "  노드별 로그: $RUN_LOG_DIR/"
+echo "  Per-node logs: $RUN_LOG_DIR/"
 
 python3 -u fl/mn_ae_standard.py 0 5001 2>&1 | tee "$RUN_LOG_DIR/mn1.log" &
 PIDS+=("$!")
@@ -305,16 +305,16 @@ echo "[5/5] IN-AE"
 if [ "${FL_START_IN_AE:-1}" = "1" ]; then
   python3 -u fl/in_ae_standard.py 2>&1 | tee "$RUN_LOG_DIR/in_ae.log" &
   PIDS+=("$!")
-  echo "  IN-AE PID: ${PIDS[-1]}  (중앙 CSE 는 원격, 알림은 pollingChannel)"
+  echo "  IN-AE PID: ${PIDS[-1]}  (central CSE is remote, notifications via pollingChannel)"
 else
-  echo "  → 여기서는 안 띄운다 (FL_START_IN_AE=0). 중앙 노드에서 띄울 것."
+  echo "  → Not started here (FL_START_IN_AE=0). Start it on the central node."
 fi
 
 echo
 echo "============================================================"
-echo "  전부 기동됨.   대시보드: http://localhost:7000"
-echo "  노드별 로그:   $RUN_LOG_DIR/{mn1,mn2,mn3,in_ae}.log"
-echo "  Ctrl+C 로 전체 종료"
+echo "  All started.     Dashboard: http://localhost:7000"
+echo "  Per-node logs:  $RUN_LOG_DIR/{mn1,mn2,mn3,in_ae}.log"
+echo "  Ctrl+C stops everything"
 echo "============================================================"
 echo
 

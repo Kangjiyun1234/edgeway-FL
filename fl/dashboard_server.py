@@ -271,8 +271,8 @@ def index():
     if not HTML_PATH.exists():
         return (
             f"Dashboard HTML not found: {HTML_PATH}<br>"
-            "프로젝트 루트에 "
-            "fl_bearing_dashboard.html 파일이 있는지 확인하세요.",
+            "Check that the project root contains "
+            "fl_bearing_dashboard.html.",
             500,
         )
 
@@ -551,7 +551,7 @@ def _latest_global_from_cse(max_round: int | None = None):
     try:
         state = model_codec.decode_state_dict(meta, fetch_chunk=fetch_chunk)
     except Exception as e:
-        print(f"  ⚠ 글로벌 모델 복원 실패 ({type(e).__name__}: {e})")
+        print(f"  ⚠ Failed to restore global model ({type(e).__name__}: {e})")
         return -1, None
 
     return (model_round, state) if state is not None else (-1, None)
@@ -702,7 +702,7 @@ def _node_scores_from_cse(node: str):
             om2m.get_latest_content_instance(path)
         )
     except Exception as error:
-        print(f"    ⚠ {node} 드롭박스 조회 실패: {error}")
+        print(f"    ⚠ {node} drop-box read failed: {error}")
         return None
 
     if not content:
@@ -771,7 +771,7 @@ def _reload_scores_if_needed() -> None:
     if has_new_model:
         print(
             "  [Scores] "
-            f"새 글로벌 모델 R{model_round} 감지"
+            f"new global model R{model_round} detected"
         )
         try:
             model = _load_model(
@@ -779,7 +779,7 @@ def _reload_scores_if_needed() -> None:
             )
         except Exception as error:
             print(
-                "  ✗ 글로벌 모델 로드 실패: "
+                "  ✗ Failed to load global model: "
                 f"{error}"
             )
             model = None
@@ -790,8 +790,8 @@ def _reload_scores_if_needed() -> None:
     if model is None:
         print(
             "  [Scores] "
-            f"R{current_fl_round} — 글로벌 모델 없이 "
-            "CSE 드롭박스 점수로 갱신"
+            f"R{current_fl_round} — no global model, "
+            "updating from CSE drop-box scores"
         )
 
     new_thresholds: dict[str, float] = {}
@@ -811,7 +811,7 @@ def _reload_scores_if_needed() -> None:
 
             if from_cse is None:
                 print(
-                    f"  ⚠ {node}: PKL 도 CSE 점수도 없다 "
+                    f"  ⚠ {node}: neither PKL nor CSE scores "
                     f"({pkl_path.name})"
                 )
                 continue
@@ -832,7 +832,7 @@ def _reload_scores_if_needed() -> None:
 
             print(
                 f"    {node}: n={len(cse_scores)}, "
-                f"threshold={cse_threshold:.4f} (CSE 드롭박스)"
+                f"threshold={cse_threshold:.4f} (CSE drop-box)"
             )
             continue
 
@@ -845,7 +845,7 @@ def _reload_scores_if_needed() -> None:
                 )
         except Exception as error:
             print(
-                f"  ✗ {node} PKL 로드 실패: "
+                f"  ✗ {node} PKL load failed: "
                 f"{error}"
             )
             continue
@@ -918,8 +918,8 @@ def _reload_scores_if_needed() -> None:
                 _shared["model_round"] = model_round
 
         print(
-            "  ⚠ [Scores] 읽을 점수가 없다 "
-            "(PKL 없음 + 드롭박스 비어 있음). 기존 값 유지."
+            "  ⚠ [Scores] No scores to read "
+            "(no PKL + empty drop-box). Keeping previous values."
         )
         return
 
@@ -959,7 +959,7 @@ def _reload_scores_if_needed() -> None:
     )
 
     print(
-        f"  ✓ R{model_round} score 재계산 완료"
+        f"  ✓ R{model_round} scores recomputed"
     )
 
 
@@ -1446,10 +1446,10 @@ def _is_stale_control(content: dict) -> bool:
     if not _stale_control_warned:
         _stale_control_warned = True
         print(
-            f"  ⓘ 지난 실행의 라운드 상태를 무시한다 "
+            f"  ⓘ Ignoring round state from a previous run "
             f"(R{content.get('currentRound')} "
             f"{content.get('jobState')}). "
-            f"IN-AE 가 새 명령을 올릴 때까지 대기한다."
+            f"Waiting for IN-AE to post a new command."
         )
 
     return True
@@ -1628,12 +1628,12 @@ def _poll_thread() -> None:
                 _broadcast(ev)
                 print(f"  [Eval] R{last_eval_round} "
                       f"AUROC={ev.get('auroc')} "
-                      f"탐지={ev.get('detected')}/{ev.get('n_anomaly')} "
-                      f"오경보={ev.get('false_alarms')}/{ev.get('n_normal')}")
+                      f"detected={ev.get('detected')}/{ev.get('n_anomaly')} "
+                      f"false_alarms={ev.get('false_alarms')}/{ev.get('n_normal')}")
 
         except Exception as error:
             print(
-                "  ⚠ oneM2M poll 오류: "
+                "  ⚠ oneM2M poll error: "
                 f"{error}"
             )
 
@@ -1670,7 +1670,7 @@ def _poll_thread() -> None:
                     summary,
                 )
                 print(
-                    "  ✓ Summary 전송 완료 "
+                    "  ✓ Summary sent "
                     f"(R{summary['model_round']})"
                 )
         time.sleep(
@@ -1696,15 +1696,15 @@ def main() -> None:
 
     print()
     print("=== FL Dashboard Server ===")
-    print(f"  사업장 CSE: {om2m.base_url()}/{om2m.cse_name()}")
-    print(f"  중앙 CSE  : {config.in_endpoint()[0]}/{om2m.in_cse_name()}")
+    print(f"  Site CSE   : {om2m.base_url()}/{om2m.cse_name()}")
+    print(f"  Central CSE: {config.in_endpoint()[0]}/{om2m.in_cse_name()}")
     print(f"  PKL: {PKL_DIR}")
     print(f"  Global model: {GLOBAL_MODEL_DIR}")
     print(f"  Run marker: {RUN_MARKER_PATH}")
     print(
-        "  이상 표시: "
+        "  Anomaly shown: "
         f"{ANOMALY_NODE}, "
-        f"Round {ANOMALY_START_ROUND}부터"
+        f"from Round {ANOMALY_START_ROUND}"
     )
     print(f"  Port: {PORT}")
     print(f"  http://localhost:{PORT}")
