@@ -595,6 +595,29 @@ class INAECoordinator:
             if res:
                 print(f"    ✓ {node} subscribed -> {cnt_path}")
 
+    @staticmethod
+    def _subscription_present(sub_path: str) -> bool:
+        """
+        구독이 있는지만 본다. 내용은 읽지 않는다.
+
+        403 도 '있다' 로 친다. 구독은 학습 앱이 자기 AE-ID 로 만들고 acpi 가
+        없어서, 만든 쪽이 아닌 CIN-AE 가 읽으면 ACME 가 403 을 돌려준다.
+        ACME 는 리소스를 먼저 찾고 권한을 나중에 보므로, 없으면 404 다.
+
+        CSE 가 권한 없는 리소스를 404 로 숨길 수도 있으므로, 404 면 관리자
+        신원으로 한 번 더 본다. 존재 확인만 하고 내용은 쓰지 않는다.
+        """
+        for origin in (None, config.ORIGINATOR):
+            try:
+                r = om2m._request_with_retry(
+                    "get", om2m._url(sub_path),
+                    headers=om2m._headers(origin=origin), timeout=10)
+            except Exception:
+                continue
+            if r.status_code in (200, 403):
+                return True
+        return False
+
     def _wait_for_mn_command_subscriptions(self) -> bool:
         """
         Round 1 command를 발행하기 전에 모든 MN-AE의 cnt-fl-control
@@ -615,7 +638,7 @@ class INAECoordinator:
             for node, sub_path in expected.items():
                 if node in ready:
                     continue
-                if om2m.get_resource(sub_path):
+                if self._subscription_present(sub_path):
                     ready.add(node)
                     print(f"    ✓ {node} command subscription ready")
 

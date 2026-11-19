@@ -276,7 +276,13 @@ def setup_in_acps(nodes: List[str]) -> Dict[str, str]:
         {"acor": mn_origins,
          "acop": ACOP_RETRIEVE | ACOP_NOTIFY | ACOP_DISCOVERY},
     ]
-    mk("acp-fl-control", read_for_mn)
+    # 학습 앱은 cnt-fl-control 에 구독을 걸어야 한다. ACME 는 구독 생성에
+    # 부모의 CREATE 를 요구한다. 그냥 CREATE 를 주면 라운드 명령 CIN 까지
+    # 만들 수 있으니, 자식 타입이 구독(ty=23)일 때로만 좁힌다.
+    mk("acp-fl-control", read_for_mn + [
+        {"acor": mn_origins, "acop": ACOP_CREATE,
+         "acod": [{"chty": [23]}]},
+    ])
     mk("acp-global-model", read_for_mn)
 
     mk("acp-local-updates", [
