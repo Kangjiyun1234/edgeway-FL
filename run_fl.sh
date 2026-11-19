@@ -21,6 +21,11 @@
 #   FL_LABEL_FOR_TRAIN=0         1 이면 정상 라벨만 학습(지도). 기본은 비지도
 #   FL_VERDICT=1                 0 이면 판정을 CSE 에 안 쓴다
 #   FL_START_IN_AE=1             0 이면 IN-AE 를 여기서 안 띄운다
+#   FL_DP=0                      1 이면 예전 배치 단위 DP 노이즈를 켠다(비교용)
+#   FL_MIN_STEPS=200             라운드당 최소 옵티마이저 스텝. 0 이면 local_epochs 그대로
+#   AMR_NORM_MIN_PER_LOAD=20     정규화 통계를 적재 상태별 몇 창 모이면 고정할지
+#   AMR_NORM_FREEZE_ROUND=5      다 안 모여도 이 라운드에 고정
+#   AMR_NORM_CLIP=10             표준화 뒤 |z| 상한. 0 이면 끔
 #
 #   예)  FL_TRIM_RATIO=0 ./run_fl.sh        절사 없이 돌려 A/B 비교
 #

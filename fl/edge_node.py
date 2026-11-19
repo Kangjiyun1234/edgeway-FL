@@ -258,13 +258,27 @@ class AEEdgeNode:
         trim_ratio = float(os.getenv("FL_TRIM_RATIO", "0"))
         trim_warmup = int(os.getenv("FL_TRIM_WARMUP_EPOCHS", "2"))
 
+        # 에폭 수를 최소 스텝 수에 맞춰 늘린다(config.TrainConfig.min_steps).
+        # 라운드당 창이 50개 안팎이라 local_epochs 만으로는 스텝이 20번
+        # 남짓이고, 그 정도로는 모델이 '출력 0' 에서 벗어나지 못했다.
+        steps_per_epoch = max(1, len(train_loader))
+        min_steps = int(getattr(self.train_cfg, "min_steps", 0) or 0)
+        n_epochs = max(int(self.train_cfg.local_epochs),
+                       math.ceil(min_steps / steps_per_epoch))
+        print(f"    ◦ 로컬 학습 {n_epochs}에폭 x {steps_per_epoch}배치 "
+              f"= {n_epochs * steps_per_epoch}스텝"
+              f"{' (DP)' if use_dp else ''}")
+
         self.model.train()
         loss_sum, total, trimmed = 0.0, 0, 0
 
-        for epoch in range(self.train_cfg.local_epochs):
+        for epoch in range(n_epochs):
             # 초반에는 모델이 무작위라 손실이 커도 이상이 아니다.
             # 워밍업 동안은 자르지 않는다.
             trim = trim_ratio if epoch >= trim_warmup else 0.0
+            # 보고하는 train_loss 는 마지막 에폭의 평균이다. 에폭이 많아지면
+            # 전체 평균은 초반의 큰 손실에 끌려 라운드끼리 비교가 안 된다.
+            loss_sum, total = 0.0, 0
 
             for xb, cb in train_loader:
                 xb = xb.to(self.device)
@@ -304,7 +318,7 @@ class AEEdgeNode:
         train_loss = loss_sum / max(total, 1)
 
         if trimmed:
-            print(f"    ◦ 절사 손실: {trimmed}/{total} 샘플을 학습에서 제외 "
+            print(f"    ◦ 절사 손실: {trimmed}/{total * n_epochs} 샘플을 학습에서 제외 "
                   f"(비율 {trim_ratio:.0%}, 워밍업 {trim_warmup}에폭)")
 
         # 학습이 끝난 모델 기준으로 채널 기준 오차와 임계값을 다시 잡는다.

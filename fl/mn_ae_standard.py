@@ -56,9 +56,11 @@ class MNAETrainer:
         self.notification_port = notification_port
         self.inject_anomaly   = inject_anomaly
 
-        # 이 사업장의 정규화 통계. 첫 수집에서 잡고 이후 라운드에서 재사용한다.
-        self.norm_mean = None
-        self.norm_std = None
+        # 이 사업장의 정규화 통계. 적재 상태가 고루 모일 때까지 누적하다가
+        # 고정한다(amr_schema.NormStats). 첫 수집분 고정은 빈 차 주행만
+        # 담겨 적재 구간에서 |z| 가 수십~수백으로 튀었다.
+        import amr_schema as _sch
+        self.norm = _sch.NormStats()
 
         self.ae_name = config.training_ae_name(self.node_name)
         self.ae_id = config.training_ae_id(self.node_name)
@@ -1087,7 +1089,7 @@ class MNAETrainer:
                   + "  ".join(f"{r.split('_')[-1]}={n}개"
                               for r, n in sorted(gaps.items())))
 
-        return self._build_round_data_from_cse(got)
+        return self._build_round_data_from_cse(got, round_num)
 
     def _load_sensor_data_from_pkl(self, round_num: int):
         """
@@ -1132,7 +1134,7 @@ class MNAETrainer:
         return data_dict
 
 
-    def _build_round_data_from_cse(self, got: dict) -> dict:
+    def _build_round_data_from_cse(self, got: dict, round_num: int = 1) -> dict:
         """
         CSE에서 받은 윈도우를 학습용 dict로 만든다.
 
@@ -1151,11 +1153,13 @@ class MNAETrainer:
         else:
             robot, names = got["robot"], got["cond_name"]
 
-        Xn = amr_ingest.normalize_with(X, self.norm_mean, self.norm_std)
-        if self.norm_mean is None and len(Xn):
-            # 첫 수집이면 이 데이터로 통계를 잡고 이후 라운드에서 재사용한다.
-            self.norm_mean = X.mean(axis=(0, 2), keepdims=True)
-            self.norm_std = X.std(axis=(0, 2), keepdims=True) + 1e-8
+        # 고정 전이면 이번 창까지 넣어 통계를 다시 잡고, 그 자로 표준화한다.
+        was_frozen = self.norm.frozen
+        if len(X):
+            self.norm.update(X, C, round_num)
+        Xn = self.norm.apply(X) if len(X) else X
+        if not was_frozen:
+            print(f"      ◦ {self.norm.describe()}")
 
         # 학습은 정상 주행만 쓴다.
         #
@@ -1996,7 +2000,10 @@ class MNAETrainer:
                 )
 
             # DP 설정
-            security_mode = job_state.get("securityMode", "DP")
+            # 명령에 없으면 로컬 설정을 따른다. 기본은 DP 끔.
+            security_mode = job_state.get(
+                "securityMode",
+                "DP" if getattr(config, "DP_ENABLED", False) else "NONE")
             privacy_params = job_state.get("privacyParams", {})
             dp_epsilon = float(
                 privacy_params.get(

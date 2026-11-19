@@ -310,3 +310,114 @@ def apply_ref(D, keys, ref, glob, alive):
         Z[i] = (D[i] - md) / mad
     Z[:, ~alive] = 0.0
     return Z.astype(np.float32)
+
+
+# ════════════════════════════════════════════════════════
+# 사업장별 입력 정규화 통계
+#
+# [왜 R1 에서 고정하면 안 되나]
+# 예전에는 첫 수집분(약 50창)으로 평균/표준편차를 잡고 끝까지 썼다.
+# 아이작심은 빈 차로 출발하므로 첫 수집은 거의 다 빈 차다. 실측
+# (2026-11-19 01:19 실행, siteA): R1 은 45/45 빈 차, R6 은 0/50 빈 차.
+# R1 의 lift.pos 표준편차가 6.7e-5 라 적재 구간이 오면 |z| 가 40~80
+# 까지 튀었고, 학습 손실이 1.1 -> 14.3 으로 오른 것은 학습이 망가진
+# 게 아니라 이 자가 어긋난 것이었다(재현한 평균 z² 와 손실이 거의 같다).
+#
+# [어떻게 하나]
+#   - 적재 상태(빈/가벼움/무거움)가 각각 NORM_MIN_PER_LOAD 창 이상 모일
+#     때까지는 받은 창을 쌓아 가며 통계를 다시 잡는다.
+#   - 다 모였거나 NORM_FREEZE_ROUND 에 이르면 고정한다. 그 뒤로 자가
+#     바뀌면 라운드끼리 점수를 비교할 수 없다.
+#   - 표준편차 하한과 |z| 클리핑을 같이 건다. 고정 전에도, 희귀한 창
+#     하나가 손실을 지배하지 못하게 하는 안전장치다.
+#
+# 같은 telemetry 로 재현한 라운드별 평균 z² (siteA):
+#   R1 고정        1.0 2.9 1.4 5.4 13.6 16.7 16.8 15.4 10.8 5.1
+#   누적 후 고정    1.0 1.2 0.6 0.6  0.7  0.6  0.5  2.0  0.8 0.6  (R5 에 고정)
+# ════════════════════════════════════════════════════════
+
+NORM_MIN_PER_LOAD = int(os.getenv("AMR_NORM_MIN_PER_LOAD", "20"))
+NORM_FREEZE_ROUND = int(os.getenv("AMR_NORM_FREEZE_ROUND", "5"))
+NORM_STD_FLOOR = float(os.getenv("AMR_NORM_STD_FLOOR", "1e-4"))
+NORM_CLIP = float(os.getenv("AMR_NORM_CLIP", "10"))
+# 쌓아 둘 원신호 창의 상한. 고정 전까지만 쓰고 고정하면 버린다.
+NORM_MAX_BUFFER = int(os.getenv("AMR_NORM_MAX_BUFFER", "2000"))
+
+
+class NormStats:
+    """사업장 하나의 채널별 정규화 통계. 고정될 때까지 누적한다."""
+
+    def __init__(self,
+                 min_per_load: int = NORM_MIN_PER_LOAD,
+                 freeze_round: int = NORM_FREEZE_ROUND,
+                 std_floor: float = NORM_STD_FLOOR,
+                 clip: float = NORM_CLIP,
+                 max_buffer: int = NORM_MAX_BUFFER):
+        self.min_per_load = int(min_per_load)
+        self.freeze_round = int(freeze_round)
+        self.std_floor = float(std_floor)
+        self.clip = float(clip)
+        self.max_buffer = int(max_buffer)
+
+        self.mean: Optional[np.ndarray] = None   # (1, C, 1)
+        self.std: Optional[np.ndarray] = None    # (1, C, 1)
+        self.frozen = False
+        self.frozen_round: Optional[int] = None
+        self._buf: List[np.ndarray] = []
+        self._load_counts = np.zeros(N_LOAD, dtype=np.int64)
+
+    @staticmethod
+    def load_of(cond: np.ndarray) -> np.ndarray:
+        """cond 벡터 (N, COND_DIM) -> 적재 상태 인덱스 (N,)."""
+        C = np.asarray(cond)
+        lo = N_NAV + N_SPD
+        if C.ndim != 2 or C.shape[1] < lo + N_LOAD:
+            return np.zeros(len(C), dtype=np.int64)
+        return np.argmax(C[:, lo:lo + N_LOAD], axis=1).astype(np.int64)
+
+    def update(self, X: np.ndarray, cond: Optional[np.ndarray],
+               round_num: int) -> None:
+        """이번 라운드의 원신호 창 (N, C, T) 로 통계를 갱신한다. 고정됐으면 무시."""
+        if self.frozen or X is None or len(X) == 0:
+            return
+        X = np.asarray(X, dtype=np.float32)
+        self._buf.append(X)
+        if cond is not None and len(cond) == len(X):
+            self._load_counts += np.bincount(self.load_of(cond),
+                                             minlength=N_LOAD)[:N_LOAD]
+
+        A = np.concatenate(self._buf)
+        if len(A) > self.max_buffer:
+            # 넘치면 시간축 전체에서 고르게 남긴다.
+            keep = np.linspace(0, len(A) - 1, self.max_buffer).astype(np.int64)
+            A = A[keep]
+            self._buf = [A]
+
+        self.mean = A.mean(axis=(0, 2), keepdims=True)
+        self.std = np.maximum(A.std(axis=(0, 2), keepdims=True),
+                              self.std_floor)
+
+        covered = bool(self._load_counts.min() >= self.min_per_load)
+        if covered or round_num >= self.freeze_round:
+            self.frozen = True
+            self.frozen_round = int(round_num)
+            self._buf = []
+
+    def apply(self, X: np.ndarray) -> np.ndarray:
+        """(N, C, T) 원신호 -> 표준화 + 클리핑."""
+        if X is None or np.asarray(X).size == 0:
+            return X
+        if self.mean is None:
+            raise RuntimeError("NormStats.apply: update() 를 먼저 불러야 한다")
+        Z = (np.asarray(X, dtype=np.float32) - self.mean) / self.std
+        if self.clip > 0:
+            Z = np.clip(Z, -self.clip, self.clip)
+        return Z.astype(np.float32)
+
+    def describe(self) -> str:
+        cnt = "/".join(str(int(c)) for c in self._load_counts)
+        if self.frozen:
+            return (f"정규화 통계 고정됨 (R{self.frozen_round}, "
+                    f"적재 빈/경/중 {cnt}, |z|≤{self.clip:g})")
+        return (f"정규화 통계 누적 중 (적재 빈/경/중 {cnt}, "
+                f"각 {self.min_per_load}창 또는 R{self.freeze_round} 에 고정)")

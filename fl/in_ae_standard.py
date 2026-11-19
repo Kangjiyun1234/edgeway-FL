@@ -651,7 +651,8 @@ class INAECoordinator:
                 self.current_global_model_uri
                 or f"{self.global_model_path}/la"
             ),
-            "securityMode": "DP",
+            # DP 는 기본으로 끈다(config.DP_ENABLED 주석 참고).
+            "securityMode": "DP" if config.DP_ENABLED else "NONE",
             "privacyParams": {
                 "epsilon": config.DP_EPSILON,
                 "delta": config.DP_DELTA,

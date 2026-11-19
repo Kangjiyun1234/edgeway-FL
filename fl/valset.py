@@ -171,6 +171,50 @@ def _auroc(scores: np.ndarray, labels: np.ndarray) -> float:
         return float((ranks[pos].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
 
 
+# "모델 없음" 기준선. 모델이 아무것도 복원하지 못해 출력이 0 일 때의
+# 점수다. 입력 자체에 이미 들어 있는 신호(이상 창의 에너지나 떨림이 더
+# 크다)만으로 나오는 숫자라, 글로벌 모델의 AUROC 가 이것을 넘어야
+# 연합학습이 무언가를 배웠다고 말할 수 있다.
+#
+# 2026-11-19 실행의 R1~R10 AUROC(0.638~0.641, bearing 0.53 / floor 0.93 /
+# wknob 0.63)는 recon 방식의 이 기준선(0.641 / 0.535 / 0.933 / 0.631)과
+# 소수 셋째 자리까지 같았다. diff 방식의 기준선은 약 0.832 다.
+_baseline_cache: dict = {}
+
+
+def _scores_no_model(X: torch.Tensor, C: torch.Tensor) -> np.ndarray:
+    """출력 0 인 모델의 점수. evaluate() 의 점수 식과 같은 자를 쓴다."""
+    Xn = X.cpu().numpy()
+    if SCORE_MODE == "diff":
+        D = np.abs(np.diff(Xn, axis=2)).mean(axis=2)
+        return _cell_zmax(D, C.cpu().numpy())
+    E = (Xn ** 2).mean(axis=2)
+    E = E / (E.mean(axis=0) + 1e-12)
+    return E.mean(axis=1)
+
+
+def _auroc_block(scores: np.ndarray, y: np.ndarray, ft) -> dict:
+    out = {"auroc": round(_auroc(scores, y), 4), "by_fault": {}}
+    if ft is not None:
+        for name in sorted(set(ft[y == 1].tolist())):
+            m = (ft == name) | (y == 0)
+            out["by_fault"][name] = round(
+                _auroc(scores[m], (ft[m] == name).astype(int)), 4)
+    return out
+
+
+def baseline(ds=None) -> Optional[dict]:
+    """검증셋의 '모델 없음' 기준선 {auroc, by_fault}. 한 번만 계산한다."""
+    ds = ds or load()
+    if ds is None:
+        return None
+    key = (ds.get("path"), SCORE_MODE)
+    if key not in _baseline_cache:
+        s = _scores_no_model(ds["X"], ds["C"])
+        _baseline_cache[key] = _auroc_block(s, ds["y"], ds.get("fault_type"))
+    return _baseline_cache[key]
+
+
 def evaluate(model_path: str, n_sigma: float = None) -> Optional[dict]:
     """
     글로벌 모델 하나를 검증셋으로 잰다.
@@ -193,6 +237,7 @@ def evaluate(model_path: str, n_sigma: float = None) -> Optional[dict]:
             n_channels=cfg.n_channels,
             cond_dim=cfg.cond_dim,
             latent_dim=cfg.latent_dim,
+            hidden=int(getattr(cfg, "hidden", 48)),
             seq_len=cfg.seq_len,
         )
         model.load_state_dict(torch.load(model_path, map_location="cpu"))
@@ -254,9 +299,18 @@ def evaluate(model_path: str, n_sigma: float = None) -> Optional[dict]:
                 "n": int((ft == name).sum()),
             }
 
+    base = baseline(ds) or {}
+    auroc = round(_auroc(scores, y), 4)
+    for name, b in (base.get("by_fault") or {}).items():
+        if name in by_fault:
+            by_fault[name]["baseline_auroc"] = b
+
     return {
         "by_fault": by_fault,
-        "auroc": round(_auroc(scores, y), 4),
+        "auroc": auroc,
+        "baseline_auroc": base.get("auroc"),
+        "delta_vs_baseline": (round(auroc - base["auroc"], 4)
+                              if base.get("auroc") is not None else None),
         "threshold": round(thr, 4),
         "threshold_mean3s": round(thr_mean, 4),
         "detected_mean3s": int((anom > thr_mean).sum()),
@@ -279,10 +333,14 @@ def summary_line(m: dict) -> str:
         tail = "  [" + " ".join(
             f"{k} {v['auroc']:.3f}({v['detected']}/{v['n']})"
             for k, v in sorted(m["by_fault"].items())) + "]"
+    base = ""
+    if m.get("baseline_auroc") is not None:
+        base = (f"  | 모델없음 {m['baseline_auroc']:.4f} "
+                f"(Δ{m['delta_vs_baseline']:+.4f})")
     return (f"AUROC {m['auroc']:.4f}  "
             f"탐지 {m['detected']}/{m['n_anomaly']}  "
             f"오경보 {m['false_alarms']}/{m['n_normal']}  "
             f"정상 {m['mean_normal']:.3f} vs 이상 {m['mean_anomaly']:.3f}  "
             f"thr {m['threshold']:.3f}"
-            f"(평균3σ {m['threshold_mean3s']:.3f} -> "
-            f"{m['detected_mean3s']}/{m['false_alarms_mean3s']})" + tail)
+            f"(평균+{config.THRESHOLD_N_SIGMA:g}σ {m['threshold_mean3s']:.3f} -> "
+            f"{m['detected_mean3s']}/{m['false_alarms_mean3s']})" + tail + base)
