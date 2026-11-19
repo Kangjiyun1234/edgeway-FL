@@ -78,6 +78,15 @@ POLL_INTERVAL = float(
         "3.0",
     )
 )
+# 라운드 상태(cnt-fl-control)만 따로, 더 자주 본다. 노드 업로드(가중치가
+# 실린 큰 CIN)와 모델 재채점까지 도는 폴링 한 바퀴는 수 초가 걸려서,
+# 거기에 묶여 있으면 IN-AE 가 다음 라운드를 열어도 화면이 늦게 따라왔다.
+CONTROL_POLL_INTERVAL = float(
+    os.getenv(
+        "FL_DASHBOARD_CONTROL_INTERVAL",
+        "1.0",
+    )
+)
 SCORE_INTERVAL = float(
     os.getenv(
         "FL_DASHBOARD_SCORE_INTERVAL",
@@ -1455,6 +1464,57 @@ def _is_stale_control(content: dict) -> bool:
     return True
 
 
+def _control_thread() -> None:
+    """
+    라운드 상태만 본다. 바뀌면 바로 화면에 보낸다.
+
+    jobState / currentRound / maxRounds 는 이 스레드만 고친다. _poll_thread 가
+    고치면, 그쪽이 느린 한 바퀴 앞부분에서 읽은 옛 라운드로 덮어써 화면이
+    한 라운드 뒤로 갔다가 돌아올 수 있다.
+    """
+    fl_control_path = om2m.in_path(
+        f"{config.IN_AE_NAME}/cnt-fl-control"
+    )
+    last = None
+
+    while True:
+        try:
+            content = _parse_content_instance(
+                om2m.get_latest_content_instance(fl_control_path)
+            )
+            if content and not _is_stale_control(content):
+                state = (
+                    content.get("jobState", "FL_READY"),
+                    int(content.get("currentRound", 0)),
+                    int(content.get("maxRounds", config.GLOBAL_ROUNDS)),
+                )
+                if state != last:
+                    last = state
+                    with _shared_lock:
+                        _shared.update(
+                            {
+                                "fl_state": state[0],
+                                "round": state[1],
+                                "max_rounds": state[2],
+                            }
+                        )
+                        nodes = dict(_shared["nodes"])
+                    _broadcast(
+                        {
+                            "type": "round",
+                            "fl_state": state[0],
+                            "round": state[1],
+                            "max_rounds": state[2],
+                            "nodes": nodes,
+                        }
+                    )
+                    print(f"  [Round] R{state[1]}/{state[2]} {state[0]}")
+        except Exception as error:
+            print(f"  ⚠ 라운드 상태 조회 오류: {error}")
+
+        time.sleep(CONTROL_POLL_INTERVAL)
+
+
 def _poll_thread() -> None:
     # IN-AE 의 컨테이너는 중앙 IN-CSE 에 있다. config.CSE_NAME 은 사업장
     # MN-CSE 이름이라, 그걸로 경로를 만들면 없는 리소스를 찾게 된다.
@@ -1563,13 +1623,17 @@ def _poll_thread() -> None:
                         ),
                     }
 
+                # 라운드 상태는 _control_thread 가 맡는다. 여기서는 노드
+                # 업로드가 바뀌었을 때만 보낸다.
                 snapshot = {
-                    "state": fl_state,
-                    "round": round_number,
-
                     "node_keys": sorted(
                         nodes.keys(),
                     ),
+                    "rounds": {
+                        node: data["round"]
+                        for node, data
+                        in nodes.items()
+                    },
 
                     "losses": {
                         node: data[
@@ -1584,29 +1648,25 @@ def _poll_thread() -> None:
                     previous_snapshot = snapshot
 
                     with _shared_lock:
-                        _shared.update(
-                            {
-                                "fl_state": fl_state,
-                                "round": round_number,
-                                "max_rounds": max_rounds,
-                                "nodes": nodes,
-                            }
-                        )
+                        _shared["nodes"] = nodes
+                        cur_state = _shared["fl_state"]
+                        cur_round = _shared["round"]
+                        cur_max = _shared["max_rounds"]
 
                     _broadcast(
                         {
                             "type": "round",
-                            "fl_state": fl_state,
-                            "round": round_number,
-                            "max_rounds": max_rounds,
+                            "fl_state": cur_state,
+                            "round": cur_round,
+                            "max_rounds": cur_max,
                             "nodes": nodes,
                         }
                     )
                     print(
                         "  [Poll] "
-                        f"R{round_number}/{max_rounds} "
-                        f"{fl_state} "
-                        f"nodes={list(nodes.keys())}"
+                        f"R{cur_round}/{cur_max} "
+                        f"{cur_state} "
+                        f"nodes={ {n: d['round'] for n, d in nodes.items()} }"
                     )
 
             # 라운드별 평가 결과. 새 라운드 것만 한 번씩 내보낸다.
@@ -1716,6 +1776,12 @@ def main() -> None:
         name="fl-poll",
     )
 
+    control_thread = threading.Thread(
+        target=_control_thread,
+        daemon=True,
+        name="fl-control",
+    )
+
     score_thread = threading.Thread(
         target=_score_thread,
         daemon=True,
@@ -1723,6 +1789,7 @@ def main() -> None:
     )
 
     polling_thread.start()
+    control_thread.start()
     score_thread.start()
 
     app.run(
