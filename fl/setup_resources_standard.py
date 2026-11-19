@@ -114,14 +114,14 @@ def reachable(label: str) -> bool:
     if code != 200:
         print(f"  ✗ {label}: {om2m.base_url()}/{cse}")
         if code is None:
-            print(f"      연결 실패 — {body}")
+            print(f"      connection failed — {body}")
         else:
             print(f"      HTTP {code}  {body}")
             hint = {
-                400: "헤더가 잘못됐을 수 있다 (RETRIEVE에 Content-Type ty)",
-                401: "인증 필요 — FL_IN_USER / FL_IN_PASS 를 설정하라",
-                403: "권한 없음 — X-M2M-Origin 과 ACP를 확인하라",
-                404: "경로에 리소스가 없다 — CSE 이름을 확인하라",
+                400: "header may be wrong (Content-Type ty on a RETRIEVE)",
+                401: "authentication required — set FL_IN_USER / FL_IN_PASS",
+                403: "forbidden — check X-M2M-Origin and the ACP",
+                404: "no resource at this path — check the CSE name",
             }.get(code)
             if hint:
                 print(f"      → {hint}")
@@ -168,10 +168,10 @@ def create_fl_ae(ae_name: str, origin: str) -> bool:
         return False
 
     if r.status_code == 201:
-        print(f"  ✓ AE 생성: {ae_name}  (Origin {origin})")
+        print(f"  ✓ AE created: {ae_name}  (Origin {origin})")
         return True
     if r.status_code == 409:
-        print(f"  = AE 이미 있음: {ae_name}")
+        print(f"  = AE already exists: {ae_name}")
         return True
     print(f"  ✗ AE {ae_name}: {r.status_code} {r.text[:160]}")
     return False
@@ -205,19 +205,19 @@ def verify_robot_aes(node: str) -> Dict[str, bool]:
     )
 
     if tel_paths:
-        print(f"  라벨 디스커버리 {labels}: {len(tel_paths)}/{want}대")
+        print(f"  Label discovery {labels}: {len(tel_paths)}/{want} robots")
         found: Dict[str, bool] = {}
         for rb in sorted(tel_paths):
             found[rb] = True
             print(f"    ✓ {tel_paths[rb]}")
         if len(found) < want:
-            print(f"    ⚠ {want}대 중 {len(found)}대만 라벨이 붙어 있다.")
+            print(f"    ⚠ Only {len(found)} of {want} robots are labeled.")
         return found
 
     # 라벨이 없으면 예전처럼 이름으로 찾는다(Isaac 이 아직 라벨을 안 다는 경우).
     codes = ", ".join(str(c) for c in om2m.LAST_DISCOVERY_STATUS)
-    print(f"  ⓘ 라벨 {labels} 로 못 찾았다 (응답 {codes or '없음'}). "
-          f"이름 규칙으로 되돌아간다")
+    print(f"  ⓘ Nothing found with labels {labels} (response {codes or 'none'}). "
+          f"Falling back to the naming rule")
     uril = om2m.discover(cse, ty=2, lim=200)
     robots = sorted({
         p.rstrip("/").split("/")[-1]
@@ -225,7 +225,7 @@ def verify_robot_aes(node: str) -> Dict[str, bool]:
         if p.rstrip("/").split("/")[-1].startswith(f"{site}_")
     })
 
-    print(f"  로봇 AE ({site}_*): {len(robots)}/{want}대 발견")
+    print(f"  Robot AEs ({site}_*): {len(robots)}/{want} found")
 
     found: Dict[str, bool] = {}
     for rb in robots:
@@ -235,9 +235,9 @@ def verify_robot_aes(node: str) -> Dict[str, bool]:
         print(f"    {'✓' if ok else '✗'} {rb}/{config.ROBOT_TELEMETRY_CNT}")
 
     if not robots:
-        print(f"    ⚠ {site} 로봇 AE가 하나도 없다. Isaac Sim을 먼저 띄워라.")
+        print(f"    ⚠ No {site} robot AE at all. Start Isaac Sim first.")
     elif len(robots) < want:
-        print(f"    ⚠ {want}대 중 {len(robots)}대만 등록됐다.")
+        print(f"    ⚠ Only {len(robots)} of {want} robots are registered.")
 
     return found
 
@@ -317,7 +317,7 @@ def setup_mn_acp(node: str) -> Optional[str]:
 
 def setup_in_resources(nodes: List[str], acps: Dict[str, str]) -> None:
     """IN-AE와 그 아래 제어·모델·수집 컨테이너를 만든다."""
-    print("\n=== IN-CSE 리소스 ===")
+    print("\n=== IN-CSE resources ===")
     cse = bind_in()
 
     create_fl_ae(config.IN_AE_NAME, ORIGIN_IN_AE)
@@ -416,16 +416,16 @@ def setup_analysis_ae(node: str, cse: str) -> None:
     ae_id = config.analysis_ae_id(node)
 
     if not create_fl_ae(ae_name, ae_id):
-        print(f"  ✗ {ae_name} 생성 실패 — 판정 컨테이너를 건너뛴다")
+        print(f"  ✗ Failed to create {ae_name} — skipping verdict containers")
         return
     time.sleep(SETTLE)
 
     robots = robot_ae_ids(cse, node)
     if robots:
-        print(f"  로봇 AE-ID: {', '.join(robots)}")
+        print(f"  Robot AE-IDs: {', '.join(robots)}")
     else:
-        print(f"  ⚠ 로봇 AE-ID 를 못 읽었다. 아이작심이 아직 안 올라왔으면 "
-              f"로봇에게 읽기 권한이 안 붙는다.")
+        print(f"  ⚠ Could not read robot AE-IDs. If Isaac Sim is not up yet, "
+              f"robots will not get read permission.")
 
     pv = [
         {"acor": [config.ORIGINATOR, ae_id], "acop": ACOP_ALL},
@@ -440,7 +440,7 @@ def setup_analysis_ae(node: str, cse: str) -> None:
         if getattr(config, "VERDICT_SUB_CREATE", True):
             acop |= ACOP_CREATE
         pv.append({"acor": subs, "acop": acop})
-        print(f"  판정 구독자: {', '.join(subs)}  (acop={acop})")
+        print(f"  Verdict subscribers: {', '.join(subs)}  (acop={acop})")
 
     if robots:
         pv.append({"acor": robots,
@@ -549,8 +549,8 @@ def wait_for_robots(nodes: List[str],
     로봇 한 대가 고장나 있다고 데모 전체를 막을 이유는 없다.
     시간이 다 되면 현재 상태를 알리고 그대로 진행한다 — 멈추지 않는다.
     """
-    print(f"\n=== Isaac Sim 대기 (최대 {timeout:.0f}s, "
-          f"사업장당 최소 {min_per_site}대) ===")
+    print(f"\n=== Waiting for Isaac Sim (up to {timeout:.0f}s, "
+          f"at least {min_per_site} robots per site) ===")
 
     deadline = time.time() + timeout
     next_log = 0.0
@@ -568,20 +568,20 @@ def wait_for_robots(nodes: List[str],
             for node, (ready, want) in status.items():
                 site = config.SITE_OF_NODE.get(node, node)
                 mark = "✓" if len(ready) >= min_per_site else "✗"
-                print(f"  {mark} {site}: {len(ready)}/{want}대 "
-                      f"({', '.join(ready) if ready else '없음'})")
+                print(f"  {mark} {site}: {len(ready)}/{want} robots "
+                      f"({', '.join(ready) if ready else 'none'})")
             if done:
-                print("  ✓ 학습을 시작할 수 있다")
+                print("  ✓ Ready to start training")
                 return True
-            print(f"\n  ⚠ {timeout:.0f}s 안에 다 준비되지 않았다.")
-            print("    Isaac Sim이 이 샌드박스에 등록 중인지 확인하라.")
+            print(f"\n  ⚠ Not everything was ready within {timeout:.0f}s.")
+            print("    Check that Isaac Sim is registering with this sandbox.")
             return False
 
         if now >= next_log:
             parts = [f"{config.SITE_OF_NODE.get(n, n)} {len(r)}/{w}"
                      for n, (r, w) in status.items()]
             print(f"  ⏳ {' / '.join(parts)}  "
-                  f"(남은 {deadline - now:.0f}s)")
+                  f"({deadline - now:.0f}s left)")
             next_log = now + 10.0
 
         time.sleep(5.0)
@@ -593,7 +593,7 @@ def wait_for_robots(nodes: List[str],
 
 def verify(nodes: List[str]) -> bool:
     print("\n" + "=" * 60)
-    print("  리소스 확인")
+    print("  Resource check")
     print("=" * 60)
 
     ok = True
@@ -631,10 +631,10 @@ def verify(nodes: List[str]) -> bool:
         # 로봇은 Isaac 소유라 없어도 실패로 치지 않는다. 경고만.
         robots = verify_robot_aes(node)
         if not robots:
-            print("    (로봇 데이터 없이는 학습을 돌릴 수 없다)")
+            print("    (training cannot run without robot data)")
 
     print()
-    print("✓ 우리 리소스는 모두 있다" if ok else "✗ 빠진 리소스가 있다")
+    print("✓ All our resources are present" if ok else "✗ Some resources are missing")
     return ok
 
 
@@ -647,7 +647,7 @@ def clean(nodes: List[str]) -> None:
     oneM2M DELETE로 우리가 만든 것만 지운다.
     로봇 AE는 Isaac 소유이므로 건드리지 않는다.
     """
-    print("\n=== 우리 리소스 삭제 ===")
+    print("\n=== Deleting our resources ===")
 
     cse = bind_in()
     for name in (f"{cse}/{config.IN_AE_NAME}",):
@@ -657,7 +657,7 @@ def clean(nodes: List[str]) -> None:
             om2m.delete_resource(f"{cse}/{n}")
     for n in ("acp-fl-control", "acp-global-model", "acp-local-updates"):
         om2m.delete_resource(f"{cse}/{n}")
-    print("  ✓ IN-CSE ACP 삭제")
+    print("  ✓ IN-CSE ACP deleted")
 
     for node in nodes:
         cse = bind_mn(node)
@@ -672,18 +672,18 @@ def clean(nodes: List[str]) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--clean", action="store_true",
-                    help="우리 리소스를 지우고 다시 만든다")
+                    help="delete our resources and recreate them")
     ap.add_argument("--verify", action="store_true",
-                    help="생성하지 않고 확인만 한다")
+                    help="check only, do not create")
     ap.add_argument("--nodes", default=",".join(config.ALL_NODES),
-                    help="대상 노드 (기본: mn1,mn2,mn3)")
+                    help="target nodes (default: mn1,mn2,mn3)")
     ap.add_argument("--wait-robots", nargs="?", type=float,
                     const=float(os.getenv("FL_ROBOT_WAIT_SEC", "300")),
                     default=None,
-                    help="Isaac Sim이 로봇 AE를 올릴 때까지 기다린다 (초)")
+                    help="wait until Isaac Sim registers the robot AEs (seconds)")
     ap.add_argument("--min-robots", type=int,
                     default=int(os.getenv("FL_MIN_ROBOTS_PER_SITE", "1")),
-                    help="사업장당 최소 로봇 수 (기본 1)")
+                    help="minimum robots per site (default 1)")
     args = ap.parse_args()
 
     config.require_sandbox()
@@ -691,16 +691,16 @@ def main() -> None:
     nodes = [n.strip() for n in args.nodes.split(",") if n.strip()]
 
     print("=" * 60)
-    print("  oneM2M FL 리소스 설정 (ACME / MEP별 CSE)")
+    print("  oneM2M FL resource setup (ACME / one CSE per MEP)")
     print("=" * 60)
-    print(f"  샌드박스 : {config.SANDBOX_HOST} / {config.SANDBOX_NAME}")
-    print(f"  노드     : {', '.join(nodes)}")
-    print(f"  학습 참여: {', '.join(config.TRAINING_NODES)}")
-    print(f"  비참여   : {', '.join(config.NON_CONTRIBUTING_NODES)}")
+    print(f"  Sandbox      : {config.SANDBOX_HOST} / {config.SANDBOX_NAME}")
+    print(f"  Nodes        : {', '.join(nodes)}")
+    print(f"  Training     : {', '.join(config.TRAINING_NODES)}")
+    print(f"  Not training : {', '.join(config.NON_CONTRIBUTING_NODES)}")
 
     # 먼저 4개 CSE가 다 뜨는지 본다. 하나라도 못 뜨면 생성이 반쯤
     # 끝난 상태로 남아 더 헷갈린다.
-    print("\n=== CSE 연결 확인 ===")
+    print("\n=== CSE connectivity check ===")
     bind_in()
     alive = reachable("IN-CSE")
     for node in nodes:
@@ -708,8 +708,8 @@ def main() -> None:
         alive &= reachable(f"{config.MEP_OF_NODE.get(node)} MN-CSE")
 
     if not alive:
-        print("\n✗ 닿지 않는 CSE가 있다. 샌드박스 시나리오가 떠 있는지,")
-        print("  FL_SANDBOX_HOST / FL_SANDBOX_NAME 이 맞는지 확인하라.")
+        print("\n✗ Some CSEs are unreachable. Check that the sandbox scenario is up")
+        print("  and that FL_SANDBOX_HOST / FL_SANDBOX_NAME are correct.")
         sys.exit(1)
 
     if args.wait_robots is not None:
@@ -731,7 +731,7 @@ def main() -> None:
         setup_mn_resources(node)
 
     ok = verify(nodes)
-    print("\n다음: python3 fl/in_ae_standard.py  /  python3 fl/mn_ae_standard.py <node>")
+    print("\nNext: python3 fl/in_ae_standard.py  /  python3 fl/mn_ae_standard.py <node>")
     sys.exit(0 if ok else 1)
 
 

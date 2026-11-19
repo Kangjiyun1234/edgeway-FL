@@ -468,7 +468,7 @@ def fetch_round_windows(
 
     if not cins:
         # 라운드 구분이 아예 없는 배포. 최근 구간으로 학습한다.
-        print(f"    ⓘ round_{round_num} 표시가 없어 최근 {limit}개로 대체")
+        print(f"    ⓘ No round_{round_num} marker, using the latest {limit} instead")
         return fetch_latest_windows(container_path, limit=limit)
 
     return build_from_cins(cins)
