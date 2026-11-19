@@ -31,6 +31,8 @@ if (!window.Chart) {
     --tr-bg:    #e6f1fb; --tr-text:  #0c447c; --tr-bar:   #378add;
     --fd-bg:    #fcebeb; --fd-text:  #791f1f; --fd-bar:   #e24b4a;
     --fault-line: #e24b4a;
+    --mn3-bg:   #f4f5f8;    /* mn3(로컬 전용) 카드 바탕. 누런 페이지 배경과 갈리도록 푸른 기가 도는 연회색 */
+    --mn3-bar:  #e5b300;    /* mn3 위 띠·테두리. Fault 때는 빨강이 덮는다 */
   }
 
   @media (prefers-color-scheme: dark) {
@@ -46,6 +48,7 @@ if (!window.Chart) {
       --ok-bg:   #173404; --ok-text: #c0dd97; --ok-bar:  #1d9e75;
       --tr-bg:   #042c53; --tr-text: #b5d4f4; --tr-bar:  #378add;
       --fd-bg:   #501313; --fd-text: #f7c1c1; --fd-bar:  #e24b4a;
+      --mn3-bg:  #2a2a2a;
     }
   }
 
@@ -57,9 +60,12 @@ if (!window.Chart) {
     padding: 24px;
   }
 
-  /* 전체 화면 폭. 양옆 여백은 화면 폭에 비례(최소 16px, 최대 96px)하고 body 패딩 24px이 더해진다.
-     1920px 화면 기준 한쪽 약 120px. */
-  .root { margin: 0 auto; padding: 0 clamp(16px, 5vw, 96px); display: flex; flex-direction: column; gap: 14px; }
+  /* 화면 전체(헤더~Reconnect)를 가로 4 : 세로 3 상자에 넣는다. 높이는 창 높이(위아래 body 패딩 24px 제외)에
+     맞추고, 폭은 그 4/3. 창이 그보다 좁으면 창 폭을 다 쓴다. 남는 높이는 차트 두 줄이 반씩 나눠 가진다. */
+  .root { width: min(100%, calc((100vh - 48px) * 4 / 3)); aspect-ratio: 4 / 3; margin: 0 auto;
+          display: flex; flex-direction: column; gap: 14px; }
+  .charts-sec { display: contents; }
+  .charts-sec > .section-label { margin-bottom: -6px; }
 
   .topbar { display: flex; justify-content: space-between; align-items: center; }
   .logo-title { font-size: 28.5px; font-weight: 600; color: var(--text); letter-spacing: -0.02em; }
@@ -95,7 +101,7 @@ if (!window.Chart) {
   .top-row { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); column-gap: 10px; }
   .top-row > .section-label,
   .top-row > .nodes-row     { grid-column: 1 / -1; }
-  .top-row > .progress-wrap { grid-column: span 2; margin-top: 10px; }
+  .top-row > .progress-wrap { grid-column: 1 / -1; margin-top: 10px; }
 
   .node {
     background: var(--bg);
@@ -170,19 +176,20 @@ if (!window.Chart) {
   .dot.cur  { background: var(--tr-bg);   border-color: var(--tr-bar);  color: var(--tr-text); font-weight: 600; }
   .dot.bad  { background: var(--fd-bar);  border-color: var(--fd-bar);  color: #fff; }
 
-  /* align-items:start — mn3 아래 경고가 붙어도 mn1·mn2 카드는 제 높이를 유지한다. */
-  .charts-grid { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; align-items: start; }
+  /* 두 차트 줄은 4:3 상자에서 남는 높이를 반씩 나눠 쓴다. 카드 높이가 줄 높이로 정해지므로
+     mn3 아래 경고가 붙으면 mn3 그래프만 그만큼 줄고, mn1·mn2 카드는 그대로다. */
+  .charts-grid { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; flex: 1 1 0; min-height: 200px; }
   /* 아래 줄도 차트 줄과 같은 3칸: 글로벌 loss 는 mn1 아래 1칸, 검증셋 표는 mn2~mn3 아래 2칸. */
-  .bottom-grid { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; }
+  /* 창 높이가 낮아도 차트 두 줄은 200px 아래로 줄지 않는다. 그때는 4:3 을 넘어 아래로 스크롤된다. */
+  .bottom-grid { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; flex: 1 1 0; min-height: 200px; }
   /* 검증셋 표는 줄 수와 상관없이 loss 카드 높이에 맞춘다. contain:size 라 행 높이를 키우지 않고,
      넘치는 줄은 표 안에서 스크롤한다. 처음부터 빈 표(열 이름만)로 같은 크기를 차지한다. */
   .bottom-grid > .evallog { grid-column: span 2; display: flex; flex-direction: column; contain: size; }
   .bottom-grid > .evallog .evallog-body { flex: 1; min-height: 0; max-height: none; }
-  /* 높이 맞춤. mn 카드 = 머리 + 값 + AUROC 줄 + 그래프, loss 카드 = 머리 + 값 + 그래프.
-     loss 그래프를 AUROC 줄(높이 + 아래 여백 8px)만큼 더 키워 두 카드 높이를 같게 한다. */
-  :root { --node-plot-h: 217px; --auroc-h: 18px; }
-  .node-plot { position: relative; height: var(--node-plot-h); }
-  .loss-plot { position: relative; height: calc(var(--node-plot-h) + var(--auroc-h) + 8px); }
+  /* 그래프는 카드에서 머리·값·AUROC 줄을 뺀 나머지 높이를 다 쓴다. */
+  .charts-grid > .chart-card, .bottom-grid > #cc-loss { display: flex; flex-direction: column; min-height: 0; }
+  :root { --auroc-h: 18px; }
+  .node-plot, .loss-plot { position: relative; flex: 1 1 0; min-height: 40px; }
 
   .chart-card {
     background: var(--bg); border: 0.5px solid var(--border);
@@ -191,6 +198,11 @@ if (!window.Chart) {
   }
   .chart-card.hl     { border-color: var(--tr-bar); }
   .chart-card.hl-red { border-color: var(--fault-line); border-width: 1px; }
+  /* mn3(로컬 전용) 노드 카드와 차트 카드: 연한 회색 바탕, 노란 띠·테두리.
+     Fault 때는 .node.fault / .chart-card.hl-red 의 빨강이 그대로 이긴다. */
+  #nd-mn3, #cc-mn3 { background: var(--mn3-bg); }
+  #nd-mn3:not(.fault)::before { background: var(--mn3-bar); }
+  #cc-mn3.hl { border-color: var(--mn3-bar); border-width: 1.5px; }
 
   .chart-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
   .chart-name { font-size: 22px; font-weight: 600; color: var(--text); }
@@ -250,14 +262,19 @@ if (!window.Chart) {
   }
 
   /* ── 카드 내 alert strip ── */
+  /* 4:3 화면에서는 카드 높이가 고정이라, 경고가 붙으면 mn3 그래프가 그만큼 준다.
+     그래서 경고를 한 줄로 줄인다: [⚠ Fault Detected] [상세 …] [ALERT]. 상세 전체는 마우스를 올리면 보인다. */
   .alert-strip {
-    display: none; flex-direction: column; gap: 4px;
-    margin-top: 10px; padding: 10px 12px;
+    display: none; flex-direction: row; align-items: center; gap: 10px;
+    margin-top: 6px; padding: 6px 10px;
     background: var(--fd-bg); border-radius: var(--radius-md);
     border: 0.5px solid #f09595;
   }
   .alert-strip.show { display: flex; }
-  .alert-strip-top { display: flex; align-items: center; justify-content: space-between; }
+  .alert-strip-top { display: contents; }
+  .alert-text { white-space: nowrap; }
+  .alert-chip { order: 2; }
+  .alert-detail { flex: 1 1 0; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .alert-text { font-size: 14px; font-weight: 700; color: var(--fd-text); }
   .alert-chip {
     font-size: 12px; background: var(--fault-line); color: #fff;
@@ -345,7 +362,8 @@ if (!window.Chart) {
     border-radius: var(--radius-lg); overflow: hidden;
   }
   .evallog-head { padding: 13px 16px; border-bottom: 0.5px solid var(--border);
-                  display: flex; justify-content: space-between; align-items: baseline; }
+                  display: flex; justify-content: space-between; align-items: baseline;
+                  gap: 4px 16px; flex-wrap: wrap; }
   .evallog-title { font-size: 22px; font-weight: 600; color: var(--text); }
   .evallog-sub  { font-size: 12px; font-weight: 500; color: var(--text3); }
   /* 고정폭 글꼴을 쓰지 않는다. 숫자만 등폭으로 두고 열은 그리드로 맞춘다. */
@@ -385,13 +403,16 @@ if (!window.Chart) {
   @media (max-width: 1200px) {
     .top-row > .progress-wrap { grid-column: 1 / -1; }
     .nodes-row { grid-template-columns: repeat(3, minmax(0,1fr)); }
+    .root { width: auto; aspect-ratio: auto; }
+    .charts-grid, .bottom-grid { flex: none; }
+    .node-plot { flex: none; height: 200px; }
   }
 
   @media (max-width: 1200px) {
     .bottom-grid { grid-template-columns: minmax(0,1fr); }
     .bottom-grid > .evallog { grid-column: auto; contain: none; }
     .bottom-grid > .evallog .evallog-body { flex: none; height: 250px; }
-    .loss-plot { height: 160px; }
+    .loss-plot { flex: none; height: 160px; }
   }
 
   @media (max-width: 760px) {
@@ -500,7 +521,7 @@ if (!window.Chart) {
   </div>
 
   <!-- 차트 -->
-  <div>
+  <div class="charts-sec">
     <div class="section-label">Reconstruction error (MSE) — live stream</div>
     <div class="charts-grid">
 
@@ -994,6 +1015,7 @@ function showFaultDetail() {
   if (faultShown || !faulted) return;
   faultShown = true;
   document.getElementById('alert-detail').textContent = faultDetail;
+  document.getElementById('alert-detail').title = faultDetail;
   document.getElementById('alert-strip').classList.add('show');
   setNode('mn3', 'fault', 'Fault!');
   document.getElementById('cc-mn3').className        = 'chart-card hl-red';
