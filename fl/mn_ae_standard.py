@@ -29,6 +29,7 @@ import model_codec
 import onem2m_utils as om2m
 import onem2m_pch
 import verdict
+import mec_services
 from edge_node import AEEdgeNode
 
 # "이번 라운드는 학습할 수 없다. 다만 노드를 죽일 일은 아니다"를 나타내는 신호.
@@ -169,6 +170,13 @@ class MNAETrainer:
         )
         # 이번 라운드에 읽은 윈도우. 판정은 학습이 끝난 뒤 이걸로 낸다.
         self.last_windows = None
+
+        # MEC 서비스(MEC011 등록·발견, MEC028 링크, MEC013 위치).
+        # 링크·위치 기록은 이 사업장 학습 앱의 cnt-net-status 에 남긴다.
+        self.mec = mec_services.SiteMec(self.node_name)
+        self.net_status_path = (
+            f"{self.mn_cse_name}/{self.ae_name}/cnt-net-status"
+        )
 
         self.job_event = threading.Event()
         self.job_lock = threading.Lock()
@@ -1778,6 +1786,32 @@ class MNAETrainer:
             block["window_robots"] = [str(v) for v in robots]
         return block
 
+    def _record_net_status(self, round_num: int) -> None:
+        """
+        이번 라운드 로봇 링크(MEC028)·위치(MEC013)를 cnt-net-status 에 남긴다.
+        데이터를 다 모은 직전 시점의 상태다. 실패해도 라운드는 계속된다.
+        """
+        try:
+            snap = self.mec.link_snapshot(round_num)
+        except Exception as e:
+            print(f"  ⚠ {self.node_name}: MEC 링크·위치 조회 실패 — {e}")
+            return
+        if not snap:
+            return
+        bad = [r.get("ae") for r in snap["robots"]
+               if r.get("verdict") in ("DEGRADED", "LOST")]
+        zones = sorted({str(r["zone"]) for r in snap["robots"] if r.get("zone")})
+        print(f"  ◦ MEC 링크·위치 ({'+'.join(snap['sources'])}): "
+              f"{snap['summary'] or '-'}"
+              + (f"  나쁨 {', '.join(bad)}" if bad else "")
+              + (f"  zone {', '.join(zones)}" if zones else ""))
+        res = om2m.create_content_instance(
+            self.net_status_path, snap,
+            labels=[f"round_{round_num}", "net-status"],
+        )
+        if not res:
+            print(f"  ⚠ cnt-net-status 기록 실패")
+
     def _publish_verdicts(self, round_num: int,
                           model_uri: str = None) -> int:
         """
@@ -1826,6 +1860,9 @@ class MNAETrainer:
                 cts=w["ct"],
                 poses=w.get("pose"),
                 model_uri=model_uri,
+                enrich=(self.mec.robot_context
+                        if (self.mec.loc.enabled or self.mec.link.enabled)
+                        else None),
             )
         except Exception as e:
             print(f"  ⚠ {self.node_name}: 판정 실패 — {e}")
@@ -2013,6 +2050,12 @@ class MNAETrainer:
         # 로봇이 올라온 뒤에 구독을 건다. 없는 컨테이너에는 못 건다.
         self._subscribe_to_telemetry()
 
+        # MEP 에 MEC 앱으로 등록하고 MEC013·028 주소를 찾는다. 실패해도 진행한다.
+        try:
+            self.mec.start()
+        except Exception as e:
+            print(f"  ⚠ {self.node_name}: MEC 기동 실패(계속 진행) — {e}")
+
         # 쌓여 있는 텔레메트리를 처음부터 쓴다(기본).
         # 묵은 게 섞였을 때만 FL_SENSOR_BACKLOG_SEC 으로 경계를 준다.
         if os.getenv("FL_SENSOR_SEED_CURSOR", "1") != "0":
@@ -2061,6 +2104,8 @@ class MNAETrainer:
                     "stop MN-AE"
                 )
                 return
+
+            self._record_net_status(round_num)
 
             self.edge_node = self._build_ae_node_from_data_dict(data_dict)
             if self.edge_node is None:

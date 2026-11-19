@@ -113,7 +113,8 @@ def publish(node_name: str,
             cts=None,
             poses=None,
             model_uri: Optional[str] = None,
-            k: Optional[int] = None) -> int:
+            k: Optional[int] = None,
+            enrich=None) -> int:
     """
     로봇별로 판정을 내고 CIN 으로 올린다. 올린 건수를 돌려준다.
 
@@ -164,6 +165,14 @@ def publish(node_name: str,
                 "model": model_uri,
                 "timestamp": time.time(),
             }
+            # MEC 정보(Zone·AP·링크). 실패해도 판정은 그대로 올린다.
+            if enrich is not None:
+                try:
+                    mec = enrich(robot)
+                    if mec:
+                        payload["mec"] = mec
+                except Exception as e:
+                    print(f"    ⚠ {robot}: MEC 정보 붙이기 실패 — {e}")
             res = om2m.create_content_instance(
                 cnt_path, payload,
                 labels=[robot, "ANOMALY", site],

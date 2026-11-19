@@ -40,6 +40,9 @@ UL_MIN_KBPS = float(os.getenv("FL_UL_MIN_KBPS", "500"))   # 상향 최소 전송
 
 TIMEOUT = float(os.getenv("FL_MEC_TIMEOUT_SEC", "8"))
 
+# MEC011 서비스 발견으로 찾은 주소가 있으면 그걸 쓴다. mep -> base url
+DISCOVERED: Dict[str, str] = {}
+
 
 def _verify():
     return config.TLS_VERIFY
@@ -53,6 +56,8 @@ def wai_base(mep: str) -> str:
     override = os.getenv(f"FL_WAI_BASE_{mep.replace('-', '_').upper()}")
     if override:
         return override.rstrip("/")
+    if mep in DISCOVERED:
+        return DISCOVERED[mep]
     scheme = os.getenv("FL_SANDBOX_SCHEME", "https")
     return (f"{scheme}://{config.SANDBOX_HOST}"
             f"/{config.SANDBOX_NAME}/{mep}/wai/v2")
