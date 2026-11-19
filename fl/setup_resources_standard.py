@@ -6,6 +6,10 @@ MEC 샌드박스에는 CSE가 4개다. 사업장마다 MEP 안에 MN-CSE가 하�
 다르므로, 이 스크립트는 생성 직전에 바인딩을 바꿔 가며 돈다.
 
   IN-CSE (클라우드)                        config.in_endpoint()
+    TRAINING-AE-1/2/3                      ← 우리가 만든다. 사업장 학습 앱이
+                                             MN-CSE 와 IN-CSE 양쪽에 등록된다.
+                                             IN 쪽은 <pollingChannel> 을 걸고
+                                             드롭박스에 쓰기 위한 신원이다.
     IN-AE                                  ← 우리가 만든다
       cnt-fl-control      라운드 지시 (IN→MN)
       cnt-global-model    글로벌 가중치 (IN→MN)
@@ -17,23 +21,27 @@ MEC 샌드박스에는 CSE가 4개다. 사업장마다 MEP 안에 MN-CSE가 하�
     siteA_AMR_1 … siteA_AMR_4              ← Isaac Sim이 만든다. 확인만 한다
       telemetry                            ← Isaac이 채운다. 우리는 읽는다
       status
-    MN-AE-1                                ← 우리가 만든다
+    TRAINING-AE-1                          ← 우리가 만든다. 학습 앱
       cnt-local-model     라운드 캐시
       cnt-net-status      MEC028 스냅샷 / 버퍼 상태
+    ANALYSIS-AE-1                          ← 우리가 만든다. 분석 앱
+      cnt-verdict         판정 결과. 사업장 밖으로 나가지 않는다
 
 AE가 두 종류라는 점이 중요하다.
   로봇 AE   : Isaac Sim이 CSE에 등록한다. 여기서 만들지 않는다. 없으면 경고만.
-  FL 앱 AE  : MN-AE-1/2/3, IN-AE. 아무도 만들어 주지 않으므로 여기서 만든다.
+  FL 앱 AE  : TRAINING-AE-1/2/3, ANALYSIS-AE-1/2/3, IN-AE.
+              아무도 만들어 주지 않으므로 여기서 만든다.
 
 TinyIoT 시절의 PostgreSQL 직접 초기화(clean_db)는 없앴다. ACME는 클라우드에
 있고 DB 접근권도 없다. 초기화는 oneM2M DELETE로만 한다.
 
 ACP 정책
-  acp-fl-control    IN-AE 전체 / MN-AE-* RETRIEVE          (IN-CSE)
-  acp-global-model  IN-AE 전체 / MN-AE-* RETRIEVE          (IN-CSE)
-  acp-local-updates IN-AE 전체 / MN-AE-* CREATE            (IN-CSE)
-  acp-dropbox-mnX   IN-AE 전체 / 해당 MN-AE-X만 CREATE     (IN-CSE)
-  acp-cache-mnX     해당 MN-AE-X 전체 / IN-AE RETRIEVE     (MN-CSE of X)
+  acp-fl-control    IN-AE 전체 / TRAINING-AE-* RETRIEVE          (IN-CSE)
+  acp-global-model  IN-AE 전체 / TRAINING-AE-* RETRIEVE          (IN-CSE)
+  acp-local-updates IN-AE 전체 / TRAINING-AE-* CREATE            (IN-CSE)
+  acp-dropbox-mnX   IN-AE 전체 / 해당 TRAINING-AE-X만 CREATE     (IN-CSE)
+  acp-cache-mnX     해당 TRAINING-AE-X 전체 / IN-AE RETRIEVE     (MN-CSE of X)
+  acp-verdict-mnX   분석 앱 전체 / 학습 앱·로봇 AE RETRIEVE      (MN-CSE of X)
   로봇 telemetry에는 ACP를 걸지 않는다. Isaac 소유다.
 
 ACOP 비트마스크 (TS-0001)
@@ -70,8 +78,8 @@ SETTLE = 0.3  # CSE가 생성을 커밋할 시간
 
 
 def origin_mn(node: str) -> str:
-    """MN-AE-i의 Originator. mn2 -> CMN-AE-2"""
-    return config.mn_ae_id(node)
+    """학습 앱의 Originator. mn2 -> CTRAINING-AE-2"""
+    return config.training_ae_id(node)
 
 
 def all_mn_origins(nodes: List[str]) -> List[str]:
@@ -123,14 +131,14 @@ def reachable(label: str) -> bool:
 
 
 # ════════════════════════════════════════════════════════
-# AE 생성 (우리 소유: IN-AE, MN-AE-i)
+# AE 생성 (우리 소유: IN-AE, TRAINING-AE-i, ANALYSIS-AE-i)
 # ════════════════════════════════════════════════════════
 
 def create_fl_ae(ae_name: str, origin: str) -> bool:
     """
     FL 애플리케이션 AE를 등록한다.
 
-    rr=True는 request reachable. IN-AE가 보내는 NOTIFY를 MN-AE가 받으려면
+    rr=True는 request reachable. IN-AE가 보내는 NOTIFY를 학습 앱이 받으려면
     필요하다. srv는 지원 릴리스 버전(TS-0004).
     이미 있으면(409) 그대로 둔다.
     """
@@ -184,6 +192,32 @@ def verify_robot_aes(node: str) -> Dict[str, bool]:
     site = config.SITE_OF_NODE.get(node, node)
     want = config.ROBOTS_PER_NODE.get(node, 0)
 
+    # 먼저 라벨로 telemetry 컨테이너를 찾는다. 이름 규칙에 기대지 않는다.
+    # 'siteC:telemetry' 로 먼저 찾고, 결과마다 lbl 을 다시 확인한다.
+    # 우리 컨테이너에도 site: 라벨이 붙어 있어 lbl 을 여러 개 주는 조회는
+    # CSE 가 OR 로 해석하면 그것까지 로봇으로 잡는다.
+    labels = [config.site_telemetry_label(node)] + config.telemetry_labels(node)
+    tel_paths = om2m.discover_telemetry(
+        cse, site,
+        cnt_name=config.ROBOT_TELEMETRY_CNT,
+        type_label=config.LABEL_TYPE_TELEMETRY,
+        combined_label=config.site_telemetry_label(node),
+    )
+
+    if tel_paths:
+        print(f"  라벨 디스커버리 {labels}: {len(tel_paths)}/{want}대")
+        found: Dict[str, bool] = {}
+        for rb in sorted(tel_paths):
+            found[rb] = True
+            print(f"    ✓ {tel_paths[rb]}")
+        if len(found) < want:
+            print(f"    ⚠ {want}대 중 {len(found)}대만 라벨이 붙어 있다.")
+        return found
+
+    # 라벨이 없으면 예전처럼 이름으로 찾는다(Isaac 이 아직 라벨을 안 다는 경우).
+    codes = ", ".join(str(c) for c in om2m.LAST_DISCOVERY_STATUS)
+    print(f"  ⓘ 라벨 {labels} 로 못 찾았다 (응답 {codes or '없음'}). "
+          f"이름 규칙으로 되돌아간다")
     uril = om2m.discover(cse, ty=2, lim=200)
     robots = sorted({
         p.rstrip("/").split("/")[-1]
@@ -289,12 +323,31 @@ def setup_in_resources(nodes: List[str], acps: Dict[str, str]) -> None:
     create_fl_ae(config.IN_AE_NAME, ORIGIN_IN_AE)
     time.sleep(SETTLE)
 
+    # 사업장 학습 앱은 IN-CSE 에도 AE 로 등록돼 있어야 한다.
+    #
+    # <pollingChannel> 은 AE 의 자식이고 그 AE 본인만 만들 수 있다(관리자도
+    # 안 된다). 캠퍼스 방화벽이 인바운드를 버려서 IN-CSE 가 우리를 직접
+    # 부르지 못하므로, 라운드 명령은 전부 그 채널로 온다. 여기에 AE 가
+    # 없으면 MN 은 명령을 영영 못 받는다. 드롭박스 ACP 의 acor 도 이
+    # AE-ID 를 가리킨다.
+    #
+    # 지금까지 이 코드가 없었다. IN-CSE 에 있던 AE 들은 예전에 손으로
+    # 만든 것이고, 그 CSE 가 초기화되면 조용히 전부 멈췄을 것이다.
+    for node in nodes:
+        create_fl_ae(config.training_ae_name(node),
+                     config.training_ae_id(node))
+        time.sleep(SETTLE)
+
     ae = f"{cse}/{config.IN_AE_NAME}"
 
-    def cnt(parent: str, name: str, mni: int, acp_key: Optional[str]) -> None:
+    # 라벨을 달아 둔다. 경로를 박는 대신 ?fu=1&lbl=... 로 찾게 하는
+    # 열쇠다. type: 은 무엇인지, scope:in 은 중앙 리소스라는 뜻이다.
+    def cnt(parent: str, name: str, mni: int, acp_key: Optional[str],
+            kind: Optional[str] = None) -> None:
         om2m.create_container(
             parent, name, mni=mni,
             acpi=[acps[acp_key]] if acp_key and acps.get(acp_key) else None,
+            labels=["scope:in", f"type:{kind or name.removeprefix('cnt-')}"],
         )
         print(f"  ✓ {name}  (mni={mni})")
         time.sleep(SETTLE)
@@ -310,6 +363,8 @@ def setup_in_resources(nodes: List[str], acps: Dict[str, str]) -> None:
             updates, f"cnt-{node}", mni=50,
             acpi=([acps[f"dropbox-{node}"]]
                   if acps.get(f"dropbox-{node}") else None),
+            labels=["scope:in", "type:local-updates",
+                    f"node:{node}", config.site_label(node)],
         )
         print(f"    ✓ cnt-local-updates/cnt-{node}")
         time.sleep(SETTLE)
@@ -349,10 +404,13 @@ def setup_analysis_ae(node: str, cse: str) -> None:
 
     권한
       분석 앱   전권 (자기 리소스)
-      로봇 AE   RETRIEVE + NOTIFY + DISCOVERY  -> 구독해서 판정을 받는다
-      학습 앱   RETRIEVE + DISCOVERY           -> 대시보드가 읽는다
+      판정 앱   RETRIEVE + NOTIFY + DISCOVERY (+ CREATE)  -> 구독해서 받는다
+      로봇 AE   RETRIEVE + NOTIFY + DISCOVERY             -> 구독해서 받는다
+      학습 앱   RETRIEVE + DISCOVERY                      -> 대시보드가 읽는다
 
     로봇에 CREATE 를 주지 않는 것이 요점이다. 판정은 분석 앱만 쓴다.
+    판정 앱(CJUDGE-AE-i)에만 CREATE 를 같이 주는데, <subscription> 생성에
+    CREATE 가 필요한 CSE 가 있어서다. config.VERDICT_SUB_CREATE 참고.
     """
     ae_name = config.analysis_ae_name(node)
     ae_id = config.analysis_ae_id(node)
@@ -374,6 +432,16 @@ def setup_analysis_ae(node: str, cse: str) -> None:
         {"acor": [origin_mn(node)],
          "acop": ACOP_RETRIEVE | ACOP_DISCOVERY},
     ]
+
+    # 판정 앱. 구독을 걸어 알림으로 받아 간다.
+    subs = config.verdict_subscribers(node)
+    if subs:
+        acop = ACOP_RETRIEVE | ACOP_NOTIFY | ACOP_DISCOVERY
+        if getattr(config, "VERDICT_SUB_CREATE", True):
+            acop |= ACOP_CREATE
+        pv.append({"acor": subs, "acop": acop})
+        print(f"  판정 구독자: {', '.join(subs)}  (acop={acop})")
+
     if robots:
         pv.append({"acor": robots,
                    "acop": ACOP_RETRIEVE | ACOP_NOTIFY | ACOP_DISCOVERY})
@@ -389,6 +457,7 @@ def setup_analysis_ae(node: str, cse: str) -> None:
         f"{cse}/{ae_name}", config.VERDICT_CNT,
         mni=config.VERDICT_MNI,
         acpi=[acp_ri] if acp_ri else None,
+        labels=config.resource_labels(node, "verdict"),
     )
     print(f"  ✓ {ae_name}/{config.VERDICT_CNT}  (mni={config.VERDICT_MNI})")
     time.sleep(SETTLE)
@@ -398,7 +467,7 @@ def setup_mn_resources(node: str) -> Dict[str, bool]:
     """
     한 사업장 분. MEP의 MN-CSE에 바인딩하고
       1) 로봇 AE / telemetry 확인 (Isaac 소유)
-      2) MN-AE-i 생성 (우리 소유)
+      2) TRAINING-AE-i 생성 (우리 소유)
       3) cnt-local-model, cnt-net-status 생성
     """
     site = config.SITE_OF_NODE.get(node, node)
@@ -411,7 +480,7 @@ def setup_mn_resources(node: str) -> Dict[str, bool]:
 
     robots = verify_robot_aes(node)
 
-    ae_name = f"MN-AE-{node[2:]}"
+    ae_name = config.training_ae_name(node)
     create_fl_ae(ae_name, origin_mn(node))
     time.sleep(SETTLE)
 
@@ -422,6 +491,7 @@ def setup_mn_resources(node: str) -> Dict[str, bool]:
     om2m.create_container(
         ae, "cnt-local-model", mni=5,
         acpi=[acp_ri] if acp_ri else None,
+        labels=config.resource_labels(node, "local-model"),
     )
     print("  ✓ cnt-local-model  (mni=5)")
     time.sleep(SETTLE)
@@ -430,6 +500,7 @@ def setup_mn_resources(node: str) -> Dict[str, bool]:
     om2m.create_container(
         ae, "cnt-net-status", mni=100,
         acpi=[acp_ri] if acp_ri else None,
+        labels=config.resource_labels(node, "net-status"),
     )
     print("  ✓ cnt-net-status  (mni=100)")
     time.sleep(SETTLE)
@@ -549,7 +620,7 @@ def verify(nodes: List[str]) -> bool:
         mep = config.MEP_OF_NODE.get(node, "?")
         print(f"\n[{mep}] {om2m.base_url()}/{cse}  ({site})")
 
-        ae_name = f"MN-AE-{node[2:]}"
+        ae_name = config.training_ae_name(node)
         for t in (f"{cse}/{ae_name}",
                   f"{cse}/{ae_name}/cnt-local-model",
                   f"{cse}/{ae_name}/cnt-net-status"):
@@ -590,7 +661,7 @@ def clean(nodes: List[str]) -> None:
 
     for node in nodes:
         cse = bind_mn(node)
-        ae_name = f"MN-AE-{node[2:]}"
+        ae_name = config.training_ae_name(node)
         print(f"  {'✓' if om2m.delete_resource(f'{cse}/{ae_name}') else '✗'} "
               f"{config.MEP_OF_NODE.get(node)}/{ae_name}")
         om2m.delete_resource(f"{cse}/acp-cache-{node}")

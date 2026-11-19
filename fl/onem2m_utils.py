@@ -63,7 +63,7 @@ def set_originator(aeid: Optional[str]) -> None:
     아무것도 막히지 않았다. 사업장 간 격리가 설정만 돼 있고 발동하지
     않는 상태였다.
 
-    각 AE가 자기 AE-ID(CMN-AE-1, CIN-AE …)로 요청해야 ACP가 의미를 갖는다.
+    각 AE가 자기 AE-ID(CTRAINING-AE-1, CIN-AE …)로 요청해야 ACP가 의미를 갖는다.
     None 을 주면 기본값으로 돌아간다.
     """
     global _ORIGINATOR
@@ -359,17 +359,22 @@ def create_container(
     mni: int = 1000,
     mbs: int = 10_000_000,
     acpi: Optional[List[str]] = None,
+    labels: Optional[List[str]] = None,
 ) -> Optional[Dict]:
     """
     Container 생성.
     mbs: max byte size (기본 10MB — 가중치 CIN이 들어갈 여유)
     acpi: ACP ri 목록. 지정 시 생성과 동시에 acpi 연결 시도,
           실패하면 생성 후 UPDATE로 재시도.
+    labels: 리소스 라벨(lbl). 경로를 박아 두는 대신 디스커버리로 찾게
+          해 주는 열쇠다. 예: ["site:siteC", "type:local-model"].
     """
     url = _url(parent_path)
     cnt_obj: Dict[str, Any] = {"rn": container_name, "mni": mni, "mbs": mbs}
     if acpi:
         cnt_obj["acpi"] = acpi
+    if labels:
+        cnt_obj["lbl"] = list(labels)
 
     payload = {"m2m:cnt": cnt_obj}
     try:
@@ -540,6 +545,138 @@ def discover_uril_by_label(container_path: str, label: str, lim: int = 20) -> Li
         except Exception:
             continue
     return []
+
+
+def discover_by_labels(
+    parent_path: str,
+    labels: List[str],
+    ty: Optional[int] = None,
+    lim: int = 200,
+    match_all: bool = True,
+) -> List[str]:
+    """
+    라벨로 리소스를 찾는다 (?fu=1&lbl=...). 경로 문자열 목록을 돌려준다.
+
+    왜 쓰나
+      리소스 경로를 코드에 박아 두면, 로봇이 늘거나 이름 규칙이 바뀌면
+      코드를 고쳐야 한다. 라벨로 찾으면 Isaac Sim 이 올린 그대로를
+      그때그때 읽는다. 늦게 올라온 로봇도 다음 조회에서 잡힌다.
+
+    labels    : ["site:siteC", "type:telemetry"] 처럼 여러 개
+    ty        : 2 AE / 3 container / 4 contentInstance. None 이면 전부
+    match_all : True 면 모든 라벨을 만족해야 한다(fo=1 AND).
+                False 면 하나만 맞아도 된다(fo=2 OR).
+
+    CSE 마다 fo 와 라벨 인코딩 처리가 조금씩 달라서 몇 가지 형태를
+    차례로 시도하고, 처음 성공한 것을 쓴다.
+    """
+    if not labels:
+        return []
+    base = _url(parent_path)
+    ty_q = f"&ty={ty}" if ty is not None else ""
+    raw = "".join(f"&lbl={l}" for l in labels)
+    enc = "".join(f"&lbl={requests.utils.quote(l, safe='')}" for l in labels)
+    fo = "&fo=1" if match_all else "&fo=2"
+
+    candidates = [
+        f"{base}?fu=1&lim={lim}{ty_q}{fo}{raw}",
+        f"{base}?fu=1&lim={lim}{ty_q}{fo}{enc}",
+        f"{base}?fu=1&lim={lim}{ty_q}{raw}",
+        f"{base}?fu=1&lim={lim}{ty_q}{enc}",
+    ]
+    # 다 실패했을 때 왜 실패했는지 남긴다. 403 이면 DISCOVERY 권한,
+    # 200 인데 비었으면 라벨이 안 붙은 것이다. 둘은 고칠 곳이 다르다.
+    LAST_DISCOVERY_STATUS.clear()
+    for url in candidates:
+        try:
+            r = _request_with_retry("get", url, headers=_headers(), timeout=15)
+            LAST_DISCOVERY_STATUS.append(r.status_code)
+            if r.status_code != 200:
+                continue
+            uril = r.json().get("m2m:uril", [])
+            if isinstance(uril, list) and uril:
+                return uril
+        except Exception as e:
+            LAST_DISCOVERY_STATUS.append(type(e).__name__)
+            continue
+    return []
+
+
+# discover_by_labels 가 마지막에 시도한 요청들의 응답 코드.
+LAST_DISCOVERY_STATUS: List[Any] = []
+
+
+def _relative_to_cse(raw: str, cse: str) -> List[str]:
+    """디스커버리 결과 한 줄 -> cse 이름부터 시작하는 경로 조각들.
+
+    CSE 마다 '/<cse-id>/<cse-rn>/...' 처럼 앞에 더 붙여 줄 수 있어서
+    cse 이름 위치를 찾아 거기서부터 쓴다. 못 찾으면 그대로 둔다.
+    """
+    parts = [x for x in strip_prefix(raw).split("/") if x]
+    if cse in parts:
+        parts = parts[parts.index(cse):]
+    return parts
+
+
+def discover_telemetry(
+    cse: str,
+    site: str,
+    cnt_name: str = "telemetry",
+    type_label: str = "type:telemetry",
+    combined_label: Optional[str] = None,
+    lim: int = 200,
+) -> Dict[str, str]:
+    """
+    한 사업장의 로봇 telemetry 컨테이너를 라벨로 찾는다. {로봇 AE 이름: 경로}
+
+    Isaac Sim 이 다는 라벨 (합의한 형태):
+      ["site:siteC", "robot:AMR_2", "ae:siteC_AMR_2",
+       "type:telemetry", "siteC:telemetry"]
+
+    [왜 'siteC:telemetry' 한 개로 먼저 찾나]
+    lbl 을 여러 개 주면 CSE 구현에 따라 AND 가 아니라 OR 로 해석될 수
+    있다(같은 조건 태그의 여러 값). OR 이면 site:siteC 만 붙은 것이 다
+    걸린다. 우리 학습/분석 AE 의 cnt-local-model, cnt-net-status,
+    cnt-verdict 에도 site:siteC 를 달았기 때문에 그것들이 '로봇' 으로
+    잡혔다. 사업장과 종류를 한 라벨에 묶은 siteC:telemetry 는 해석이
+    갈릴 여지가 없다. 그것으로 못 찾을 때만 두 라벨 조합을 쓴다.
+
+    [왜 결과를 다시 확인하나]
+    어느 쪽으로 찾았든 컨테이너를 한 번씩 읽어 lbl 을 직접 본다.
+    site 와 type 이 둘 다 맞는 것만 남긴다. 로봇 이름은 'ae:' 라벨을
+    우선 쓰고, 없으면 경로에서 부모 이름을 쓴다.
+    """
+    site_label = f"site:{site}"
+    combined_label = combined_label or f"{site}:telemetry"
+
+    uris: List[str] = []
+    for labels in ([combined_label], [site_label, type_label]):
+        got = discover_by_labels(cse, labels, ty=3, lim=lim)
+        if got:
+            uris = got
+            break
+
+    found: Dict[str, str] = {}
+    for raw in uris:
+        parts = _relative_to_cse(raw, cse)
+        if len(parts) < 2:
+            continue
+        path = "/".join(parts) if parts[0] == cse else \
+            f"{cse}/{parts[-2]}/{parts[-1]}"
+
+        res = get_resource(path)
+        cnt = (res or {}).get("m2m:cnt") or {}
+        lbl = [str(x) for x in (cnt.get("lbl") or [])]
+        ok = (combined_label in lbl) or (site_label in lbl and type_label in lbl)
+        if not ok:
+            continue
+
+        robot = next((x[3:] for x in lbl if x.startswith("ae:")), parts[-2])
+        # 한 로봇에 후보가 둘이면 이름이 telemetry 인 쪽을 쓴다.
+        if robot in found and parts[-1] != cnt_name:
+            continue
+        found[robot] = path
+    return found
 
 
 def list_uril(container_path: str, lim: int = 50) -> List[str]:

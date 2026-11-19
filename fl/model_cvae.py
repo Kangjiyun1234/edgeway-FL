@@ -124,6 +124,24 @@ class CVAE1D(nn.Module):
         kl = kl / (x.shape[1] * x.shape[2])
         return rec + beta * kl, rec.detach(), kl.detach()
 
+    def loss_terms(
+        self,
+        x: torch.Tensor,
+        c: Optional[torch.Tensor] = None,
+        beta: float = 0.5,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        샘플별 ELBO. loss() 와 같은 식이되 배치 평균을 내지 않는다.
+
+        절사 손실(손실 큰 쪽을 그 에폭 학습에서 제외)을 쓰려면 샘플마다
+        값이 있어야 한다. loss_terms(...)[0].mean() 은 loss(...)[0] 과 같다.
+        """
+        recon, mu, logvar = self.forward(x, c)
+        rec = ((recon - x) ** 2).mean(dim=(1, 2))
+        kl = -0.5 * (1 + logvar - mu ** 2 - logvar.exp()).sum(dim=1)
+        kl = kl / (x.shape[1] * x.shape[2])
+        return rec + beta * kl, rec.detach(), kl.detach()
+
     # ── 이상 점수 ─────────────────────────────────────────
     @torch.no_grad()
     def channel_error(
@@ -135,6 +153,32 @@ class CVAE1D(nn.Module):
         self.eval()
         recon, _, _ = self.forward(x, c)
         return ((recon - x) ** 2).mean(dim=2)
+
+    @torch.no_grad()
+    def channel_diff_error(
+        self,
+        x: torch.Tensor,
+        c: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        채널별 '차분' 재구성 오차 (B, C).
+
+        왜 원신호가 아니라 차분인가
+          고장 세 가지(바닥 요철 / 휠 돌기 / 베어링)는 전부 가속도계의
+          1 샘플 단위 떨림으로 나타난다. 진폭 자체는 거의 안 변한다.
+          원신호 오차는 1 초 창의 저주파 궤적을 복원하는 오차가 크고
+          주행마다 들쭉날쭉해서, 그 위에 얹힌 미세한 고주파 어긋남을
+          덮어 버린다. 차분을 먼저 취하면 저주파 성분이 빠진다.
+
+        실측 (2노드 FedAvg 10 라운드, 라벨 붙은 siteC, 시드 3 개)
+          원신호 오차  floor 0.950  wknob 0.683  bearing 0.550
+          차분 오차    floor 0.975  wknob 0.783  bearing 0.749
+        """
+        self.eval()
+        recon, _, _ = self.forward(x, c)
+        d_x = x[..., 1:] - x[..., :-1]
+        d_r = recon[..., 1:] - recon[..., :-1]
+        return (d_r - d_x).abs().mean(dim=2)
 
     @torch.no_grad()
     def anomaly_score(

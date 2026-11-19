@@ -2,19 +2,38 @@
 # run_fl.sh — edgeway 연합학습 데모 기동
 #
 # 전제
-#   1) MEC 샌드박스 시나리오(edgeway)가 떠 있다. MEP 3개 + 클라우드 IN-CSE.
+#   1) MEC 샌드박스 시나리오(edgeway)가 떠 있다. MEP 3개에 MN-CSE 가 하나씩.
+#      IN-CSE 는 샌드박스 밖의 공유 CSE 다(.env.local 의 FL_IN_BASE_URL).
 #   2) Isaac Sim이 각 MN-CSE에 로봇 AE를 등록하고 telemetry를 보내고 있다.
 #      로봇 AE는 우리가 만들지 않는다.
-#   3) .env.local 에 샌드박스 주소가 들어 있고 source 되어 있다.
+#   3) .env.local 에 샌드박스·IN-CSE 주소가 들어 있다. 이 스크립트가 읽는다.
 #
 # 순서
-#   리소스 확인/생성 → 대시보드 → Isaac 대기 → MN-AE → IN-AE
+#   리소스 확인/생성 → 대시보드 → Isaac 대기 → 학습 앱 3개 → IN-AE
+#
+# 자주 쓰는 설정 (전부 환경변수. 앞에 붙여 쓰면 된다)
+#   FL_GLOBAL_ROUNDS=10          라운드 수
+#   FL_SENSOR_MIN_WINDOWS=50     라운드당 사업장별 윈도우 수
+#   FL_SENSOR_BACKLOG_SEC=0      0 이면 쌓여 있는 것을 처음부터 전부 쓴다
+#                                양수면 그 초 이내 것만, 음수면 전부 건너뛴다
+#   FL_TRIM_RATIO=0.15           학습에서 손실 상위 몇 %를 뺄지. 0 이면 끔
+#   FL_TRIM_WARMUP_EPOCHS=2      그 전 몇 에폭은 자르지 않을지
+#   FL_LABEL_FOR_TRAIN=0         1 이면 정상 라벨만 학습(지도). 기본은 비지도
+#   FL_VERDICT=1                 0 이면 판정을 CSE 에 안 쓴다
+#   FL_START_IN_AE=1             0 이면 IN-AE 를 여기서 안 띄운다
+#   FL_DP=0                      1 이면 예전 배치 단위 DP 노이즈를 켠다(비교용)
+#   FL_MIN_STEPS=200             라운드당 최소 옵티마이저 스텝. 0 이면 local_epochs 그대로
+#   AMR_NORM_MIN_PER_LOAD=20     정규화 통계를 적재 상태별 몇 창 모이면 고정할지
+#   AMR_NORM_FREEZE_ROUND=5      다 안 모여도 이 라운드에 고정
+#   AMR_NORM_CLIP=10             표준화 뒤 |z| 상한. 0 이면 끔
+#
+#   예)  FL_TRIM_RATIO=0 ./run_fl.sh        절사 없이 돌려 A/B 비교
 #
 #   대시보드를 Isaac 대기보다 먼저 띄운다. 기다리는 동안 상태를 볼 수
 #   있어야 하기 때문이다. 마지막에 두면 로봇이 안 올라올 때 몇 분간
 #   아무것도 못 본다.
 #
-#   MN-AE를 IN-AE보다 먼저 띄운다. MN-AE가 cnt-fl-control 구독을 걸기 전에
+#   학습 앱을 IN-AE보다 먼저 띄운다. 그쪽이 cnt-fl-control 구독을 걸기 전에
 #   IN-AE가 라운드 명령을 올리면 NOTIFY를 아무도 받지 못한다.
 #
 # 오프라인으로 학습 로직만 돌려볼 때
@@ -23,6 +42,32 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
+
+# ------------------------------------------------------------
+# 설정과 실행 환경
+#
+# .env.local 을 source 하는 걸 잊어 엉뚱한 주소로 붙는 일이 반복됐다.
+# 이미 읽혀 있으면 덮어쓰지 않는다(앞에 붙인 환경변수가 이긴다).
+# ------------------------------------------------------------
+if [ -f .env.local ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env.local
+  set +a
+  echo "  ✓ .env.local 읽음"
+else
+  echo "  ⚠ .env.local 이 없다. 샌드박스·IN-CSE 주소가 기본값으로 간다."
+fi
+
+# torch 가 없으면 MN-AE 가 import 에서 죽는데, 그 로그는 tee 뒤에 묻혀
+# 한참 뒤에야 보인다. 여기서 먼저 막는다.
+if ! python3 -c "import torch" 2>/dev/null; then
+  echo
+  echo "  ✗ 지금 python3 에 torch 가 없다: $(command -v python3)"
+  echo "    가상환경을 켜고 다시 실행할 것:"
+  echo "      source ~/venv-edgeway/bin/activate"
+  exit 1
+fi
 
 PIDS=()
 cleanup() {
@@ -184,7 +229,7 @@ if [ "$FROM_CSE" = "0" ]; then
   echo "[3/5] Isaac Sim 대기 — 오프라인 모드라 건너뛴다"
 else
   echo "[1/5] oneM2M 리소스 확인"
-  # 우리 리소스(IN-AE, MN-AE-i, 컨테이너, ACP)만 본다.
+  # 우리 리소스(IN-AE, TRAINING-AE-i, ANALYSIS-AE-i, 컨테이너, ACP)만 본다.
   # 로봇 AE는 Isaac 소유라 여기서 실패로 치지 않는다.
   if ! python3 fl/setup_resources_standard.py --verify; then
     echo
@@ -209,7 +254,14 @@ fi
 # ── 2. 학습 노드 ────────────────────────────────────────
 
 echo
-echo "[4/5] MN-AE 기동 (사업장 3곳)"
+echo "[4/5] 학습 앱 기동 (사업장 3곳)"
+
+# 어떤 설정으로 돌린 실행인지 로그만 보고 알 수 있어야 한다.
+echo "  설정: 라운드 ${FL_GLOBAL_ROUNDS:-10}"\
+" · 라운드당 ${FL_SENSOR_MIN_WINDOWS:-50}윈도우"\
+" · 백로그 ${FL_SENSOR_BACKLOG_SEC:-0}s"\
+" · 절사 ${FL_TRIM_RATIO:-0.15}"\
+" · 라벨학습 ${FL_LABEL_FOR_TRAIN:-0}"
 
 # 셋이 한 터미널에 찍으면 줄이 뒤섞여 어느 노드 것인지 알기 어렵다.
 # 줄 앞에 노드 이름을 박아 두었지만, 한 노드만 따로 보고 싶을 때를 위해
@@ -220,17 +272,17 @@ echo "  노드별 로그: $RUN_LOG_DIR/"
 
 python3 -u fl/mn_ae_standard.py 0 5001 2>&1 | tee "$RUN_LOG_DIR/mn1.log" &
 PIDS+=("$!")
-echo "  MN-AE-1 (siteA / mep-a) PID: ${PIDS[-1]}"
+echo "  TRAINING-AE-1 (siteA / mep-a) PID: ${PIDS[-1]}"
 
 python3 -u fl/mn_ae_standard.py 1 5002 2>&1 | tee "$RUN_LOG_DIR/mn2.log" &
 PIDS+=("$!")
-echo "  MN-AE-2 (siteB / mep-b) PID: ${PIDS[-1]}"
+echo "  TRAINING-AE-2 (siteB / mep-b) PID: ${PIDS[-1]}"
 
 python3 -u fl/mn_ae_standard.py 2 5003 2>&1 | tee "$RUN_LOG_DIR/mn3.log" &
 PIDS+=("$!")
-echo "  MN-AE-3 (siteC / mep-c) PID: ${PIDS[-1]}"
+echo "  TRAINING-AE-3 (siteC / mep-c) PID: ${PIDS[-1]}"
 
-# 각 MN-AE가 cnt-fl-control subscription을 만들 시간을 준다.
+# 각 학습 앱이 cnt-fl-control subscription을 만들 시간을 준다.
 sleep 5
 
 # ── 3. 코디네이터 ───────────────────────────────────────

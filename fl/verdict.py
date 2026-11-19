@@ -43,6 +43,22 @@ import onem2m_utils as om2m
 K_CONSECUTIVE = int(os.getenv(
     "FL_VERDICT_K", str(getattr(config, "ANOMALY_K_CONSECUTIVE", 3))))
 
+# 로봇당 한 번만 올릴지. 기본은 한 번만.
+#
+# 같은 로봇이 계속 이상이면 라운드마다 CIN 이 쌓인다. 받는 쪽에서 첫 통보
+# 뒤의 반복은 새 정보가 아니다. 그래서 로봇마다 처음 한 건만 올린다.
+# FL_VERDICT_ONCE=0 으로 끄면 예전처럼 매번 올린다.
+ONCE_PER_ROBOT = os.getenv("FL_VERDICT_ONCE", "1") not in ("0", "false", "False")
+
+# 이미 보고한 (노드, 로봇). 프로세스가 살아 있는 동안만 유지된다.
+# 재시작하면 비므로 로봇마다 다시 한 번 나간다.
+_reported: set = set()
+
+
+def reset_reported() -> None:
+    """보고 기록을 비운다. 시험용."""
+    _reported.clear()
+
 
 def onset_indices(scores: Sequence[float], threshold: float,
                   k: Optional[int] = None) -> List[int]:
@@ -104,6 +120,9 @@ def publish(node_name: str,
     scores/robots/cts/poses 는 같은 길이의 윈도우 단위 배열이다. 로봇마다 따로
     끊어서 보기 때문에, 한 로봇의 이상이 다른 로봇의 연속 판정에 섞이지 않는다.
 
+    ONCE_PER_ROBOT(기본 참)이면 로봇당 첫 판정 한 건만 올린다. 그 뒤로는 같은
+    로봇의 판정을 라운드가 바뀌어도 올리지 않는다.
+
     poses 는 (N, 2) 의 (x, y) 다. 윈도우 하나가 주행 구간을 덮으므로 그
     구간 샘플들의 평균 위치이고, 한 점으로 특정된 좌표가 아니다. 받는 쪽이
     오해하지 않도록 CIN 에 basis="window_mean" 을 같이 적는다.
@@ -116,6 +135,9 @@ def publish(node_name: str,
     total = 0
 
     for robot in sorted({str(r) for r in robots}):
+        if ONCE_PER_ROBOT and (node_name, robot) in _reported:
+            continue
+
         idx = [i for i, r in enumerate(robots) if str(r) == robot]
         if not idx:
             continue
@@ -151,6 +173,10 @@ def publish(node_name: str,
                 total += 1
                 print(f"    ⚠ 판정 {robot}: score={score:.6f} "
                       f"(임계 {threshold:.6f}, {k}회 연속)")
+                if ONCE_PER_ROBOT:
+                    # 로봇당 첫 건만. 같은 라운드의 뒤 onset 도 안 올린다.
+                    _reported.add((node_name, robot))
+                    break
 
     if total:
         print(f"  ✓ 판정 {total}건 -> {om2m.strip_prefix(cnt_path)}")

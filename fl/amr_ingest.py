@@ -496,7 +496,7 @@ def build_from_cins(cins: List[Dict]) -> Dict[str, np.ndarray]:
         if "scn" in lab and "spd" in lab:
             cvec = sch.cond_from_labels(lab["scn"], lab["spd"])
         else:
-            cvec = sch.cond_vector(meta["nav"], meta["speed"])
+            cvec = sch.cond_vector(meta["nav"], meta["speed"], sig)
 
         sigs.append(sig)
         conds.append(cvec)

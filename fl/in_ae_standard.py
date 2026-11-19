@@ -23,6 +23,7 @@ import torch
 from flask import Flask, request, make_response
 
 import config
+import valset
 
 # IN-AE 의 AE-ID. ACP의 acor 와 X-M2M-Origin 에 쓰는 값이다.
 ORIGIN_IN_AE = config.IN_AE_ID
@@ -55,6 +56,9 @@ class INAECoordinator:
         self.fl_control_path   = f"{self.in_cse_name}/{config.IN_AE_NAME}/cnt-fl-control"
         self.global_model_path = f"{self.in_cse_name}/{config.IN_AE_NAME}/cnt-global-model"
         self.dropbox_root      = f"{self.in_cse_name}/{config.IN_AE_NAME}/cnt-local-updates"
+        # 고정 검증셋으로 잰 라운드별 성능을 여기에 남긴다.
+        # 대시보드가 이걸 읽어 로그로 띄운다.
+        self.fl_inference_path = f"{self.in_cse_name}/{config.IN_AE_NAME}/cnt-fl-inference"
 
         # 리소스/구독은 모든 노드에 대해 만든다.
         # cold start 노드도 라운드 명령과 글로벌 모델은 받아야 추론을 할 수 있다.
@@ -479,11 +483,12 @@ class INAECoordinator:
             (f"{in_cse}/{ae}/cnt-global-model", None),
             (f"{in_cse}/{ae}/cnt-local-updates", None),
         ]
-        for i, node in enumerate(config.ALL_NODES, start=1):
+        for node in config.ALL_NODES:
             in_paths.append((f"{in_cse}/{ae}/cnt-local-updates/cnt-{node}", None))
             mn_cse = config.mn_endpoint(node)[1]
-            in_paths.append((f"{mn_cse}/MN-AE-{i}/cnt-local-model", node))
-            in_paths.append((f"{mn_cse}/MN-AE-{i}/cnt-net-status", node))
+            tr = config.training_ae_name(node)
+            in_paths.append((f"{mn_cse}/{tr}/cnt-local-model", node))
+            in_paths.append((f"{mn_cse}/{tr}/cnt-net-status", node))
 
         for path, node in in_paths:
             bind(node)
@@ -501,24 +506,30 @@ class INAECoordinator:
         mn_a = config.mn_endpoint("mn1")[1]
         mn_b = config.mn_endpoint("mn2")[1]
 
-        # 원래 MN-AE-2/cnt-sensor-data 를 봤는데 그 컨테이너는 없어졌다.
+        # 학습 앱의 이름과 AE-ID. 박아 쓰면 이름을 바꿀 때 여기만 남는다.
+        tr1, tr2, tr3 = (config.training_ae_name(n)
+                         for n in ("mn1", "mn2", "mn3"))
+        id1, id2, id3 = (config.training_ae_id(n)
+                         for n in ("mn1", "mn2", "mn3"))
+
+        # 원래 학습앱2/cnt-sensor-data 를 봤는데 그 컨테이너는 없어졌다.
         # 텔레메트리가 로봇 AE 아래로 갔고 거기엔 우리 ACP 가 없다.
         # 같은 의도(남의 사업장 것은 못 본다)를 cnt-net-status 로 확인한다.
-        check("", f"{mn_b}/MN-AE-2/cnt-net-status", "CMN-AE-1", False, "mn2")
-        check("", f"{in_cse}/{ae}/cnt-local-updates/cnt-mn2", "CMN-AE-1", False)
-        check("", f"{mn_a}/MN-AE-1/cnt-local-model", "CMN-AE-2", False, "mn1")
-        check("", f"{in_cse}/{ae}/cnt-local-updates/cnt-mn1", "CMN-AE-3", False)
-        check("", f"{in_cse}/{ae}/cnt-local-updates/cnt-mn1", "CMN-AE-1", False)
+        check("", f"{mn_b}/{tr2}/cnt-net-status", id1, False, "mn2")
+        check("", f"{in_cse}/{ae}/cnt-local-updates/cnt-mn2", id1, False)
+        check("", f"{mn_a}/{tr1}/cnt-local-model", id2, False, "mn1")
+        check("", f"{in_cse}/{ae}/cnt-local-updates/cnt-mn1", id3, False)
+        check("", f"{in_cse}/{ae}/cnt-local-updates/cnt-mn1", id1, False)
 
         # ── [3] 허용돼야 하는 접근 ──────────────────────
         print("\n  [3] 허용돼야 하는 접근")
         mn_c = config.mn_endpoint("mn3")[1]
 
-        check("", f"{in_cse}/{ae}/cnt-fl-control", "CMN-AE-1", True)
-        check("", f"{in_cse}/{ae}/cnt-global-model", "CMN-AE-2", True)
-        # 원래 MN-AE-3/cnt-sensor-data 자리. 위와 같은 이유로 옮긴다.
-        check("", f"{mn_c}/MN-AE-3/cnt-net-status", "CMN-AE-3", True, "mn3")
-        check("", f"{mn_c}/MN-AE-3/cnt-local-model", "CMN-AE-3", True, "mn3")
+        check("", f"{in_cse}/{ae}/cnt-fl-control", id1, True)
+        check("", f"{in_cse}/{ae}/cnt-global-model", id2, True)
+        # 원래 학습앱3/cnt-sensor-data 자리. 위와 같은 이유로 옮긴다.
+        check("", f"{mn_c}/{tr3}/cnt-net-status", id3, True, "mn3")
+        check("", f"{mn_c}/{tr3}/cnt-local-model", id3, True, "mn3")
         check("", f"{in_cse}/{ae}/cnt-fl-control", "CIN-AE", True)
         check("", f"{in_cse}/{ae}/cnt-local-updates/cnt-mn1", "CIN-AE", True)
 
@@ -640,7 +651,8 @@ class INAECoordinator:
                 self.current_global_model_uri
                 or f"{self.global_model_path}/la"
             ),
-            "securityMode": "DP",
+            # DP 는 기본으로 끈다(config.DP_ENABLED 주석 참고).
+            "securityMode": "DP" if config.DP_ENABLED else "NONE",
             "privacyParams": {
                 "epsilon": config.DP_EPSILON,
                 "delta": config.DP_DELTA,
@@ -657,7 +669,8 @@ class INAECoordinator:
         if result:
             print(
                 f"  ✓ jobState: {state} "
-                f"(Round {round_num}, model={data['globalModelUri']})"
+                f"(Round {round_num}, {data['securityMode']}, "
+                f"model={data['globalModelUri']})"
             )
         else:
             print(
@@ -1094,6 +1107,47 @@ class INAECoordinator:
         return avg_loss, out_path
 
     # -----------------------
+    # 고정 검증셋 평가
+    # -----------------------
+    def _evaluate_global(self, round_num: int, model_path: str):
+        """
+        이번 라운드 글로벌 모델을 고정 검증셋으로 잰다.
+
+        라운드마다 같은 데이터·같은 자로 재야 "갈수록 좋아진다"를 말할 수
+        있다. 그동안의 val_auroc 는 그 라운드에 받은 윈도우로 계산해서
+        라운드 간 비교가 안 됐고, 라이브 스트림에 라벨이 없어 늘 0.5 였다.
+
+        결과는 cnt-fl-inference 에 CIN 으로 남긴다. 대시보드가 읽어 띄운다.
+        평가가 실패해도 FL 은 계속한다.
+        """
+        try:
+            m = valset.evaluate(model_path)
+        except Exception as e:
+            print(f"  ⚠ 검증셋 평가 실패(계속 진행): {e}")
+            return
+
+        if not m:
+            return
+
+        print(f"  [EVAL] Round {round_num}  {valset.summary_line(m)}")
+
+        payload = {
+            "type": "global-eval",
+            "round": round_num,
+            "model": model_path,
+            "timestamp": time.time(),
+        }
+        payload.update(m)
+
+        try:
+            om2m.create_content_instance(
+                self.fl_inference_path, payload,
+                labels=[f"round_{round_num}", "global-eval"],
+            )
+        except Exception as e:
+            print(f"  ⚠ 평가 결과 업로드 실패(계속 진행): {e}")
+
+    # -----------------------
     # Hidden test evaluation
     # -----------------------
     def _run_hidden_test_eval(self):
@@ -1254,6 +1308,8 @@ class INAECoordinator:
                     "abort FL"
                 )
                 return
+
+            self._evaluate_global(r, final_path)
 
         print("\nFederated learning completed!")
         self._publish_job_state("FL_COMPLETED", self.max_rounds)

@@ -9,6 +9,7 @@ AMR 주행 텔레메트리(38채널 CVAE)용
 - val_acc → val_auroc (재구성 오차 기반 AUROC)
 """
 import sys
+import calendar
 
 import os
 import time
@@ -35,6 +36,12 @@ from edge_node import AEEdgeNode
 # 후자는 그렇지 않다.
 SKIP_ROUND = object()
 
+# 학습 전 판정에서 임계를 넘은 창을 그 라운드 학습에서 뺄지.
+EXCLUDE_FLAGGED = os.getenv("FL_EXCLUDE_FLAGGED", "1") not in ("0", "false", "False")
+# 정상 기준 창을 몇 라운드까지 모으고 고정할지. 정규화 통계와 맞춘다.
+REF_FREEZE_ROUND = int(os.getenv(
+    "FL_REF_FREEZE_ROUND", os.getenv("AMR_NORM_FREEZE_ROUND", "5")))
+
 
 class MNAETrainer:
     def __init__(self, node_id: int, notification_port: int, inject_anomaly: bool = False):
@@ -55,12 +62,25 @@ class MNAETrainer:
         self.notification_port = notification_port
         self.inject_anomaly   = inject_anomaly
 
-        # 이 사업장의 정규화 통계. 첫 수집에서 잡고 이후 라운드에서 재사용한다.
-        self.norm_mean = None
-        self.norm_std = None
+        # 이 사업장의 정규화 통계. 적재 상태가 고루 모일 때까지 누적하다가
+        # 고정한다(amr_schema.NormStats). 첫 수집분 고정은 빈 차 주행만
+        # 담겨 적재 구간에서 |z| 가 수십~수백으로 튀었다.
+        import amr_schema as _sch
+        self.norm = _sch.NormStats()
 
-        self.ae_name = f"MN-AE-{node_id + 1}"
-        self.ae_id = config.mn_ae_id(self.node_name)
+        # 판정기. 직전 라운드에 학습·보정을 마친 노드를 그대로 둔다.
+        # 새 창은 이것으로 '학습하기 전에' 채점한다(_prescore_windows).
+        self._detector = None
+        # 기준·임계값을 잡을 정상 기준 창(원신호). 워밍업 라운드 동안 모으고
+        # REF_FREEZE_ROUND 에 고정한다. 고정한 뒤로는 이상이 들어와도 기준이
+        # 따라 올라가지 않는다.
+        self._calib_X: list = []
+        self._calib_C: list = []
+        self._calib_frozen = False
+        self._calib_frozen_round = None
+
+        self.ae_name = config.training_ae_name(self.node_name)
+        self.ae_id = config.training_ae_id(self.node_name)
 
         # 켜져 있으면 이 사업장의 AE-ID 로 CSE에 요청한다. 그래야 ACP가
         # 실제로 작동한다. 꺼져 있으면 기존처럼 CAdmin 으로 나간다.
@@ -80,7 +100,12 @@ class MNAETrainer:
         #     <MN-CSE>/siteA_AMR_1/telemetry/<cin>
         # 사업장 하나가 FL 노드 하나이므로 로봇 대수만큼의 컨테이너를
         # 여기서 모아 "한 공장의 데이터"로 합친다.
+        # Isaac Sim 이 라벨을 달아 올리므로 디스커버리로 찾는다. 기동
+        # 시점에는 아직 아무것도 없을 수 있어서, 여기서는 config 로
+        # 한 번 채워 두고 _refresh_telemetry() 가 실제 목록으로 바꾼다.
         self.robot_names = config.robot_names(self.node_name)
+        self.telemetry_discovered = False
+        self._telemetry_added = []
         # 로봇별로 어디까지 읽었는지. 라운드마다 그 뒤만 읽는다.
         # 비워 두면 첫 라운드는 최근 분량을 받는다.
         self.telemetry_cursor = {}
@@ -97,6 +122,7 @@ class MNAETrainer:
             f"{mn_cse}/{rb}/{config.ROBOT_TELEMETRY_CNT}"
             for rb in self.robot_names
         ]
+        self._refresh_telemetry(quiet=True)
         self.local_model_cnt   = "cnt-local-model"
         self.local_model_path  = f"{mn_cse}/{self.ae_name}/{self.local_model_cnt}"
 
@@ -156,7 +182,7 @@ class MNAETrainer:
 
         self.edge_node = None
 
-        self.app = Flask(f"MN-AE-{self.node_name}")
+        self.app = Flask(self.ae_name)
         self._setup_flask()
 
         self.edge_cache_dir = f"/tmp/fl_models/cache/{self.node_name}"
@@ -477,6 +503,14 @@ class MNAETrainer:
             )
 
             fallback = self._get_current_job_state()
+            # /la 에는 지난 실행의 명령이 남아 있을 수 있다. 알림 경로는
+            # 이미 발행 시각으로 거르는데 여기서는 안 걸러서, 이전 실행이
+            # 1라운드에서 멈췄을 때 남긴 FL_TRAINING round=1 을 이번 실행의
+            # 명령으로 받아 IN-AE 가 뜨기도 전에 학습·업로드를 해 버렸다.
+            # IN-AE 는 아직 0라운드라 그 업로드를 round mismatch 로 버리고,
+            # MN 은 이미 2라운드를 기다리므로 1라운드에서 영영 멈춘다.
+            if isinstance(fallback, dict) and self._is_stale_command(fallback):
+                fallback = None
             if self._is_expected_command(fallback, round_num):
                 with self.job_lock:
                     self.latest_job_command = fallback
@@ -491,7 +525,7 @@ class MNAETrainer:
     # ---------------------------
     # oneM2M ops
     # ---------------------------
-    def _subscribe_to_telemetry(self) -> int:
+    def _subscribe_to_telemetry(self, only=None) -> int:
         """
         이 사업장 로봇들의 telemetry 컨테이너에 구독을 건다.
 
@@ -520,6 +554,10 @@ class MNAETrainer:
         ok = 0
         print(f"\n  [{self.node_name}] 로봇 텔레메트리 구독")
         for robot, tel_path in zip(self.robot_names, self.telemetry_paths):
+            # 라운드 중 재탐색에서는 새로 생긴 로봇만 건다. 전부 지우고
+            # 다시 걸면 그 사이 알림을 놓치고, 수집 중인 라운드가 멈칫한다.
+            if only is not None and robot not in only:
+                continue
             if not om2m.resource_exists(tel_path):
                 print(f"    ⚠ {robot}: telemetry 없음 — 건너뜀")
                 continue
@@ -590,6 +628,74 @@ class MNAETrainer:
     # ---------------------------
     # Sensor data load (AE 버전)
     # ---------------------------
+    def _refresh_telemetry(self, quiet: bool = False) -> bool:
+        """
+        이 사업장의 telemetry 컨테이너를 라벨 디스커버리로 다시 찾는다.
+
+        왜 경로를 박지 않나
+          <MN-CSE>/{site}_AMR_{i}/telemetry 를 조립하면 로봇 대수와 이름
+          규칙이 코드에 박힌다. 로봇이 늘거나 이름이 바뀌면 코드를 고쳐야
+          하고, 늦게 올라온 로봇은 영영 안 보인다. Isaac Sim 이 컨테이너에
+          라벨을 달아 주므로 (?fu=1&ty=3&lbl=site:siteC&lbl=type:telemetry)
+          그때그때 찾는다.
+
+        찾은 게 없으면 기존 목록을 그대로 둔다. 디스커버리가 잠깐 실패했을
+        때 멀쩡한 경로까지 날리면 그 라운드를 통째로 잃는다.
+        반환: 목록이 바뀌었으면 True.
+        """
+        if not getattr(config, "USE_DISCOVERY", True):
+            return False
+
+        site = config.SITE_OF_NODE.get(self.node_name, self.node_name)
+        labels = [config.site_telemetry_label(self.node_name)] \
+            + config.telemetry_labels(self.node_name)
+        try:
+            found = om2m.discover_telemetry(
+                self.mn_cse_name, site,
+                cnt_name=config.ROBOT_TELEMETRY_CNT,
+                type_label=config.LABEL_TYPE_TELEMETRY,
+                combined_label=config.site_telemetry_label(self.node_name),
+            )
+        except Exception as e:
+            if not quiet:
+                print(f"    ⚠ telemetry 디스커버리 실패(기존 경로 유지): {e}")
+            return False
+
+        if not found:
+            if not quiet and not self.telemetry_discovered:
+                codes = ", ".join(str(c) for c in om2m.LAST_DISCOVERY_STATUS)
+                print(f"    ⓘ 라벨 {labels} 로 찾은 telemetry 가 없다 "
+                      f"(응답 {codes or '없음'}). 경로 조립으로 진행한다")
+                if any(c == 403 for c in om2m.LAST_DISCOVERY_STATUS):
+                    print(f"      403 이면 {self.ae_id} 에 CSEBase DISCOVERY "
+                          f"권한이 없는 것이다")
+            return False
+
+        robots = sorted(found)
+        paths = [found[r] for r in robots]
+
+        # 경로가 실제로 열리는지 하나만 확인한다. 디스커버리 응답 형태를
+        # 잘못 해석했는데 그대로 바꿔치우면 그 라운드를 통째로 잃는다.
+        if not om2m.resource_exists(paths[0]):
+            if not quiet:
+                print(f"    ⚠ 디스커버리 경로가 안 열린다 ({paths[0]}) "
+                      f"-> 기존 경로 유지")
+            return False
+        changed = (robots != self.robot_names or paths != self.telemetry_paths)
+        # 새로 생겼거나 경로가 바뀐 로봇. 구독은 이것만 새로 건다.
+        before = dict(zip(self.robot_names, self.telemetry_paths))
+        self._telemetry_added = [r for r in robots
+                                 if before.get(r) != found[r]]
+        if changed and not quiet:
+            added = [r for r in robots if r not in self.robot_names]
+            print(f"    ✓ 디스커버리: {len(robots)}대 "
+                  f"({', '.join(robots)})"
+                  + (f"  새로 발견 {', '.join(added)}" if added else ""))
+        self.robot_names = robots
+        self.telemetry_paths = paths
+        self.telemetry_discovered = True
+        return changed
+
     def _wait_for_robots(self) -> bool:
         """
         Isaac Sim이 이 사업장의 로봇 AE와 telemetry를 올릴 때까지 기다린다.
@@ -614,6 +720,8 @@ class MNAETrainer:
         next_log = 0.0
 
         while True:
+            # 늦게 올라온 로봇도 다음 조회에서 잡히도록 매번 다시 찾는다.
+            self._refresh_telemetry()
             ready = [
                 rb for rb, path in zip(self.robot_names, self.telemetry_paths)
                 if om2m.resource_exists(path)
@@ -643,22 +751,94 @@ class MNAETrainer:
 
             time.sleep(poll)
 
+    # ct 는 oneM2M 절대시각(UTC). cra 는 쉼표 앞만 받는다.
+    CT_FMT = "%Y%m%dT%H%M%S"
+
+    def _cse_now_ct(self):
+        """
+        CSE 가 보는 '지금'. 텔레메트리 컨테이너들의 마지막 ct 중 최신값이다.
+
+        커서를 로컬 시계로 만들면 CSE 와 시계가 틀어졌을 때 멀쩡한 데이터를
+        건너뛰거나 묵은 것을 끌어온다. 기준을 CSE 가 찍은 ct 로 두면 시계
+        차이와 무관해진다. 하나도 못 읽으면 None.
+        """
+        newest = None
+        for path in self.telemetry_paths:
+            try:
+                cin = om2m.get_latest_content_instance(path)
+            except Exception as e:
+                print(f"    ⚠ {path} 마지막 ct 조회 실패(건너뜀): {e}")
+                continue
+            ct = ((cin or {}).get("m2m:cin") or {}).get("ct")
+            if ct and (newest is None or str(ct) > str(newest)):
+                newest = ct
+        return newest
+
     def _seed_telemetry_cursor(self) -> None:
         """
-        이미 쌓여 있는 텔레메트리를 건너뛰고, FL 시작 후에 들어온 것부터 읽는다.
+        FL 시작 전에 쌓인 텔레메트리 중 '너무 오래된 것'만 건너뛴다.
 
-        [왜]
-        커서가 비어 있으면 fetch 가 "최근 N개"를 긁어 온다. 그래서 Round 1
-        만 Isaac Sim 이 그때까지 올려둔 걸 통째로 가져갔다. 로그에서 mn1 이
-        Round 1 에 341개를 먹고 Round 2 에는 37개밖에 안 남았던 것이 이것
-        때문이다. 라운드마다 조건이 같아야 비교가 되므로, Round 1 도 다른
-        라운드처럼 FL 이 시작된 뒤에 쌓인 것만 받아야 한다.
+        [왜 시각 기준인가]
+        전에는 각 컨테이너의 마지막 ct 를 커서로 놓아 쌓여 있던 것을 통째로
+        버렸다. 그러면 Isaac Sim 을 먼저 켜 두고 FL 을 켜는 순간, 그동안
+        들어온 데이터가 전부 날아간다. "아이작심을 먼저 켜라"고 해 놓고 그
+        데이터를 버리는 것은 앞뒤가 안 맞는다.
 
-        각 로봇 컨테이너의 지금 마지막 ct 를 커서로 놓는다. 비어 있는
-        컨테이너는 커서를 두지 않는다. 어차피 거기는 지금부터가 처음이다.
+        반대로 커서를 아예 안 두면 지난 실행의 묵은 데이터까지 끌려온다.
+
+        그래서 경계를 시각으로 둔다. 방금 전까지 들어온 것은 쓰고, 한참 전
+        것은 건너뛴다.
+
+        쌓인 것은 전부 쓰는 것이 기본이다. 실험 사이에 telemetry 컨테이너를
+        비우고 시작하므로, 거기 남아 있는 것은 곧 이번 실험의 데이터다.
+        앞부분을 버릴 이유가 없다.
+
+          FL_SENSOR_BACKLOG_SEC = 0   쌓인 것 전부 쓴다 (기본)
+                               > 0   그 초 이내에 쌓인 것만 쓴다. 컨테이너를
+                                     못 비우고 묵은 게 섞였을 때만 쓴다.
+                               < 0   쌓인 것 전부 건너뛴다
+
+        Round 1 이 쌓인 걸 통째로 먹던 문제는 커서가 막는 게 아니다.
+        _collect_round_data_once 의 take_head 가 막는다. 라운드마다 시간순
+        앞에서 FL_SENSOR_MIN_WINDOWS 개만 떼고 나머지는 버퍼에 남으므로,
+        백로그를 쓰더라도 라운드당 양은 똑같이 50 개다.
         """
-        seeded, empty = 0, 0
+        backlog = float(os.getenv("FL_SENSOR_BACKLOG_SEC", "0"))
+        n_cnt = len(self.telemetry_paths)
 
+        if backlog == 0:
+            print(f"  ⏱ [{self.node_name}] 쌓여 있는 텔레메트리를 처음부터 "
+                  f"전부 쓴다. 라운드당 양은 take_head 가 "
+                  f"{os.getenv('FL_SENSOR_MIN_WINDOWS', '50')}개로 맞춘다.")
+            return
+
+        if backlog > 0:
+            newest = self._cse_now_ct()
+            if newest is None:
+                print(f"  ⏱ [{self.node_name}] 아직 텔레메트리가 없다. "
+                      f"커서 없이 시작한다.")
+                return
+
+            stamp = str(newest).split(",")[0]
+            try:
+                base = calendar.timegm(time.strptime(stamp, self.CT_FMT))
+                cutoff = time.strftime(self.CT_FMT,
+                                       time.gmtime(base - backlog))
+            except ValueError as e:
+                print(f"  ⚠ [{self.node_name}] ct 해석 실패({stamp}): {e}. "
+                      f"커서 없이 시작한다.")
+                return
+
+            for path in self.telemetry_paths:
+                self.telemetry_cursor[path] = cutoff
+
+            print(f"  ⏱ [{self.node_name}] 최근 {backlog:.0f}초 안에 쌓인 "
+                  f"텔레메트리부터 쓴다 (cra={cutoff}, 최신={stamp}, "
+                  f"컨테이너 {n_cnt}개).")
+            return
+
+        # backlog < 0 : 지금까지 쌓인 것은 전부 건너뛴다.
+        seeded, empty = 0, 0
         for path in self.telemetry_paths:
             try:
                 cin = om2m.get_latest_content_instance(path)
@@ -673,7 +853,7 @@ class MNAETrainer:
             else:
                 empty += 1
 
-        print(f"  ⏱ 쌓여 있던 텔레메트리는 건너뛴다 "
+        print(f"  ⏱ [{self.node_name}] 쌓여 있던 텔레메트리는 건너뛴다 "
               f"(커서 설정 {seeded}개 / 비어 있음 {empty}개). "
               f"지금부터 쌓이는 것만 학습한다.")
 
@@ -771,6 +951,11 @@ class MNAETrainer:
         if not getattr(config, "FL_SENSOR_FROM_CSE", True):
             return self._load_sensor_data_from_pkl(round_num)
 
+        # 라운드마다 다시 찾는다. 중간에 올라온 로봇이 그 라운드부터
+        # 들어오고, 빠진 로봇은 목록에서 사라진다.
+        if self._refresh_telemetry() and self._telemetry_added:
+            self._subscribe_to_telemetry(only=self._telemetry_added)
+
         # 라운드마다 사업장당 이만큼 모일 때까지 기다린다.
         # 상한(site_cap)과 같은 값이어야 라운드마다 정확히 같은 양이 된다.
         want_min   = int(os.getenv("FL_SENSOR_MIN_WINDOWS", "50"))
@@ -837,7 +1022,24 @@ class MNAETrainer:
             n = len(got["signals"])
 
             if n >= want_min:
+                if n_polls <= 1:
+                    # 기다릴 필요가 없었던 경우. 진행 줄이 하나도 안 찍혀서
+                    # 수집이 빠진 것처럼 보이므로 한 줄 남긴다.
+                    print(f"    [{self.node_name}] ✓ 윈도우 {n}/{want_min} "
+                          f"— 첫 조회에서 이미 찼다 (쌓여 있던 분량)")
                 break
+
+            # 조회를 10번(약 20초) 해도 하나도 없으면 컨테이너마다 CIN 이 몇 개 있는지
+            # 한 번 찍는다. cni 가 0 이면 아무도 안 쓰고 있는 것(Isaac 전송
+            # 또는 잘못 잡은 컨테이너)이고, cni 가 있는데 0 개면 읽는 쪽 문제다.
+            if (n == 0 and n_polls >= 10
+                    and not getattr(self, "_empty_diag_done", False)):
+                self._empty_diag_done = True
+                print(f"    [{self.node_name}] ⓘ 받은 윈도우가 없다. 컨테이너 상태:")
+                for _p in self.telemetry_paths:
+                    _r = (om2m.get_resource(_p) or {}).get("m2m:cnt") or {}
+                    print(f"      {_p}  cni={_r.get('cni', '?')}  "
+                          f"lbl={_r.get('lbl', [])}")
 
             now = time.time()
             if now >= deadline:
@@ -932,7 +1134,7 @@ class MNAETrainer:
                   + "  ".join(f"{r.split('_')[-1]}={n}개"
                               for r, n in sorted(gaps.items())))
 
-        return self._build_round_data_from_cse(got)
+        return self._build_round_data_from_cse(got, round_num)
 
     def _load_sensor_data_from_pkl(self, round_num: int):
         """
@@ -977,7 +1179,7 @@ class MNAETrainer:
         return data_dict
 
 
-    def _build_round_data_from_cse(self, got: dict) -> dict:
+    def _build_round_data_from_cse(self, got: dict, round_num: int = 1) -> dict:
         """
         CSE에서 받은 윈도우를 학습용 dict로 만든다.
 
@@ -996,11 +1198,13 @@ class MNAETrainer:
         else:
             robot, names = got["robot"], got["cond_name"]
 
-        Xn = amr_ingest.normalize_with(X, self.norm_mean, self.norm_std)
-        if self.norm_mean is None and len(Xn):
-            # 첫 수집이면 이 데이터로 통계를 잡고 이후 라운드에서 재사용한다.
-            self.norm_mean = X.mean(axis=(0, 2), keepdims=True)
-            self.norm_std = X.std(axis=(0, 2), keepdims=True) + 1e-8
+        # 고정 전이면 이번 창까지 넣어 통계를 다시 잡고, 그 자로 표준화한다.
+        was_frozen = self.norm.frozen
+        if len(X):
+            self.norm.update(X, C, round_num)
+        Xn = self.norm.apply(X) if len(X) else X
+        if not was_frozen:
+            print(f"      ◦ {self.norm.describe()}")
 
         # 학습은 정상 주행만 쓴다.
         #
@@ -1037,27 +1241,106 @@ class MNAETrainer:
         navs = got.get("nav")
         if navs is not None and len(navs) == len(mv):
             navs = navs[mv] if mv.any() else navs
-        is_normal = names == "normal"
-        if navs is not None and len(navs) == len(is_normal):
-            is_normal = is_normal & ~np.isin(navs, list(sch.EXCLUDE_NAV_TRAIN))
+        # 라벨 기반 필터와 품질 기반 필터를 나눠 둔다.
+        #
+        #  label_ok : cond/nav 가 알려주는 '정답'. 이걸로 학습 집합을
+        #             추리면 "이 구간이 정상임을 미리 안다"는 가정이 되어
+        #             비지도 주장이 약해진다. 기본으로 쓰지 않는다.
+        #  nav_ok   : 'aborted' 같은 끊긴 주행 제외. 정답이 아니라 사실이고,
+        #             끊긴 구간은 어느 쪽이든 학습에 못 쓴다. 항상 적용한다.
+        label_ok = names == "normal"
 
-        n_normal = int(is_normal.sum())
-        print(f"      이동 {len(Xn)}개 중 학습 대상 {n_normal}개")
+        nav_ok = np.ones(len(Xn), dtype=bool)
+        if navs is not None and len(navs) == len(nav_ok):
+            nav_ok = ~np.isin(navs, list(sch.EXCLUDE_NAV_TRAIN))
 
-        if n_normal == 0:
-            print("      ✗ 정상 주행 구간이 없다. 이 라운드는 학습하지 않는다.")
-            print("        (이상 구간으로 정상 패턴을 학습할 수는 없다)")
+        # FL_LABEL_FOR_TRAIN=1 이면 예전처럼 정상 라벨만 학습한다.
+        # 둘을 각각 돌려 비교하면 "라벨 없이도 이만큼 된다"가 수치로 남는다.
+        use_label = os.getenv("FL_LABEL_FOR_TRAIN", "0") not in (
+            "0", "false", "False")
+        train_mask = (nav_ok & label_ok) if use_label else nav_ok
+
+        # ── 학습 전 판정 ─────────────────────────────────
+        # 직전 라운드의 판정기(모델 + 기준 + 임계값)로 먼저 채점한다.
+        # 예전에는 이번 창으로 학습하고, 그 창으로 기준을 다시 잡고, 그 창을
+        # 채점했다. 이상 창이 학습과 기준에 다 들어가 점수가 눌렸다.
+        pre = self._prescore_windows(Xn, C)
+        flagged = np.zeros(len(Xn), dtype=bool)
+        if pre is not None:
+            scores, thr = pre
+            flagged = scores > thr
+            self.last_windows["pre_scores"] = scores
+            self.last_windows["pre_threshold"] = thr
+            print(f"      ◦ 학습 전 판정: 직전 판정기로 {int(flagged.sum())}/"
+                  f"{len(flagged)}창이 임계 {thr:.2f} 초과 "
+                  f"(최대 {float(scores.max()):.2f})")
+            # 기준이 고정된 뒤에만 학습에서 뺀다. 그 전에는 판정기 자체가
+            # 아직 덜 잡혀 있어서 정상을 잘못 뺄 수 있다.
+            if self._calib_frozen and EXCLUDE_FLAGGED and flagged.any():
+                rest = train_mask & ~flagged
+                if int(rest.sum()) >= 8:
+                    train_mask = rest
+                    print(f"      ◦ 임계 초과 {int(flagged.sum())}창은 이번 학습에서 뺀다")
+                else:
+                    # 거의 전부가 넘으면 빼고 나서 학습할 창이 없다. 그러면
+                    # 라운드가 SKIP 되고 같은 창이 다시 들어와 멈춘다.
+                    # 이 라운드만 그대로 학습한다(기준은 고정이라 안 움직인다).
+                    print(f"      ⚠ {int(flagged.sum())}/{len(flagged)}창이 임계 초과 — "
+                          f"빼면 학습할 창이 모자라 이번엔 빼지 않는다")
+
+        # ── 정상 기준 창 ────────────────────────────────
+        if not self._calib_frozen:
+            keep = train_mask & ~flagged
+            if keep.any():
+                self._calib_X.append(X[keep])
+                self._calib_C.append(C[keep])
+            if round_num >= REF_FREEZE_ROUND:
+                self._calib_frozen = True
+                self._calib_frozen_round = round_num
+                n_ref = sum(len(a) for a in self._calib_X)
+                print(f"      ◦ 정상 기준 창 고정 (R{round_num}, {n_ref}창). "
+                      f"이후 기준·임계값은 이 창으로만 잡는다")
+        calib_X = (np.concatenate(self._calib_X) if self._calib_X else None)
+        calib_C = (np.concatenate(self._calib_C) if self._calib_C else None)
+
+        n_train = int(train_mask.sum())
+        n_label_anom = int((~label_ok).sum())
+
+        print(f"      이동 {len(Xn)}개 중 학습 대상 {n_train}개 "
+              f"(라벨 이상 {n_label_anom}개"
+              f"{', 학습에서 제외' if use_label else ', 학습에 포함'})")
+
+        if n_train == 0:
+            print("      ✗ 학습에 쓸 윈도우가 없다. 이 라운드는 학습하지 않는다.")
             return SKIP_ROUND
 
         return {
-            "train_signals": Xn[is_normal],
-            "train_cond": C[is_normal],
+            "train_signals": Xn[train_mask],
+            "train_cond": C[train_mask],
             "val_signals": Xn,
             "val_cond": C,
             "val_labels": (names != "normal").astype(np.int64),
             "from_cse": True,
             "robots": sorted(set(robot.tolist())),
+            # 기준·임계값용. 정규화는 지금 자로 다시 한다(원신호로 모았다).
+            "calib_signals": (self.norm.apply(calib_X)
+                              if calib_X is not None else None),
+            "calib_cond": calib_C,
         }
+
+    def _prescore_windows(self, Xn, C):
+        """직전 라운드 판정기로 채점한다. (점수, 임계값) 또는 None."""
+        det = self._detector
+        if det is None or len(Xn) == 0:
+            return None
+        thr = getattr(det, "threshold", None)
+        if thr is None:
+            return None
+        try:
+            return np.asarray(det.compute_anomaly_scores(Xn, C)), float(thr)
+        except Exception as e:
+            print(f"      ⚠ 학습 전 판정 실패(학습은 계속): {e}")
+            return None
 
     def _build_ae_node_from_data_dict(self, data_dict: dict) -> AEEdgeNode | None:
         """
@@ -1100,6 +1383,8 @@ class MNAETrainer:
             val_cond      = data_dict.get("val_cond"),
             train_run_id  = data_dict.get("train_run_id"),
             val_run_id    = data_dict.get("val_run_id"),
+            calib_signals = data_dict.get("calib_signals"),
+            calib_cond    = data_dict.get("calib_cond"),
         )
         return edge_node
 
@@ -1468,13 +1753,18 @@ class MNAETrainer:
         if node is None:
             return {}
 
-        try:
-            scores = node.compute_anomaly_scores(w["X"], w["C"])
-        except Exception as e:
-            print(f"    ⚠ 윈도우 점수 계산 실패(업로드는 계속): {e}")
-            return {}
-
-        thr = getattr(node, "threshold", None)
+        # 판정과 같은 점수를 보여 준다(학습 전, 직전 판정기). 첫 라운드처럼
+        # 판정기가 없을 때만 이번 모델로 매긴다.
+        if w.get("pre_scores") is not None:
+            scores = w["pre_scores"]
+            thr = w.get("pre_threshold")
+        else:
+            try:
+                scores = node.compute_anomaly_scores(w["X"], w["C"])
+            except Exception as e:
+                print(f"    ⚠ 윈도우 점수 계산 실패(업로드는 계속): {e}")
+                return {}
+            thr = getattr(node, "threshold", None)
         labels = w.get("labels")
         robots = w.get("robot")
 
@@ -1496,23 +1786,35 @@ class MNAETrainer:
         학습이 끝난 뒤에 부른다. 임계값이 이번 라운드 모델 기준으로
         갱신돼 있어야 판정이 의미를 갖는다.
 
+        config.VERDICT_START_ROUND(기본 3) 전에는 아무것도 올리지 않는다.
+
         판정이 실패해도 라운드는 계속된다. 연합학습 본체가 부수 기능 때문에
         멈추면 안 된다.
         """
         if not getattr(config, "VERDICT_ENABLED", True):
             return 0
 
+        # 초반 라운드는 건너뛴다. 임계값이 덜 학습된 모델로 잡혀 있어서
+        # 이때 내는 판정은 맞든 틀리든 근거가 없다.
+        start = int(getattr(config, "VERDICT_START_ROUND", 1))
+        if round_num < start:
+            print(f"  · 판정 보류 — R{round_num} < R{start} "
+                  f"(FL_VERDICT_START_ROUND)")
+            return 0
+
         w = self.last_windows
         if not w or w["X"] is None or len(w["X"]) == 0:
             return 0
 
-        node = self.edge_node
-        threshold = getattr(node, "threshold", None)
-        if threshold is None:
+        # 학습 전에 직전 판정기로 매긴 점수만 쓴다. 이번 라운드에 학습한
+        # 모델로 같은 창을 채점하면 이상이 학습에 흡수돼 점수가 눌린다.
+        if w.get("pre_scores") is None:
+            print("  · 판정 보류 — 직전 라운드 판정기가 없다")
             return 0
+        scores = w["pre_scores"]
+        threshold = w["pre_threshold"]
 
         try:
-            scores = node.compute_anomaly_scores(w["X"], w["C"])
             return verdict.publish(
                 node_name=self.node_name,
                 cnt_path=self.verdict_cnt_path,
@@ -1674,7 +1976,11 @@ class MNAETrainer:
         print(f"\n=== {self.node_name.upper()} Trainer start (AE 버전) ===")
         print(f"  AE:           {self.ae_name}")
         print(f"  telemetry:    {len(self.telemetry_paths)}개 컨테이너 "
-              f"({', '.join(self.robot_names)})")
+              f"({'라벨 디스커버리' if self.telemetry_discovered else '경로 조립'})")
+        # 이름만 찍으면 엉뚱한 컨테이너(status, 우리 AE 의 컨테이너)를
+        # 잡았는지 알 수 없다. 경로를 그대로 찍는다.
+        for _p in self.telemetry_paths:
+            print(f"                {_p}")
         print(f"  local-model:  {self.local_model_path} (Edge cache)")
         print(f"  fl-control:   {self.fl_control_path}")
         print(f"  global-model: {self.global_model_path}")
@@ -1707,8 +2013,8 @@ class MNAETrainer:
         # 로봇이 올라온 뒤에 구독을 건다. 없는 컨테이너에는 못 건다.
         self._subscribe_to_telemetry()
 
-        # 이미 쌓여 있던 텔레메트리는 버리고 지금부터 받는다.
-        # FL_SENSOR_SEED_CURSOR=0 이면 예전처럼 쌓인 것을 가져간다.
+        # 쌓여 있는 텔레메트리를 처음부터 쓴다(기본).
+        # 묵은 게 섞였을 때만 FL_SENSOR_BACKLOG_SEC 으로 경계를 준다.
         if os.getenv("FL_SENSOR_SEED_CURSOR", "1") != "0":
             self._seed_telemetry_cursor()
 
@@ -1813,7 +2119,10 @@ class MNAETrainer:
                 )
 
             # DP 설정
-            security_mode = job_state.get("securityMode", "DP")
+            # 명령에 없으면 로컬 설정을 따른다. 기본은 DP 끔.
+            security_mode = job_state.get(
+                "securityMode",
+                "DP" if getattr(config, "DP_ENABLED", False) else "NONE")
             privacy_params = job_state.get("privacyParams", {})
             dp_epsilon = float(
                 privacy_params.get(
@@ -1900,8 +2209,11 @@ class MNAETrainer:
                 f"  val_auroc={val_auroc:.4f}"
             )
 
-            # 학습이 끝나 임계값이 갱신된 뒤에 판정한다.
+            # 판정은 이번 창을 학습 '전에' 직전 판정기로 매긴 점수로 한다
+            # (_prescore_windows). 이번에 학습·보정한 노드는 다음 라운드의
+            # 판정기가 된다.
             self._publish_verdicts(round_num)
+            self._detector = self.edge_node
 
             if self.upload_stagger_sec > 0:
                 time.sleep(self.upload_stagger_sec)

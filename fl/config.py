@@ -16,6 +16,8 @@ AE는 Isaac Sim 쪽에서 등록하므로 이 코드는 AE를 만들지 않는�
 """
 
 import os
+
+import amr_schema as _sch   # 조건 벡터 차원의 단일 출처
 from dataclasses import dataclass
 
 
@@ -34,7 +36,9 @@ class AEConfig:
     n_channels: int = 38
 
     # 조건 벡터: nav 그룹(5) + 속도 버킷(3). amr_schema.COND_DIM 과 같아야 한다.
-    cond_dim: int = 8
+    # amr_schema 가 정한다. nav 5 + speed 3 + 적재 3 = 11.
+    # 여기서 숫자를 박으면 스키마가 늘 때 조용히 어긋난다.
+    cond_dim: int = _sch.COND_DIM
 
     # 잠재 차원과 은닉 채널. 이 조합에서 90,806 파라미터이고
     # fp16+gzip+base64로 약 217KB라 contentInstance 하나에 들어간다.
@@ -56,6 +60,13 @@ class AEConfig:
 class TrainConfig:
     rounds: int = 10
     local_epochs: int = 10
+    # 라운드당 최소 옵티마이저 스텝 수. 에폭 수를 이만큼 채우도록 늘린다.
+    #
+    # 라운드당 창이 약 50개라 배치 32 로 10에폭이면 스텝이 20번 남짓이다.
+    # 2026-11-19 실행에서 10라운드 내내 글로벌 모델의 검증셋 점수가
+    # '출력 0' 으로 계산한 값과 소수 셋째 자리까지 같았다(AUROC 0.641).
+    # 모델이 아무것도 배우지 못한 것이다. 0 이면 local_epochs 그대로.
+    min_steps: int = int(os.getenv("FL_MIN_STEPS", "200"))
     batch_size: int = 32
     lr: float = 1e-3
     weight_decay: float = 1e-4
@@ -100,12 +111,58 @@ ROBOT_STATUS_CNT = os.getenv("FL_ROBOT_STATUS_CNT", "status")
 
 
 def robot_names(node: str):
-    """한 사업장의 로봇 AE 이름 목록. siteA_AMR_1 … siteA_AMR_4"""
+    """한 사업장의 로봇 AE 이름 목록. siteA_AMR_1 … siteA_AMR_4
+
+    디스커버리가 안 될 때의 되돌아갈 자리다. 평소에는
+    telemetry_labels() 로 찾은 것을 쓴다.
+    """
     site = SITE_OF_NODE.get(node, node)
     return [
         f"{site}_AMR_{i}"
         for i in range(1, ROBOTS_PER_NODE.get(node, 0) + 1)
     ]
+
+
+# ── 리소스 라벨 ──────────────────────────────────────────
+#
+# 경로를 코드에 박아 두면 로봇이 늘거나 이름 규칙이 바뀔 때마다 코드를
+# 고쳐야 한다. 라벨을 달아 두고 디스커버리(?fu=1&lbl=...)로 찾으면
+# Isaac Sim 이 올린 그대로를 그때그때 읽는다.
+#
+# Isaac Sim 쪽이 telemetry 컨테이너에 다는 라벨 (합의한 형태):
+#   ["site:siteC", "robot:AMR_2", "ae:siteC_AMR_2",
+#    "type:telemetry", "siteC:telemetry"]
+# 우리는 이 중 site 와 type 두 개로 찾는다. 나머지는 사람이 읽기 위한
+# 것이거나 더 좁히고 싶을 때 쓴다.
+LABEL_TYPE_TELEMETRY = os.getenv("FL_LBL_TELEMETRY", "type:telemetry")
+# 디스커버리를 끄고 예전처럼 경로를 조립하고 싶을 때 0 으로 둔다.
+USE_DISCOVERY = os.getenv("FL_USE_DISCOVERY", "1") not in ("0", "false", "False")
+
+
+def site_label(node: str) -> str:
+    """'site:siteC'"""
+    return f"site:{SITE_OF_NODE.get(node, node)}"
+
+
+def telemetry_labels(node: str):
+    """그 사업장의 telemetry 컨테이너를 찾는 라벨 묶음 (AND 조건)."""
+    return [site_label(node), LABEL_TYPE_TELEMETRY]
+
+
+# 사업장과 종류를 한 라벨로 묶은 것. 'siteC:telemetry'
+# lbl 을 여러 개 주면 CSE 에 따라 OR 로 해석될 수 있어서 이걸 먼저 쓴다.
+# 자세한 이유는 onem2m_utils.discover_telemetry 주석.
+LABEL_SITE_TELEMETRY_FMT = os.getenv("FL_LBL_SITE_TELEMETRY", "{site}:telemetry")
+
+
+def site_telemetry_label(node: str) -> str:
+    """'siteC:telemetry'"""
+    return LABEL_SITE_TELEMETRY_FMT.format(site=SITE_OF_NODE.get(node, node))
+
+
+def resource_labels(node: str, kind: str):
+    """우리가 만드는 리소스에 달 라벨. kind 는 'local-model' 같은 것."""
+    return [site_label(node), f"type:{kind}", f"node:{node}"]
 
 CLASS_NAMES = ["정상", "이상"]
 NUM_CLASSES = 2
@@ -121,8 +178,26 @@ RMS_FAULT_THRESHOLD = 1.0
 # 재구성 오차가 threshold를 연속 K회 초과하면 fault 판정
 ANOMALY_K_CONSECUTIVE = 3
 
-# threshold = 정상 validation MSE 평균 + N × 표준편차
-THRESHOLD_N_SIGMA = 3.0
+# threshold = 중앙값 + N x MAD x 1.4826  (평균+Nσ 가 아니다)
+#
+# 지금까지 edge_node.calibrate() 가 이 값을 안 쓰고 자기 기본값 3.0 을
+# 썼다. 그래서 이걸 고쳐도 실제 임계값이 안 바뀌었다. 연결했다.
+#
+# 기본값이 조건별 정규화(FL_COND_NORM) 여부에 따라 다르다. 정규화를 하면
+# 학습 점수의 중앙값이 1 로 모이면서 MAD 가 같이 줄어든다. 3 을 그대로 쓰면
+# 임계값이 내려가 오경보가 오히려 는다. 실측(1사업장, 평가 318정상/133이상):
+#
+#   정규화 없음  3MAD   임계 5.52   탐지 99.2%   오경보 48.7%
+#   정규화 후    3MAD   임계 3.58   탐지 95.5%   오경보 71.4%   <- 더 나쁨
+#   정규화 후    8MAD   임계 7.87   탐지 90.2%   오경보 38.1%
+#   정규화 후   12MAD   임계 11.31  탐지 82.7%   오경보 28.0%
+#
+# 정규화 없이 n_sigma 만 8 로 올렸을 때가 탐지 75.9% / 오경보 31.1% 였으므로,
+# 정규화 후 8 은 탐지와 오경보 양쪽에서 그보다 낫다. 그래서 8 을 기본으로
+# 둔다. 탐지를 더 원하면 5, 오경보를 더 줄이려면 12 로 바꾸면 된다.
+COND_NORM = os.getenv("FL_COND_NORM", "1") not in ("0", "false", "False")
+THRESHOLD_N_SIGMA = float(
+    os.getenv("FL_THRESHOLD_N_SIGMA", "8.0" if COND_NORM else "3.0"))
 
 # 데모에서 이상 상태를 표시할 노드
 ANOMALY_DEMO_NODE = os.getenv(
@@ -270,7 +345,6 @@ IN_IS_REMOTE = (IN_BASE_URL != MN_BASE_URL) or (IN_CSE_NAME != MN_CSE_NAME)
 BASE_URL = MN_BASE_URL
 CSE_NAME = MN_CSE_NAME
 
-MN_AE_NAME = "MN-AE-1"
 # 중앙 조정 앱의 AE 이름과 AE-ID.
 #
 # IN-CSE 는 여러 팀이 같이 쓰는 공유 자원이다. "IN-AE" 는 누구나 쓸 법한
@@ -345,7 +419,7 @@ ORIGINATOR = os.getenv("FL_ORIGINATOR", "CAdmin")
 # 꺼져 있으면 모두 ORIGINATOR(기본 CAdmin)로 나간다. 관리자 신원은 ACP를
 # 전부 통과하므로 정책이 걸려 있어도 실제로는 아무것도 막지 못한다.
 #
-# 켜면 MN-AE-1 은 CMN-AE-1, IN-AE 는 CIN-AE 로 요청한다. 그래야 ACP가
+# 켜면 TRAINING-AE-1 은 CTRAINING-AE-1, IN-AE 는 CIN-AE 로 요청한다. 그래야 ACP가
 # 실제로 작동하고 "사업장 간 격리"가 말뿐이 아니게 된다.
 #
 # 다만 정책에 구멍이 있으면 그 순간부터 동작이 막힌다. 로봇 AE 쪽 ACP가
@@ -357,20 +431,26 @@ USE_AE_IDENTITY = os.getenv("FL_USE_AE_IDENTITY", "0") == "1"
 IN_AE_ID = os.getenv("FL_IN_AE_ID", "CIN-AE")
 
 
-def mn_ae_name(node: str) -> str:
-    """mn1 -> MN-AE-1"""
-    return f"MN-AE-{node[2:]}"
+def training_ae_name(node: str) -> str:
+    """mn1 -> TRAINING-AE-1
+
+    사업장의 학습 앱이다. 전에는 MN-AE-i 였다. 같은 앱이 MN-CSE 와 IN-CSE
+    양쪽에 등록돼 있어서 IN-CSE 트리에 "MN" 이 튀어나왔고, 거기 사는 앱으로
+    읽혔다. 분석 앱(ANALYSIS-AE-i)처럼 하는 일로 이름을 맞춘다.
+    """
+    return f"TRAINING-AE-{node[2:]}"
 
 
-def mn_ae_id(node: str) -> str:
-    """mn1 -> CMN-AE-1"""
-    return f"C{mn_ae_name(node)}"
+def training_ae_id(node: str) -> str:
+    """mn1 -> CTRAINING-AE-1"""
+    return f"C{training_ae_name(node)}"
 
 
 # ── 분석 앱(판정) ────────────────────────────────────────
 #
-# 설계서에서 사업장 안의 앱은 분석 / 운행 / 학습으로 나뉜다. 학습 앱이 MN-AE 고,
-# 판정은 분석 앱의 일이다. 지금은 모델을 들고 있는 MN-AE 가 계산까지 하지만,
+# 설계서에서 사업장 안의 앱은 분석 / 운행 / 학습으로 나뉜다. 학습 앱이
+# TRAINING-AE-i 고, 판정은 분석 앱의 일이다. 지금은 모델을 들고 있는 학습 앱이
+# 계산까지 하지만,
 # 리소스는 분석 앱 신원으로 남긴다. 나중에 분석 앱을 별도 프로세스로 떼어내도
 # 리소스 트리와 구독하는 쪽 코드가 바뀌지 않는다.
 #
@@ -379,6 +459,70 @@ ANALYSIS_AE_PREFIX = os.getenv("FL_ANALYSIS_AE_PREFIX", "ANALYSIS-AE")
 VERDICT_CNT = os.getenv("FL_VERDICT_CNT", "cnt-verdict")
 VERDICT_MNI = int(os.getenv("FL_VERDICT_MNI", "500"))
 VERDICT_ENABLED = os.getenv("FL_VERDICT", "1") not in ("0", "false", "False")
+
+# 판정을 내도 되는 첫 라운드. 이 라운드부터 CIN 을 올리고 경보를 띄운다.
+# 기본 6 이면 R1~R5 는 아무것도 안 나가고, R6 부터 나간다.
+#
+# 초반 라운드의 임계값은 거의 학습되지 않은 모델로 잰 것이라 판정이
+# 의미를 갖지 못한다. 어디부터 쓸 만한지 8시드로 쟀다(2노드 FedAvg):
+#
+#   R    AUROC    직전대비    임계 편차   임계 변동률
+#   R1  0.6201        —         0.991        25%
+#   R2  0.6631   +0.0431        0.381        12%
+#   R3  0.6832   +0.0201        0.597        18%   <- 임계가 되레 튄다
+#   R4  0.6917   +0.0085        0.483        15%
+#   R5  0.6956   +0.0039        0.382        12%   <- 상승폭 < 시드편차
+#   R6  0.6907   -0.0049        0.295         9%
+#   R10 0.7036   +0.0051        0.307         9%
+#
+# R5 부터 라운드 간 상승폭(+0.0039)이 시드 간 편차(±0.0066)보다 작아진다.
+# 즉 그 뒤의 변화는 학습 때문인지 시드 운인지 구분되지 않는다. 임계값
+# 변동률도 R6 부터 9~13% 구간에 들어앉는다. R5 까지를 안정화 구간으로
+# 보고, 판정은 그 다음인 R6 부터 낸다.
+#
+# 처음엔 AUROC 만 보고 3 으로 뒀는데, R3 은 임계값이 R1 다음으로 불안정한
+# 지점이었다. 판정을 가르는 건 AUROC 가 아니라 임계값이다.
+#
+# 10 라운드를 다 돌려도 임계값 변동률은 9% 아래로 안 내려간다. 5 는
+# "더 나빠지지 않는 구간의 시작"이지 "흔들림이 없어지는 지점"이 아니다.
+VERDICT_START_ROUND = int(os.getenv("FL_VERDICT_START_ROUND", "6"))
+
+
+# 판정을 구독해 갈 앱들. 기본은 사업장별 판정 앱(CJUDGE-AE-i).
+#
+# 로봇 AE 는 Isaac 이 만들고 AE-ID 를 CSE 가 배정하므로 따로 읽어오지만,
+# 이쪽은 우리가 정하는 이름이라 규칙으로 만든다.
+JUDGE_AE_PREFIX = os.getenv("FL_JUDGE_AE_PREFIX", "JUDGE-AE")
+
+# 구독자에게 CREATE 도 줄지.
+#
+# <subscription> 을 부모 밑에 만들 때 CREATE 가 필요한지 RETRIEVE 로 되는지는
+# CSE 구현이 정한다. ACME 문서에서 확인하지 못했다. 필요한데 안 주면 구독이
+# 403 으로 막히고, 안 필요한데 주면 그 앱이 판정을 위조할 수 있다.
+# 판정 앱은 우리 쪽 구성요소라 기본을 1 로 두되, 확인되면 0 으로 내리면 된다.
+# fl/demo_verdict_sub.py 가 이걸 실제로 재 준다.
+VERDICT_SUB_CREATE = os.getenv("FL_VERDICT_SUB_CREATE", "1") not in (
+    "0", "false", "False")
+
+
+def judge_ae_name(node: str) -> str:
+    """mn3 -> JUDGE-AE-3"""
+    return f"{JUDGE_AE_PREFIX}-{node[2:]}"
+
+
+def judge_ae_id(node: str) -> str:
+    """mn3 -> CJUDGE-AE-3"""
+    return f"C{judge_ae_name(node)}"
+
+
+def verdict_subscribers(node: str) -> list:
+    """
+    이 사업장 판정을 구독할 수 있는 AE-ID 목록.
+    FL_VERDICT_SUBSCRIBERS 로 쉼표 구분해 더 넣을 수 있다.
+    """
+    extra = [x.strip() for x in
+             os.getenv("FL_VERDICT_SUBSCRIBERS", "").split(",") if x.strip()]
+    return list(dict.fromkeys([judge_ae_id(node)] + extra))
 
 
 def analysis_ae_name(node: str) -> str:
@@ -476,6 +620,17 @@ os.makedirs(
 # DP-SGD 설정
 # ════════════════════════════════════════════════════════
 
+# DP 를 켤지. 기본은 끈다.
+#
+# 지금 방식은 배치 단위로 기울기를 클리핑(C=1.5)한 뒤 배치마다 가우시안
+# 노이즈를 더한다. 파라미터 약 9만 개에 σ≈0.33 이면 노이즈 노름이 배치
+# 32 에서 약 4.7, 배치 18 에서 약 8.3 으로, 클리핑된 기울기(≤1.5)의
+# 3~8배다. 기울기가 노이즈에 묻혀 학습이 안 됐다. 또 클리핑이 샘플
+# 단위가 아니라서 ε=12 라는 보장도 성립하지 않는다.
+#
+# 먼저 노이즈 없이 학습이 '모델 없음' 기준선을 넘는지 확인한다.
+# FL_DP=1 로 예전 방식을 켠다(비교용).
+DP_ENABLED = os.getenv("FL_DP", "0") not in ("0", "false", "False", "")
 DP_EPSILON = 12.0
 DP_DELTA = 5e-4
 DP_MAX_GRAD_NORM = 1.5

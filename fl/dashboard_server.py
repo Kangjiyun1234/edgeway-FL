@@ -53,7 +53,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from flask import Flask, Response
+from flask import Flask, Response, send_from_directory
 from sklearn.metrics import roc_auc_score
 
 import config
@@ -193,7 +193,21 @@ _shared: dict = {
     "summary_sent": False,
 
     "anomaly_start_round": ANOMALY_START_ROUND,
+
+    # 이 라운드 전에는 화면에도 이상 표시를 안 한다.
+    # MN 쪽 판정(CIN)을 막는 기준과 같은 값을 쓴다. 둘이 어긋나면
+    # CSE 에는 아무것도 없는데 화면만 빨개지는 일이 생긴다.
+    "verdict_start_round": int(
+        getattr(config, "VERDICT_START_ROUND", 1)
+    ),
+
+    # 라운드별 고정 검증셋 평가 결과. 나중에 접속한 클라이언트에도
+    # 지난 라운드를 보내기 위해 쌓아 둔다.
+    "evals": [],
 }
+
+# 평가 로그를 몇 라운드까지 들고 있을지. 라운드 수보다 넉넉하게 둔다.
+EVAL_HISTORY_MAX = 60
 
 _shared_lock = threading.Lock()
 
@@ -238,6 +252,19 @@ def _broadcast(event: dict) -> None:
 # ════════════════════════════════════════════════════════
 # HTTP Endpoint
 # ════════════════════════════════════════════════════════
+
+@app.route("/vendor/<path:name>")
+def vendor(name: str):
+    """
+    외부 CDN 대신 저장소 안의 라이브러리를 내준다.
+
+    Chart.js 를 cdnjs 에서 받게 두면 <head> 에서 파싱이 막혀, 캠퍼스 밖에서
+    열 때 그게 다 받아질 때까지 화면이 비어 있다. 망이 막혀 있으면 타임아웃
+    까지 기다린다. 시연 중에 바깥 망에 기대지 않도록 여기서 내준다.
+    """
+    return send_from_directory(PROJECT_ROOT / "vendor", name,
+                               max_age=86400)
+
 
 @app.route("/")
 def index():
@@ -310,6 +337,7 @@ def health():
             "summary_sent": _shared["summary_sent"],
 
             "anomaly_node": ANOMALY_NODE,
+            "verdict_start_round": _shared["verdict_start_round"],
             "anomaly_start_round": (
                 ANOMALY_START_ROUND
             ),
@@ -345,6 +373,8 @@ def stream():
             "nodes": _shared["nodes"],
             "thresholds": _shared["thresholds"],
             "model_round": _shared["model_round"],
+            # 접속 전에 끝난 라운드의 평가도 같이 보낸다.
+            "evals": list(_shared["evals"]),
         }
 
     try:
@@ -958,6 +988,9 @@ def _compute_summary() -> dict | None:
         max_rounds = _shared[
             "max_rounds"
         ]
+        evals = list(
+            _shared.get("evals", [])
+        )
 
     if (
         model_round < max_rounds
@@ -965,9 +998,23 @@ def _compute_summary() -> dict | None:
     ):
         return None
 
+    # 라이브 스트림에는 라벨이 없다. 그래서 AUROC·오경보 같은 수치는
+    # 고정 검증셋(valset) 평가 결과에서 가져온다. 라운드가 가장 큰 것을
+    # 쓰고, 없으면 None 으로 두고 화면에서 해당 블록을 감춘다.
+    global_eval = None
+    if evals:
+        def _round_of(e: dict) -> int:
+            try:
+                return int(e.get("round", -1))
+            except (TypeError, ValueError):
+                return -1
+
+        global_eval = max(evals, key=_round_of)
+
     result = {
         "type": "summary",
         "model_round": model_round,
+        "global_eval": global_eval,
         "nodes": {},
     }
 
@@ -1068,31 +1115,83 @@ def _compute_summary() -> dict | None:
             else:
                 false_alarm_consecutive = 0
 
-        result["nodes"][node] = {
-            "auroc": round(
-                auroc,
-                4,
-            ),
+        # K 회 연속 초과가 '시작된' 지점의 개수. verdict.py 와 같은 규칙이라
+        # 실제로 CSE 에 올라간 판정 건수와 맞는다.
+        detections = 0
+        run = 0
+        for score in node_scores:
+            if score > threshold:
+                run += 1
+                if run == K_CONSECUTIVE:
+                    detections += 1
+            else:
+                run = 0
+
+        labeled = bool(
+            len(
+                np.unique(
+                    node_labels,
+                )
+            ) > 1
+        )
+
+        entry = {
             "threshold": round(
                 float(threshold),
                 4,
             ),
-            "onset_idx": onset_index,
-            "detect_idx": detection_index,
-            "delay": detection_delay,
-            "false_alarms": false_alarms,
+            "labeled": labeled,
 
-            "n_normal": int(
+            # 라벨이 없어도 말할 수 있는 것들
+            "n_windows": int(
+                len(node_scores)
+            ),
+            "exceed": int(
                 np.sum(
-                    node_labels == 0
+                    node_scores > threshold
                 )
             ),
-            "n_anomaly": int(
-                np.sum(
-                    node_labels == 1
-                )
+            "detections": detections,
+            "mean_score": round(
+                float(
+                    np.mean(node_scores)
+                ),
+                4,
+            ),
+            "max_score": round(
+                float(
+                    np.max(node_scores)
+                ),
+                4,
             ),
         }
+
+        # 라벨이 있을 때만 의미가 있는 것들. 라이브 스트림은 전부 정상
+        # 라벨이라 AUROC 가 0 으로 찍혔고, 그 0 을 화면에 띄우면 거짓말이
+        # 된다. 아예 싣지 않는다.
+        if labeled:
+            entry.update({
+                "auroc": round(
+                    auroc,
+                    4,
+                ),
+                "onset_idx": onset_index,
+                "detect_idx": detection_index,
+                "delay": detection_delay,
+                "false_alarms": false_alarms,
+                "n_normal": int(
+                    np.sum(
+                        node_labels == 0
+                    )
+                ),
+                "n_anomaly": int(
+                    np.sum(
+                        node_labels == 1
+                    )
+                ),
+            })
+
+        result["nodes"][node] = entry
 
     return result
 
@@ -1301,6 +1400,22 @@ IGNORE_STALE_CONTROL = os.getenv("FL_DASH_IGNORE_STALE", "1") != "0"
 _stale_control_warned = False
 
 
+def _is_stale_payload(content: dict) -> bool:
+    """
+    지난 실행이 남긴 CIN 인지 본다. _is_stale_control 과 기준은 같고
+    경고를 찍지 않는다. 평가 결과처럼 조용히 걸러야 하는 곳에서 쓴다.
+    """
+    if not IGNORE_STALE_CONTROL:
+        return False
+
+    try:
+        ts = float(content.get("timestamp", 0))
+    except (TypeError, ValueError):
+        return False
+
+    return 0 < ts < DASHBOARD_STARTED_AT
+
+
 def _is_stale_control(content: dict) -> bool:
     """
     지난 실행이 남긴 라운드 명령인지 본다.
@@ -1349,8 +1464,13 @@ def _poll_thread() -> None:
     local_updates_path = om2m.in_path(
         f"{config.IN_AE_NAME}/cnt-local-updates"
     )
+    # IN-AE 가 라운드마다 고정 검증셋으로 잰 결과를 올리는 곳.
+    fl_inference_path = om2m.in_path(
+        f"{config.IN_AE_NAME}/cnt-fl-inference"
+    )
 
     previous_snapshot: dict = {}
+    last_eval_round = -1
 
     while True:
         try:
@@ -1488,6 +1608,28 @@ def _poll_thread() -> None:
                         f"{fl_state} "
                         f"nodes={list(nodes.keys())}"
                     )
+
+            # 라운드별 평가 결과. 새 라운드 것만 한 번씩 내보낸다.
+            ev = _parse_content_instance(
+                om2m.get_latest_content_instance(fl_inference_path)
+            )
+            if (ev and ev.get("type") == "global-eval"
+                    and int(ev.get("round", -1)) > last_eval_round
+                    and not _is_stale_payload(ev)):
+                last_eval_round = int(ev["round"])
+                ev = dict(ev)
+                ev["type"] = "eval"
+                # 접속 중인 쪽에 보내고, 나중에 접속한 쪽도 지난 라운드를
+                # 볼 수 있게 쌓아 둔다. 새로고침하면 그동안의 라운드가
+                # 통째로 사라지던 것이 이것이다.
+                with _shared_lock:
+                    _shared["evals"].append(ev)
+                    del _shared["evals"][:-EVAL_HISTORY_MAX]
+                _broadcast(ev)
+                print(f"  [Eval] R{last_eval_round} "
+                      f"AUROC={ev.get('auroc')} "
+                      f"탐지={ev.get('detected')}/{ev.get('n_anomaly')} "
+                      f"오경보={ev.get('false_alarms')}/{ev.get('n_normal')}")
 
         except Exception as error:
             print(
