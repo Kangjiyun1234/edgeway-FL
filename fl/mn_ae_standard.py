@@ -31,6 +31,7 @@ import onem2m_pch
 import verdict
 import mec_services
 import mec_iot
+import cse_failover
 from edge_node import AEEdgeNode
 
 # "이번 라운드는 학습할 수 없다. 다만 노드를 죽일 일은 아니다"를 나타내는 신호.
@@ -96,6 +97,12 @@ class MNAETrainer:
         om2m.set_endpoint(mn_base, mn_cse)
         om2m.set_in_endpoint(*config.in_endpoint())
         self.mn_cse_name = mn_cse
+
+        # MN-CSE 가 학습 도중 사라지면 같은 MEP 의 다른 CSE 로 옮긴다
+        # (cse_failover.py). 감시는 뒤에서, 전환은 _maybe_cse_handover 에서.
+        self.cse_watch = cse_failover.CseWatch(self.node_name, mn_base, mn_cse)
+        self._next_handover_try = 0.0
+        self.cse_handovers = 0
 
         # 사업장 CSE 안의 리소스.
         #
@@ -398,6 +405,29 @@ class MNAETrainer:
         poa = f"http://{config.NOTIFY_HOST}:{port}"
         local_notify = f"http://127.0.0.1:{port}/notify"
 
+        self._setup_local_notify()
+
+        # ── 원격: 클라우드 IN-CSE ────────────────────────
+        if config.remote_notify_mode() == "pch":
+            self.pch_receiver = onem2m_pch.setup(
+                om2m.in_path(self.ae_name), local_notify,
+                label=f"{self.ae_name} / 원격")
+            self.remote_notify_target = (
+                self.pch_receiver.origin if self.pch_receiver else None)
+            if not self.pch_receiver:
+                print(f"    ⚠ {self.ae_name} 은 IN-CSE 로부터 알림을 받을 수 "
+                      f"없다. 라운드 명령 구독이 실패할 것이다.")
+        else:
+            self.remote_notify_target = f"{poa}/notify"
+
+    def _setup_local_notify(self):
+        """
+        로컬(사업장 MN-CSE -> 우리) 알림 경로. CSE 핸드오버 뒤에도 다시 부른다.
+        """
+        port = self.notification_port
+        poa = f"http://{config.NOTIFY_HOST}:{port}"
+        local_notify = f"http://127.0.0.1:{port}/notify"
+
         # ── 로컬: 사업장 MN-CSE ──────────────────────────
         local_ae = f"{self.mn_cse_name}/{self.ae_name}"
         if config.local_notify_mode() == "pch":
@@ -412,19 +442,6 @@ class MNAETrainer:
             # 우리에게 못 온다. 호스트 주소를 알려줘야 한다.
             om2m.set_point_of_access(local_ae, [poa], reachable=True)
             self.local_notify_target = f"{poa}/notify"
-
-        # ── 원격: 클라우드 IN-CSE ────────────────────────
-        if config.remote_notify_mode() == "pch":
-            self.pch_receiver = onem2m_pch.setup(
-                om2m.in_path(self.ae_name), local_notify,
-                label=f"{self.ae_name} / 원격")
-            self.remote_notify_target = (
-                self.pch_receiver.origin if self.pch_receiver else None)
-            if not self.pch_receiver:
-                print(f"    ⚠ {self.ae_name} 은 IN-CSE 로부터 알림을 받을 수 "
-                      f"없다. 라운드 명령 구독이 실패할 것이다.")
-        else:
-            self.remote_notify_target = f"{poa}/notify"
 
     def _is_stale_command(self, command: dict) -> bool:
         """
@@ -710,7 +727,7 @@ class MNAETrainer:
         self.telemetry_discovered = True
         return changed
 
-    def _wait_for_robots(self) -> bool:
+    def _wait_for_robots(self, timeout: float = None) -> bool:
         """
         Isaac Sim이 이 사업장의 로봇 AE와 telemetry를 올릴 때까지 기다린다.
 
@@ -722,7 +739,8 @@ class MNAETrainer:
         로봇 한 대가 빠졌다고 사업장 전체를 멈출 이유는 없고, 뒤늦게 올라온
         로봇은 다음 라운드의 수집에서 자연히 포함된다.
         """
-        timeout = float(os.getenv("FL_ROBOT_WAIT_SEC", "300"))
+        if timeout is None:
+            timeout = float(os.getenv("FL_ROBOT_WAIT_SEC", "300"))
         min_robots = int(os.getenv("FL_MIN_ROBOTS_PER_SITE", "1"))
         poll = float(os.getenv("FL_ROBOT_POLL_SEC", "5"))
 
@@ -764,6 +782,140 @@ class MNAETrainer:
                 next_log = now + 10.0
 
             time.sleep(poll)
+
+    # ---------------------------
+    # MN-CSE 핸드오버 (MEC033)
+    # ---------------------------
+    def _cse_block(self) -> dict:
+        """
+        드롭박스 업로드에 싣는 '지금 붙어 있는 MN-CSE'. 대시보드는 IN-CSE 만
+        읽으므로, 핸드오버를 알리는 길은 이 업로드뿐이다.
+        """
+        return {"mn_cse": self.mn_cse_name,
+                "cse_handovers": int(self.cse_handovers)}
+
+    def _maybe_cse_handover(self, round_num: int = None) -> bool:
+        """
+        MN-CSE 가 FL_CSE_FAILOVER_SEC 이상 응답이 없으면 같은 MEP 의 다른
+        CSE 로 옮긴다. 옮겼으면 True.
+
+        안전한 지점(라운드 시작, 수집 루프, 판정 직전)에서만 부른다.
+        학습 중에는 MN-CSE 를 쓰지 않으므로 그 사이에 죽어도 다음 지점에서
+        옮기면 된다.
+
+        옮기면서 하는 일
+          1) MEC033 에서 지금 CSE 가 아닌, 응답하는 CSE 를 고른다
+          2) 이 프로세스의 MN-CSE 바인딩과 그 CSE 기준 경로를 전부 바꾼다
+          3) 로봇(Isaac Sim)이 새 CSE 에 올라오길 기다린다
+          4) 새 CSE 에 우리 리소스를 만든다
+             (TRAINING-AE, ANALYSIS-AE, ACP 2개, cnt-local-model,
+              cnt-net-status, cnt-verdict — setup_resources_standard 와 같다)
+             로봇을 먼저 기다리는 이유: acp-verdict 에 로봇 AE-ID 를 넣어야
+             로봇이 새 CSE 에서도 판정을 읽고 구독할 수 있다.
+          5) 로컬 알림 경로(poa)를 다시 박고 telemetry 구독을 다시 건다
+          6) 새 cnt-net-status 에 핸드오버 기록을 남긴다
+
+        바꾸지 않는 것
+          IN-CSE 쪽(라운드 명령 구독, 드롭박스, 글로벌 모델)은 그대로다.
+          메모리의 모델과 이미 모은 윈도우도 그대로 이어 쓴다.
+        """
+        if not self.cse_watch.should_failover():
+            return False
+        now = time.time()
+        if now < self._next_handover_try:
+            return False
+        self._next_handover_try = now + float(
+            os.getenv("FL_CSE_HANDOVER_RETRY_SEC", "15"))
+
+        old_base, old_cse = self.cse_watch.target()
+        down = self.cse_watch.down_for()
+        mep = config.MEP_OF_NODE.get(self.node_name, "?")
+        print(f"\n  ⇄ [{self.node_name}] MN-CSE {down:.0f}초 무응답 "
+              f"— MEC033 에서 {mep} 의 다른 CSE 를 찾는다")
+        rep = cse_failover.pick_replacement(self.node_name, (old_base, old_cse))
+        if not rep:
+            print(f"    ✗ 옮겨 갈 CSE 가 없다. "
+                  f"{os.getenv('FL_CSE_HANDOVER_RETRY_SEC', '15')}초 뒤 다시 본다")
+            return False
+        base, cse, pid = rep
+        print(f"    → {base}/{cse}  (IoT 플랫폼 {pid or '?'})")
+
+        # 2) 바인딩. config.mn_endpoint 를 쓰는 곳(setup_resources_standard)도
+        #    새 CSE 를 보도록 이 프로세스의 환경변수로 덮는다.
+        key = self.node_name.upper()
+        os.environ[f"FL_MN_BASE_URL_{key}"] = base
+        os.environ[f"FL_MN_CSE_NAME_{key}"] = cse
+        om2m.set_endpoint(base, cse)
+        self.mn_cse_name = cse
+        self.local_model_path = f"{cse}/{self.ae_name}/{self.local_model_cnt}"
+        self.net_status_path = f"{cse}/{self.ae_name}/cnt-net-status"
+        self.verdict_cnt_path = (f"{cse}/{config.analysis_ae_name(self.node_name)}"
+                                 f"/{config.VERDICT_CNT}")
+        self.telemetry_paths = [f"{cse}/{rb}/{config.ROBOT_TELEMETRY_CNT}"
+                                for rb in self.robot_names]
+        self.telemetry_discovered = False
+        self.telemetry_subs.clear()
+        self.telemetry_cursor = {}
+        self.cse_watch.set_target(base, cse)
+
+        # 새 CSE 에는 아직 우리 AE 가 없다. AE 신원(FL_USE_AE_IDENTITY=1)으로
+        # 나가면 등록 안 된 originator 라 거절당하므로, 리소스를 다 만들
+        # 때까지는 관리자 신원으로 나간다. ACP 도 CSEBase 아래라 마찬가지다.
+        import setup_resources_standard as srs
+        robots_ok = False
+        om2m.set_originator(None)
+        try:
+            # 3) 로봇. Isaac Sim 이 새 CSE 로 옮겨 오는 것을 기다린다.
+            wait = float(os.getenv("FL_CSE_HANDOVER_ROBOT_WAIT_SEC", "120"))
+            try:
+                robots_ok = self._wait_for_robots(timeout=wait)
+            except Exception as e:
+                print(f"    ⚠ 새 CSE 에서 로봇 확인 실패: {e}")
+            if not robots_ok:
+                print(f"    ⚠ 새 CSE 에 로봇이 아직 없다. acp-verdict 에 로봇이 "
+                      f"빠지고, 수집 루프가 로봇을 계속 다시 찾는다")
+
+            # 4) 우리 리소스
+            try:
+                srs.setup_mn_resources(self.node_name)
+            except Exception as e:
+                print(f"    ⚠ 새 CSE 리소스 생성 중 오류(계속 진행): {e}")
+        finally:
+            om2m.set_endpoint(base, cse)
+            if config.USE_AE_IDENTITY:
+                om2m.set_originator(self.ae_id)
+
+        # 5) 로컬 알림 경로와 telemetry 구독
+        try:
+            self._setup_local_notify()
+        except Exception as e:
+            print(f"    ⚠ 로컬 알림 경로 설정 실패: {e}")
+        if robots_ok:
+            self._subscribe_to_telemetry()
+            if os.getenv("FL_SENSOR_SEED_CURSOR", "1") != "0":
+                self._seed_telemetry_cursor()
+
+        # 6) 기록
+        self.cse_handovers += 1
+        rec = {
+            "type": "cse-handover",
+            "node": self.node_name,
+            "mep": mep,
+            "round": round_num,
+            "timestamp": time.time(),
+            "down_sec": round(down, 1),
+            "from": {"base": old_base, "cse": old_cse},
+            "to": {"base": base, "cse": cse, "iotPlatformId": pid},
+            "source": "MEC033",
+            "robots": len(self.robot_names),
+        }
+        res = om2m.create_content_instance(
+            self.net_status_path, rec,
+            labels=["cse-handover"] + ([f"round_{round_num}"] if round_num else []),
+        )
+        print(f"    {'✓' if res else '⚠'} 핸드오버 완료 "
+              f"({old_cse} → {cse}){'' if res else ' — 기록은 실패'}")
+        return True
 
     # ct 는 oneM2M 절대시각(UTC). cra 는 쉼표 앞만 받는다.
     CT_FMT = "%Y%m%dT%H%M%S"
@@ -1015,6 +1167,9 @@ class MNAETrainer:
         n_polls = 0
 
         while True:
+            # 수집 중에 MN-CSE 가 죽었으면 같은 MEP 의 다른 CSE 로 옮기고
+            # 이어서 모은다. 이미 버퍼에 쌓인 윈도우는 그대로 쓴다.
+            self._maybe_cse_handover(round_num)
             if incremental:
                 fresh, cursors = amr_ingest.fetch_site_windows_since(
                     self.telemetry_paths, self.telemetry_cursor, per_robot)
@@ -1893,6 +2048,7 @@ class MNAETrainer:
         """
         payload = {
             "type": "fl-inference",
+            **self._cse_block(),
             "node": self.node_name,
             "round": round_num,
             "cold_start": bool(self.is_cold_start),
@@ -1938,6 +2094,7 @@ class MNAETrainer:
     ):
         payload = {
             "type": "fl-update",
+            **self._cse_block(),
             "node": self.node_name,
             "round": round_num,
 
@@ -2067,6 +2224,9 @@ class MNAETrainer:
         if os.getenv("FL_SENSOR_SEED_CURSOR", "1") != "0":
             self._seed_telemetry_cursor()
 
+        # 여기서부터 MN-CSE 를 감시한다. 기동 중 실패는 위에서 이미 걸러진다.
+        self.cse_watch.start()
+
         for round_num in range(1, config.GLOBAL_ROUNDS + 1):
             print("\n" + "─" * 50)
             print(f"[{self.node_name}] wait Round {round_num}")
@@ -2088,6 +2248,9 @@ class MNAETrainer:
 
             if self.round_start_stagger_sec > 0:
                 time.sleep(self.round_start_stagger_sec)
+
+            # 라운드 명령을 기다리는 동안 MN-CSE 가 죽었을 수 있다.
+            self._maybe_cse_handover(round_num)
 
             # 데이터 로드 + AEEdgeNode 생성
             data_dict = self._load_sensor_data_for_round(round_num)
@@ -2263,6 +2426,7 @@ class MNAETrainer:
             # 판정은 이번 창을 학습 '전에' 직전 판정기로 매긴 점수로 한다
             # (_prescore_windows). 이번에 학습·보정한 노드는 다음 라운드의
             # 판정기가 된다.
+            self._maybe_cse_handover(round_num)
             self._publish_verdicts(round_num)
             self._detector = self.edge_node
 

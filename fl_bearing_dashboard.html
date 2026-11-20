@@ -491,21 +491,21 @@ if (!window.Chart) {
     <div class="nodes-row">
       <div class="node ok" id="nd-mn1">
         <div class="node-header">
-          <span class="node-name">mn1</span>
+          <span class="node-name">mn1 <span class="chart-unseen cse-tag" id="cse-mn1" title="MN-CSE handed over via MEC033" hidden>spare</span></span>
           <span class="node-badge ok" id="nb-mn1">Normal</span>
         </div>
         <div class="node-role">Site A · 4 robots · in aggregation</div>
       </div>
       <div class="node ok" id="nd-mn2">
         <div class="node-header">
-          <span class="node-name">mn2</span>
+          <span class="node-name">mn2 <span class="chart-unseen cse-tag" id="cse-mn2" title="MN-CSE handed over via MEC033" hidden>spare</span></span>
           <span class="node-badge ok" id="nb-mn2">Normal</span>
         </div>
         <div class="node-role">Site B · 2 robots · in aggregation</div>
       </div>
       <div class="node ok" id="nd-mn3">
         <div class="node-header">
-          <span class="node-name">mn3 <span class="chart-unseen" title="Local only: fine-tunes the global model on its own normal data, never sees fault data, and does not send weights to FedAvg.">local only</span></span>
+          <span class="node-name">mn3 <span class="chart-unseen" title="Local only: fine-tunes the global model on its own normal data, never sees fault data, and does not send weights to FedAvg.">local only</span> <span class="chart-unseen cse-tag" id="cse-mn3" title="MN-CSE handed over via MEC033" hidden>spare</span></span>
           <span class="fault-dot" id="fault-dot-mn3" title="Anomaly detected"></span>
           <span class="node-badge ok" id="nb-mn3">Monitoring</span>
         </div>
@@ -917,6 +917,17 @@ function applyState(evt) {
       const vl = document.getElementById('vl-' + node);
       if (au) au.textContent = fmt(d.val_auroc, 3);
       if (vl) vl.textContent = fmt(d.val_loss, 4);
+
+      // MN-CSE 핸드오버(MEC033)로 다른 CSE 에 붙어 있으면 spare 표시
+      const ct = document.getElementById('cse-' + node);
+      if (ct) {
+        const h = toNumber(d.cse_handovers, 0);
+        ct.hidden = !(h > 0);
+        if (h > 0) {
+          ct.title = 'MN-CSE handed over via MEC033 → ' + (d.mn_cse || '?')
+                   + (h > 1 ? ' (' + h + ' times)' : '');
+        }
+      }
     });
 
     if (totalSamples > 0 && upRound > 0 && !lossHistory[upRound]) {

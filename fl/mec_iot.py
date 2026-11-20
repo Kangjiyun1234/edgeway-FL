@@ -115,19 +115,33 @@ def candidates(mep: str) -> List[Tuple[str, str, str]]:
     return out
 
 
-def _cse_answers(base: str, cse: str) -> bool:
-    """CSEBase 를 한 번 조회해 본다. 우리 신원(originator)으로 나간다."""
+def _get_cse_base(base: str, cse: str, origin: Optional[str] = None):
+    """CSEBase 를 한 번 RETRIEVE 한다. origin 을 안 주면 지금 신원으로 나간다."""
     try:
-        r = requests.get(
+        return requests.get(
             f"{base}/{cse}", timeout=TIMEOUT, verify=config.TLS_VERIFY,
             auth=config.mn_auth(),
             headers={"Accept": "application/json",
-                     "X-M2M-Origin": om2m.originator(),
+                     "X-M2M-Origin": origin or om2m.originator(),
                      "X-M2M-RI": f"mec033-{uuid.uuid4().hex[:8]}",
                      "X-M2M-RVI": "3"})
     except Exception:
-        return False
-    return r.status_code == 200 and "m2m:cb" in r.text
+        return None
+
+
+def probe(base: str, cse: str) -> Optional[int]:
+    """CSEBase 조회의 HTTP 상태. 연결 실패·타임아웃이면 None."""
+    r = _get_cse_base(base, cse)
+    return None if r is None else r.status_code
+
+
+def cse_answers(base: str, cse: str, origin: Optional[str] = None) -> bool:
+    """정말 CSE 인지까지 본다(200 이고 본문이 m2m:cb)."""
+    r = _get_cse_base(base, cse, origin)
+    return r is not None and r.status_code == 200 and "m2m:cb" in r.text
+
+
+_cse_answers = cse_answers   # 예전 이름
 
 
 def resolve(node: str) -> Tuple[str, str]:

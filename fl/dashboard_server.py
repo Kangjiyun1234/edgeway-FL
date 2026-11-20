@@ -1648,6 +1648,15 @@ def _poll_thread() -> None:
                                 0,
                             )
                         ),
+                        # 사업장 앱이 지금 붙어 있는 MN-CSE 와 핸드오버 횟수.
+                        # 0 보다 크면 화면에 spare 표시를 띄운다.
+                        "mn_cse": node_content.get("mn_cse"),
+                        "cse_handovers": int(
+                            node_content.get(
+                                "cse_handovers",
+                                0,
+                            ) or 0
+                        ),
                     }
 
                 # 라운드 상태는 _control_thread 가 맡는다. 여기서는 노드
