@@ -17,6 +17,50 @@ opposite responses.
 
 ---
 
+## At a glance
+
+**What runs where**
+
+| Where | What | oneM2M identity | MEC identity |
+| --- | --- | --- | --- |
+| Shared IN-CSE, outside the sandbox | FL coordinator — starts rounds, runs FedAvg, scores each global model | `IN-AE` | — (belongs to no MEP) |
+| Each site's MEP (mep-a / b / c) | Site app — collects telemetry, trains locally, judges floor faults | `TRAINING-AE-i` + `ANALYSIS-AE-i` | MEC app `edgeway-fl-a/b/c` |
+| Isaac Sim host | Robots — drive, publish 38-channel telemetry | `siteX_AMR_n` | UE `robot-xn` |
+
+**One round, end to end**
+
+1. `IN-AE` writes an `fl-command` CIN to `cnt-fl-control`. Each site app is
+   notified through its `<pollingChannel>` on the IN-CSE.
+2. Each site app takes the global model from `cnt-global-model` and trains on the
+   telemetry windows its robots pushed to the MN-CSE since the last round.
+3. Sites A and B upload weights to their own drop-box (`cnt-local-updates/cnt-mnX`).
+   Site C uploads metrics only.
+4. `IN-AE` is notified of each upload, runs FedAvg, writes the new global model,
+   and scores it on a fixed validation set (`cnt-fl-inference`).
+5. Inside each site: link state (MEC 028) and robot location (MEC 013) go to
+   `cnt-net-status`, and from round 6 every detected floor fault becomes a verdict
+   in `ANALYSIS-AE-i/cnt-verdict`. Neither leaves the site.
+
+**Standards used**: oneM2M TS-0001 / TS-0004 / TS-0009, TR-0084 direction ·
+ETSI GS MEC 011, 013, 028, 033 (section 12).
+
+## Contents
+
+1. [Demo scenarios](#1-demo-scenarios)
+2. [System architecture](#2-system-architecture)
+3. [oneM2M resource mapping](#3-onem2m-resource-mapping)
+4. [Federated learning design](#4-federated-learning-design)
+5. [ETSI MEC integration and network scenarios](#5-etsi-mec-integration-and-network-scenarios)
+6. [Model weight transport over oneM2M](#6-model-weight-transport-over-onem2m)
+7. [Project structure](#7-project-structure)
+8. [Configuration](#8-configuration)
+9. [How to run](#9-how-to-run)
+10. [Ports](#10-ports)
+11. [Known limitations](#11-known-limitations)
+12. [Standards referenced](#12-standards-referenced)
+
+---
+
 ## 1. Demo scenarios
 
 | # | Scenario | What it shows | ETSI MEC API |
@@ -179,91 +223,139 @@ create one.
 
 ## 3. oneM2M resource mapping
 
-Both trees below were read back from the running CSEs, not written from the
-design. `<in-cse>` and `<sandbox>` stand for values that live in `.env.local`.
+Two CSEs matter to the FL run: the shared **IN-CSE** (coordination) and one
+**MN-CSE** per site (everything that stays inside the site). The trees below are
+checked against the code that creates them — `fl/setup_resources_standard.py`
+for the resources, `fl/mn_ae_standard.py` and `fl/in_ae_standard.py` for
+subscriptions, polling channels and CIN payloads. `<in-cse>` and `<sandbox>`
+stand for values that live in `.env.local`.
+
+How to read them:
 
 ```
-IN-CSE   <in-cse>                            outside the sandbox, shared
-│
-├── CAdmin                   <AE>   built into the CSE — never delete
-├── acpCreateRootResources   <ACP>  built in
-├── acpRetrieveCSEBase       <ACP>  built in
-│
-├── lightbulbAE …            <AE>   other teams' resources on the shared CSE — never touched
-│
-├── acp-fl-control           <ACP>  IN-AE all · TRAINING-AE-* RETRIEVE+NOTIFY
-├── acp-global-model         <ACP>  same
-├── acp-local-updates        <ACP>  IN-AE all · TRAINING-AE-* CREATE
-├── acp-dropbox-mn1/2/3      <ACP>  IN-AE all · that one site only, CREATE
-│
-├── TRAINING-AE-1            <AE>   CTRAINING-AE-1   site A trainer
-│   └── pch                  <pollingChannel>   receives round commands
-├── TRAINING-AE-2            <AE>   CTRAINING-AE-2
-│   └── pch                  <pollingChannel>
-├── TRAINING-AE-3            <AE>   CTRAINING-AE-3
-│   └── pch                  <pollingChannel>
-│
-└── IN-AE                    <AE>   CIN-AE           coordinator
-    ├── pch-in-ae            <pollingChannel>   receives drop-box notifications
-    │
-    ├── cnt-fl-control       <CNT>  mni=50    round commands   IN → sites
-    │   ├── sub_mn1/2/3      <SUB>  net=3, one per site trainer
-    │   └── <CIN>  {jobState, currentRound, maxRounds, timestamp}
-    │
-    ├── cnt-global-model     <CNT>  mni=50    global weights   IN → sites
-    │   └── <CIN>  fp16+gzip+base64 state_dict
-    │
-    ├── cnt-local-updates    <CNT>  mni=50
-    │   ├── cnt-mn1          <CNT>  mni=50    site A drop-box
-    │   │   ├── sub_in_dropbox_mn1  <SUB>  net=3, target IN-AE
-    │   │   └── <CIN>  {type, round, train_loss, val_loss, val_auroc,
-    │   │               num_samples, weights, window_scores,
-    │   │               window_labels, threshold}
-    │   ├── cnt-mn2          <CNT>  site B drop-box
-    │   │   └── sub_in_dropbox_mn2  <SUB>  net=3, target IN-AE
-    │   └── cnt-mn3          <CNT>  site C — uploads fl-inference only, no weights
-    │       └── sub_in_dropbox_mn3  <SUB>  net=3, target IN-AE
-    │
-    └── cnt-fl-inference     <CNT>  mni=200   per-round model evaluation
-        └── <CIN>  {type:"global-eval", round, model, timestamp, auroc,
-                    baseline_auroc, delta_vs_baseline, detected, false_alarms,
-                    threshold, threshold_mean3s, mean_normal, mean_anomaly,
-                    separation, n_normal, n_anomaly, by_fault}
+[built-in]  part of the CSE itself — never delete
+[ours]      created by fl/setup_resources_standard.py
+[runtime]   created by a running FL process (subscriptions, polling channels, CINs)
+[Isaac]     created by Isaac Sim — this repository only reads it
+acp=…       the ACP linked through acpi
+C R U D N Disc = CREATE RETRIEVE UPDATE DELETE NOTIFY DISCOVERY   (TS-0001 acop)
 ```
 
+### IN-CSE — coordination, shared, outside the sandbox
+
 ```
-MN-CSE   acme-cse-mn-mep-a-<sandbox>          inside the sandbox, one per MEP
+<in-cse>
 │
-├── CAdmin / acpCreateRootResources / acpRetrieveCSEBase    built in
-├── <in-cse-id>              <remoteCSE>   registrar link, cst=1 (IN-CSE)
+├── CAdmin                     <AE>    [built-in]
+├── acpCreateRootResources     <ACP>   [built-in]
+├── acpRetrieveCSEBase         <ACP>   [built-in]
+├── lightbulbAE …              <AE>    other teams' resources on the shared CSE — never touched
 │
-├── siteA_AMR_1 … _4         <AE>   ADN-AE, registered by Isaac Sim
-│   ├── telemetry            <CNT>  mni=10000
-│   │      lbl = site:siteA · robot:AMR_1 · ae:siteA_AMR_1
-│   │            · type:telemetry · siteA:telemetry
-│   │   ├── sub-sensor-data-mn1   <SUB>  net=3 → the trainer's poa
-│   │   └── <CIN>  {robot, seq, t_wall, t_sim, nav,
-│   │               pose{x,y,yaw}, 38 signal channels, label}
-│   └── status               <CNT>
+│   ── access control ─────────────────────────────────────────────────── [ours]
+├── acp-fl-control             <ACP>   IN-AE: all · TRAINING-AE-*: R N Disc,
+│                                      plus C for <subscription> children only (chty=23)
+├── acp-global-model           <ACP>   IN-AE: all · TRAINING-AE-*: R N Disc
+├── acp-local-updates          <ACP>   IN-AE: all · TRAINING-AE-*: C Disc
+├── acp-dropbox-mn1/2/3        <ACP>   IN-AE: all · that one site's TRAINING-AE: C R
+├── acp-fl-inference           <ACP>   IN-AE: all (the dashboard reads as admin)
 │
-├── acp-cache-mn1            <ACP>  CTRAINING-AE-1 all · CIN-AE RETRIEVE+DISCOVERY
-├── acp-verdict-mn1          <ACP>  CANALYSIS-AE-1 all
-│                                   · CTRAINING-AE-1 RETRIEVE+DISCOVERY
-│                                   · robot AEs RETRIEVE+NOTIFY+DISCOVERY
+│   ── site apps, second registration (identity for ACPs + polling) ────── [ours]
+├── TRAINING-AE-1              <AE>    CTRAINING-AE-1   rr=false once its channel exists
+│   └── pch                    <pollingChannel>  [runtime]  round commands arrive here
+├── TRAINING-AE-2              <AE>    CTRAINING-AE-2
+│   └── pch                    <pollingChannel>  [runtime]
+├── TRAINING-AE-3              <AE>    CTRAINING-AE-3
+│   └── pch                    <pollingChannel>  [runtime]
 │
-├── TRAINING-AE-1            <AE>   CTRAINING-AE-1   training app
-│   │                               poa=http://<host>:5001, rr=true
-│   │                               local notifications are direct by default,
-│   │                               so there is no <pollingChannel> here
-│   ├── cnt-local-model      <CNT>  mni=5     round cache
-│   └── cnt-net-status       <CNT>  mni=100   MEC028/MEC013 snapshots, buffer state
+│   ── coordinator ────────────────────────────────────────────────────── [ours]
+└── IN-AE                      <AE>    CIN-AE           FL coordinator
+    ├── pch                    <pollingChannel>  [runtime]  drop-box notifications arrive here
+    │
+    ├── cnt-fl-control         <CNT>   mni=50   acp=acp-fl-control      IN → sites
+    │   ├── sub_mn1/2/3        <SUB>   [runtime] net=3, one per site app, nu = its pch
+    │   └── <CIN>  {type:"fl-command", jobState, currentRound, maxRounds,
+    │               globalModelUri, securityMode, privacyParams, timestamp}
+    │
+    ├── cnt-global-model       <CNT>   mni=50   acp=acp-global-model    IN → sites
+    │   └── <CIN>  global weights, fp16 + gzip + base64 state_dict
+    │
+    ├── cnt-local-updates      <CNT>   mni=50   acp=acp-local-updates   sites → IN
+    │   ├── cnt-mn1            <CNT>   mni=50   acp=acp-dropbox-mn1     site A drop-box
+    │   │   ├── sub_in_dropbox_mn1  <SUB>  [runtime] net=3, nu = IN-AE's pch
+    │   │   └── <CIN>  {type:"fl-update", node, round, train_loss, val_loss,
+    │   │               val_auroc, num_samples, weights_b64, weights_codec,
+    │   │               weights_sha256, weights_bytes, window_scores,
+    │   │               window_labels, window_robots, threshold, timestamp}
+    │   ├── cnt-mn2            <CNT>   acp=acp-dropbox-mn2     site B drop-box (same)
+    │   └── cnt-mn3            <CNT>   acp=acp-dropbox-mn3     site C drop-box
+    │       └── <CIN>  {type:"fl-inference", …}   metrics only, no weights
+    │
+    └── cnt-fl-inference       <CNT>   mni=200  acp=acp-fl-inference    per-round evaluation
+        └── <CIN>  lbl=round_N, global-eval
+                   {type:"global-eval", round, model, timestamp, auroc,
+                    baseline_auroc, delta_vs_baseline, threshold, detected, miss,
+                    false_alarms, threshold_mean3s, detected_mean3s,
+                    false_alarms_mean3s, mean_normal, mean_anomaly, separation,
+                    n_normal, n_anomaly, by_fault}
+```
+
+All IN-side containers carry `lbl=scope:in, type:<name>`; drop-boxes add
+`node:mnX` and the site label. Polling channels are created under the name `pch`;
+if the AE already has a channel under another name, that one is reused.
+
+### MN-CSE — one per site, inside the sandbox (site A shown)
+
+```
+acme-cse-mn-mep-a-<sandbox>            registered at mep-a as an IoT platform (MEC 033)
 │
-└── ANALYSIS-AE-1            <AE>   CANALYSIS-AE-1   analysis app
-    └── cnt-verdict          <CNT>  mni=500   stays inside the site
-        └── <CIN>  {type:"amr-verdict", site, node, robot, verdict:"ANOMALY",
+├── CAdmin / acpCreateRootResources / acpRetrieveCSEBase     <…>  [built-in]
+├── <in-cse-id>                <remoteCSE>   registrar link, cst=1 (IN-CSE)
+│
+│   ── robots ────────────────────────────────────────────────────────── [Isaac]
+├── siteA_AMR_1 … _4           <AE>    ADN-AE
+│   ├── telemetry              <CNT>   mni=10000
+│   │      lbl = site:siteA · robot:AMR_1 · ae:siteA_AMR_1 · type:telemetry · siteA:telemetry
+│   │   ├── sub-sensor-data-mn1  <SUB>  [runtime] net=3, nct=1 → TRAINING-AE-1's poa
+│   │   └── <CIN>  {robot, seq, t_wall, t_sim, nav, pose{x,y,yaw},
+│   │               38 signal channels, label}
+│   └── status                 <CNT>
+│
+│   ── access control ─────────────────────────────────────────────────── [ours]
+├── acp-cache-mn1              <ACP>   TRAINING-AE-1: all · IN-AE: R Disc
+├── acp-verdict-mn1            <ACP>   ANALYSIS-AE-1: all
+│                                      · TRAINING-AE-1: R Disc
+│                                      · JUDGE-AE-1 (CJUDGE-AE-1): R N Disc C
+│                                      · robot AEs: R N Disc
+│
+│   ── site app (one process, two AEs) ─────────────────────────────────── [ours]
+├── TRAINING-AE-1              <AE>    CTRAINING-AE-1   training role
+│   │                                  poa=http://<FL_NOTIFY_HOST>:5001, rr=true
+│   │                                  (local notifications are direct, so no pch here)
+│   ├── cnt-local-model        <CNT>   mni=5    acp=acp-cache-mn1   round model cache
+│   └── cnt-net-status         <CNT>   mni=100  acp=acp-cache-mn1   link / location / buffering
+│       ├── <CIN>  every round: {type:"net-status", node, mep, round, timestamp,
+│       │                        sources:["MEC028","MEC013"],
+│       │                        mec_app{appInstanceId, ready, registered},
+│       │                        summary, robots[{ae, ue, ap, rssi, ul_kbps,
+│       │                                         dl_kbps, channel_util_pct,
+│       │                                         verdict, reasons,
+│       │                                         zone, loc_ap, lat, lon}]}
+│       └── <CIN>  scenarios 2/3: {scenario:"s2-detect"|"s2-handover"|"s3-outage-start"|…,
+│                                  robot, verdict, node, ts}
+│                  lbl = scenario:… · verdict:… · robot:…
+│
+└── ANALYSIS-AE-1              <AE>    CANALYSIS-AE-1   analysis role
+    └── cnt-verdict            <CNT>   mni=500  acp=acp-verdict-mn1  never leaves the site
+        └── <CIN>  lbl = <robot> · ANOMALY · <site>
+                   {type:"amr-verdict", site, node, robot, verdict:"ANOMALY",
                     score, threshold, ratio, consecutive, window_index,
-                    observed_at, pose{x,y}, round, model, timestamp}
+                    observed_at, pose{x,y}, round, model, timestamp,
+                    mec{ue, zone, ap, lat, lon, link, rssi, link_ap}}
 ```
+
+Robots and the judge app subscribe to `cnt-verdict` themselves; this repository
+only grants them the right to. The `mec` field is present when MEC 013 / MEC 028
+answered for that robot.
 
 mep-b and mep-c have the same structure apart from the robot count (4 / 2 / 2)
 and the node suffix. Site C (`FL_LOCAL_ONLY_NODES=mn3`) still trains locally and
@@ -271,12 +363,18 @@ still writes verdicts to `ANALYSIS-AE-3/cnt-verdict`; it differs only in *what i
 uploads*:
 
 ```
-site A / B  →  cnt-mn1, cnt-mn2   {type:"fl-update", weights, train_loss, num_samples, ...}
+site A / B  →  cnt-mn1, cnt-mn2   {type:"fl-update", weights_b64, train_loss, num_samples, …}
                                    IN-AE puts them into FedAvg
-site C      →  cnt-mn3            {type:"fl-inference", train_loss, num_samples, ...}
+site C      →  cnt-mn3            {type:"fl-inference", local_only:true, train_loss, num_samples, …}
                                    no weights; IN-AE does not wait for it and only
                                    logs it as [NO-AGG/NOTIFY]
 ```
+
+With `FL_CHUNK_WEIGHTS=1`, weights too large for one CIN go into a child
+`cnt-weights` (mni=1000) under the site's drop-box, and the `fl-update` CIN
+carries a manifest instead. Off by default.
+
+### What each FL function maps to
 
 | FL function | oneM2M resource |
 | --- | --- |
@@ -287,8 +385,10 @@ site C      →  cnt-mn3            {type:"fl-inference", train_loss, num_sample
 | Local update upload | `<contentInstance>` under `cnt-local-updates/cnt-mnX` |
 | Update collection | `<subscription>` per drop-box, target IN-AE |
 | Sensor source | `<contentInstance>` under each robot's `telemetry` |
+| Sensor delivery | `<subscription>` per robot `telemetry`, target the site app's `poa` |
 | Access control | `<accessControlPolicy>` + `acpi`, per-node scoped |
 | Per-round model evaluation | `<contentInstance>` under `cnt-fl-inference` |
+| Link and location record | `<contentInstance>` under `TRAINING-AE-i/cnt-net-status` (MN-CSE) |
 | Floor verdict | `<contentInstance>` under `ANALYSIS-AE-i/cnt-verdict` (MN-CSE) |
 
 Each drop-box carries its own ACP so one site cannot read another site's updates.
