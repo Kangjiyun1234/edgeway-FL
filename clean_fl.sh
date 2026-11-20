@@ -16,7 +16,7 @@
 #   - 전처리된 AMR PKL 데이터
 #
 # 전처리 데이터가 없을 때만 별도 실행:
-#   python3 fl/prepare_data_amr.py
+#   python3 Edge-ESTIMED-VM/Local-Model/site_app/prepare_data_amr.py
 # ============================================================
 
 set -euo pipefail
@@ -50,7 +50,7 @@ do
         echo "  ${data_file}"
         echo
         echo "다음 명령을 먼저 실행하세요."
-        echo "  python3 fl/prepare_data_amr.py"
+        echo "  python3 Edge-ESTIMED-VM/Local-Model/site_app/prepare_data_amr.py"
         exit 1
     fi
 
@@ -65,16 +65,16 @@ done
 echo
 echo "[2/6] 기존 FL 및 Dashboard 프로세스 종료"
 
-pkill -TERM -f "fl/dashboard_server.py" 2>/dev/null || true
-pkill -TERM -f "fl/in_ae_standard.py" 2>/dev/null || true
-pkill -TERM -f "fl/mn_ae_standard.py" 2>/dev/null || true
+pkill -TERM -f "Cloud/FL-Dashboard/dashboard_server.py" 2>/dev/null || true
+pkill -TERM -f "Cloud/FL-FedAvg/in_ae_standard.py" 2>/dev/null || true
+pkill -TERM -f "Edge-ESTIMED-VM/Local-Model/site_app/mn_ae_standard.py" 2>/dev/null || true
 
 sleep 2
 
 # 정상적으로 종료되지 않은 프로세스가 있을 경우 강제 종료
-pkill -KILL -f "fl/dashboard_server.py" 2>/dev/null || true
-pkill -KILL -f "fl/in_ae_standard.py" 2>/dev/null || true
-pkill -KILL -f "fl/mn_ae_standard.py" 2>/dev/null || true
+pkill -KILL -f "Cloud/FL-Dashboard/dashboard_server.py" 2>/dev/null || true
+pkill -KILL -f "Cloud/FL-FedAvg/in_ae_standard.py" 2>/dev/null || true
+pkill -KILL -f "Edge-ESTIMED-VM/Local-Model/site_app/mn_ae_standard.py" 2>/dev/null || true
 
 echo "  ✓ Dashboard 종료"
 echo "  ✓ IN-AE 종료"
@@ -109,7 +109,7 @@ echo "  ✓ ${MODEL_BASE_DIR}/cache 초기화"
 echo
 echo "[4/6] TinyIoT DB 초기화 및 oneM2M 리소스 재생성"
 
-python3 fl/setup_resources_standard.py --clean
+python3 Cloud/FL-FedAvg/setup_resources_standard.py --clean
 
 
 # ------------------------------------------------------------
