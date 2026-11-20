@@ -1,6 +1,6 @@
 # edgeway-FL
 
-**Standards-based federated learning over oneM2M and ETSI MEC for multi-robot floor inspection**
+**Standards-based federated learning over oneM2M and ETSI MEC for multi-robot anomaly detection**
 
 Submission for the 2026 oneM2M International Developer Contest.
 
@@ -23,7 +23,7 @@ opposite responses.
 
 | Where | What | oneM2M identity | MEC identity |
 | --- | --- | --- | --- |
-| Shared IN-CSE, outside the sandbox | FL coordinator — starts rounds, runs FedAvg, scores each global model | `IN-AE` | — (belongs to no MEP) |
+| Shared IN-CSE, outside the sandbox | FL coordinator — starts rounds, runs FedAvg, evaluates each global model | `IN-AE` | — (belongs to no MEP) |
 | Each site's MEP (mep-a / b / c) | Site app — collects telemetry, trains locally, flags anomalous robots | `TRAINING-AE-i` + `ANALYSIS-AE-i` | MEC app `edgeway-fl-a/b/c` |
 | Isaac Sim host | Robots — drive, publish 38-channel telemetry | `siteX_AMR_n` | UE `robot-xn` |
 
@@ -36,7 +36,7 @@ opposite responses.
 3. Sites A and B upload weights to their own drop-box (`cnt-local-updates/cnt-mnX`).
    Site C uploads metrics only.
 4. `IN-AE` is notified of each upload, runs FedAvg, writes the new global model,
-   and scores it on a fixed validation set (`cnt-fl-inference`).
+   and evaluates it on a fixed validation set (`cnt-fl-inference`).
 5. Inside each site: link state (MEC 028) and robot location (MEC 013) go to
    `cnt-net-status`, and from round 6 every detected anomaly becomes a verdict
    in `ANALYSIS-AE-i/cnt-verdict`. Neither leaves the site. Whether an anomaly is
@@ -67,14 +67,14 @@ ETSI GS MEC 011, 013, 028, 033 (section 12).
 | # | Scenario | What it shows | ETSI MEC API |
 | --- | --- | --- | --- |
 | 1 | Normal driving | Robots drive their loops; telemetry lands in each site's MN-CSE | MEC 033 (site app finds its MN-CSE) + MEC 011 (registers as a MEC app, discovers 013/028) |
-| 2 | Network anomaly → handover | MEC028 detects a degraded Wi-Fi AP; the robot is moved to another AP and data keeps flowing | MEC 028 (observe) + sandbox controller (act) |
+| 2 | Network anomaly → Wi-Fi AP handover | MEC028 detects a degraded Wi-Fi AP; the robot is moved to another AP and data keeps flowing | MEC 028 (observe) + sandbox controller (act) |
 | 4 | Federated learning in real time | Sites A and B train and FedAvg; site C never contributes and still receives the global model | MEC 028 + MEC 013, read once per round into `cnt-net-status` |
 | 5 | Anomaly detection: floor vs robot | The site app flags an anomalous robot; a separate judge app (`JUDGE-AE-3`) has the other robot cross-check the spot and decides floor or robot | MEC 013 + MEC 028, attached to each verdict as `mec` |
 | 6 | MN-CSE failure → CSE handover | A site's MN-CSE stops answering mid-training; the site app finds another CSE at the same MEP, rebuilds its resources there and keeps training | MEC 033 (find the replacement CSE) |
 
 The sandbox controller (`sandbox-ctrl`) is the MEC Sandbox's own control API, not
-an ETSI MEC specification, so it carries no GS number. Section 12 lists every MEC
-service on the MEPs and which of them this repository actually calls.
+an ETSI MEC specification, so it carries no GS number. Section 12 lists the MEC
+services this repository calls.
 
 Scenarios 2 and 6 share one goal: **the link — or the CSE itself — may fail,
 but the data must not be lost and the FL round must not stall.** Scenario 2 moves
@@ -119,8 +119,8 @@ sandbox — it is a shared CSE operated outside it, reached over Mca.
 
 The three site MEPs each run the same seven ETSI MEC services (`mec011-N` …
 `mec046-N` in the scenario); `mep-spare` runs none. This repository calls
-**MEC 011, 013, 028 and 033**; the others are deployed but not used here — see
-section 12.
+**MEC 011, 013, 028 and 033** (section 12); the others are deployed but not used
+here.
 
 Each site MEP normally runs **one** MN-CSE. Only for scenario 6 is a second
 MN-CSE brought up at the same MEP and registered in its MEC 033 as another IoT
@@ -174,12 +174,16 @@ through their own registrar.
 
 It does not, for two reasons.
 
-**ACME does not route upwards yet.** An ACME MN-CSE does not forward a request
-for a target it does not know up to its registrar (TS-0004 clause 7.3.2.6), so a
-request from a site AE through its MN-CSE to the IN-CSE stops at the MN with
-`4004`. This was reported on the ACME / Mobius4 developer channel in October
-2026; the ACME author said a fix was in progress but not yet released, and we
-have not checked whether the sandbox's `meep-acme-mn-cse` image includes it.
+**The ACME MN-CSE does not relay requests upward, and that is a limit of the CSE,
+not a piece missing from this repository.** Relaying is the CSE's job; nothing an
+AE registers or creates can make the MN-CSE forward a request. Measured on
+2026-11-20 with `fl/probe_routing.py`: a request sent through mep-a's MN-CSE to
+mep-b's MN-CSE comes back `4004` "Not registered to remote CSE" — the ACME MN-CSE
+does not forward a request for a target it does not know up to its registrar
+(TS-0004 clause 7.3.2.6). When we went to ask about it on the contest Discord
+(`#cse-acme`), another team had already reported the same behaviour, and the
+ACME author confirmed it and said a fix was in progress. The sandbox's
+`meep-acme-mn-cse` image does not have it yet.
 
 **Even with routing, the notification would not move.** The `<pollingChannel>`
 has to live on the CSE that delivers the notification. The round command is a
@@ -239,10 +243,10 @@ create one.
 ## 3. oneM2M resource mapping
 
 Two CSEs matter to the FL run: the shared **IN-CSE** (coordination) and one
-**MN-CSE** per site (everything that stays inside the site). The trees below are
-checked against the code that creates them — `fl/setup_resources_standard.py`
-for the resources, `fl/mn_ae_standard.py` and `fl/in_ae_standard.py` for
-subscriptions, polling channels and CIN payloads. `<in-cse>` and `<sandbox>`
+**MN-CSE** per site (everything that stays inside the site). Below is the
+resource structure on each, as created by `fl/setup_resources_standard.py`
+(resources) and `fl/mn_ae_standard.py` / `fl/in_ae_standard.py` (subscriptions,
+polling channels and CIN payloads). `<in-cse>` and `<sandbox>`
 stand for values that live in `.env.local`.
 
 How to read them:
@@ -264,7 +268,7 @@ C R U D N Disc = CREATE RETRIEVE UPDATE DELETE NOTIFY DISCOVERY   (TS-0001 acop)
 ├── CAdmin                     <AE>    [built-in]
 ├── acpCreateRootResources     <ACP>   [built-in]
 ├── acpRetrieveCSEBase         <ACP>   [built-in]
-├── lightbulbAE …              <AE>    other teams' resources on the shared CSE — never touched
+├── …                                  [built-in]  more depending on the ACME version (defaultNTP, …)
 │
 │   ── access control ─────────────────────────────────────────────────── [ours]
 ├── acp-fl-control             <ACP>   IN-AE: all · TRAINING-AE-*: R N Disc,
@@ -300,7 +304,7 @@ C R U D N Disc = CREATE RETRIEVE UPDATE DELETE NOTIFY DISCOVERY   (TS-0001 acop)
     │   │   └── <CIN>  {type:"fl-update", mn_cse, cse_handovers, node, round, train_loss, val_loss,
     │   │               val_auroc, num_samples, weights_b64, weights_codec,
     │   │               weights_sha256, weights_bytes, window_scores,
-    │   │               window_labels, window_robots, threshold, timestamp}
+    │   │               window_labels, window_robots, threshold, timestamp, …}
     │   ├── cnt-mn2            <CNT>   acp=acp-dropbox-mn2     site B drop-box (same)
     │   └── cnt-mn3            <CNT>   acp=acp-dropbox-mn3     site C drop-box
     │       └── <CIN>  {type:"fl-inference", mn_cse, cse_handovers, …}   metrics only, no weights
@@ -323,7 +327,7 @@ if the AE already has a channel under another name, that one is reused.
 ```
 acme-cse-mn-mep-a-<sandbox>            registered at mep-a as an IoT platform (MEC 033)
 │
-├── CAdmin / acpCreateRootResources / acpRetrieveCSEBase     <…>  [built-in]
+├── CAdmin / acpCreateRootResources / acpRetrieveCSEBase / … <…>  [built-in]
 ├── <in-cse-id>                <remoteCSE>   registrar link, cst=1 (IN-CSE)
 │
 │   ── robots ────────────────────────────────────────────────────────── [Isaac]
@@ -356,7 +360,7 @@ acme-cse-mn-mep-a-<sandbox>            registered at mep-a as an IoT platform (M
 │       │                                         verdict, reasons,
 │       │                                         zone, loc_ap, lat, lon}]}
 │       ├── <CIN>  scenario 2: {scenario:"s2-detect"|"s2-no-target"|"s2-handover",
-│       │                          robot, verdict, node, ts}
+│       │                          robot, verdict, node, ts, …}
 │       │          lbl = scenario:… · verdict:… · robot:…
 │       └── <CIN>  scenario 6, written on the *new* CSE after a handover:
 │                  {type:"cse-handover", node, mep, round, timestamp, down_sec,
@@ -370,7 +374,7 @@ acme-cse-mn-mep-a-<sandbox>            registered at mep-a as an IoT platform (M
                    {type:"amr-verdict", site, node, robot, verdict:"ANOMALY",
                     score, threshold, ratio, consecutive, window_index,
                     observed_at, pose{x,y}, round, model, timestamp,
-                    mec{ue, zone, ap, lat, lon, link, rssi, link_ap}}
+                    mec{ue, zone, ap, lat, lon, link, rssi, link_ap, …}}
 ```
 
 Robots and the judge app subscribe to `cnt-verdict` themselves; this repository
@@ -379,10 +383,10 @@ answered for that robot.
 
 mep-b and mep-c have the same structure apart from the robot count (4 / 2 / 2)
 and the node suffix. After a CSE handover (scenario 6) the same tree is rebuilt on
-the standby CSE; `mn_cse` and `cse_handovers` in every drop-box upload tell the
-IN side which CSE a site is currently on. Site C (`FL_LOCAL_ONLY_NODES=mn3`) still trains locally and
-still writes verdicts to `ANALYSIS-AE-3/cnt-verdict`; it differs only in *what it
-uploads*:
+the second CSE; `mn_cse` and `cse_handovers` in every drop-box upload tell the
+IN side which CSE a site is currently on. Site C (`FL_LOCAL_ONLY_NODES=mn3`)
+still trains locally and still writes verdicts to `ANALYSIS-AE-3/cnt-verdict`;
+it differs only in *what it uploads*:
 
 ```
 site A / B  →  cnt-mn1, cnt-mn2   {type:"fl-update", weights_b64, train_loss, num_samples, …}
@@ -391,6 +395,10 @@ site C      →  cnt-mn3            {type:"fl-inference", local_only:true, train
                                    no weights; IN-AE does not wait for it and only
                                    logs it as [NO-AGG/NOTIFY]
 ```
+
+The dashboard reads only the IN-CSE, so site C's round progress, loss, AUROC
+and score graph are drawn from these reports in `cnt-mn3` — which is why
+site C keeps a drop-box even though it sends no weights.
 
 With `FL_CHUNK_WEIGHTS=1`, weights too large for one CIN go into a child
 `cnt-weights` (mni=1000) under the site's drop-box, and the `fl-update` CIN
@@ -436,11 +444,11 @@ Each drop-box carries its own ACP so one site cannot read another site's updates
 | --- | ---: | --- |
 | A (`mn1`, mep-a) | 4 | Trains, contributes to FedAvg |
 | B (`mn2`, mep-b) | 2 | Trains, contributes to FedAvg |
-| C (`mn3`, mep-c) | 2 | **Never contributes.** Receives the global model, fine-tunes locally |
+| C (`mn3`, mep-c) | 2 | **Never contributes.** Receives the global model and keeps training it on its own data, but never uploads the weights |
 
-Site C is the point of the demo. It only ever trains locally and never uploads
-its weights, yet it must still detect faults it has never seen — using a model
-trained on two other sites' floors.
+Site C is the point of the demo. It never uploads its weights and only takes the
+global model, yet with that model — built from sites A and B's data — it has to
+catch faults it has never seen.
 
 #### Aggregation weighting: equal per site, not per sample
 
@@ -502,12 +510,13 @@ site holds less than `AMR_MIN_BALANCE_RATIO` (0.5) of the largest is refused
 with an explanation rather than applied.
 
 Robots within a site are pooled: however many robots a site runs, their windows
-become one site dataset, because a fault in the floor belongs to the site, not
-to a robot.
+become one site dataset. Robots at one site run on the same floor in the same
+work environment, so they share what normal driving looks like, and the unit that
+joins federated learning is the site, not the robot.
 
 ### Training signal — unsupervised by default
 
-Training sees **no labels at all**. A robot on a real floor does not announce
+Training sees **no labels at all**. A robot in a real warehouse does not announce
 which of its windows are faulty, so neither does the training path here. Labels
 exist only in the fixed validation set, and only for scoring.
 
@@ -600,37 +609,44 @@ the first round had not seen. z values are clipped to ±10.
 
 ### Anomaly scoring
 
-The default score (`FL_SCORE_MODE=diff`) compares the *change* between consecutive
+The default anomaly score (`FL_SCORE_MODE=diff`) compares the *change* between consecutive
 samples, not the raw signal: per channel, `mean_t |Δx − Δx̂|`. All three fault
 types show up as one-sample jolts on the accelerometers, and in the raw-signal
 error those jolts are buried under the low-frequency error of reconstructing the
-trajectory. The first difference keeps the jolt.
+trajectory. Comparing the difference between neighbouring samples (the first
+difference) all but removes the slowly varying part, so the jolt stands out.
 
 Each channel's error is turned into a robust z score against the reference for its
 **condition cell** (navigation group × speed bin × load state): `(e − median) / MAD`,
 with the cell's MAD floored at 10 % of the channel's overall MAD so a quiet cell
 cannot blow small errors up. A cell with fewer than 8 reference windows falls back
 to the channel's overall reference. The window score is the **maximum** over channels,
-because a floor fault shows up on a few channels, not on the average of 38.
+because a fault usually shows up on a few channels, not on the average of 38.
 `FL_SCORE_MODE=recon` restores the older per-channel reconstruction error.
 
-Threshold: `median + 8 · MAD · 1.4826` over the reference windows
+The threshold started out as `mean + 3σ` of the reference scores. But the
+reference windows come from the training stream, and the training stream contains
+anomalous windows, so the mean and the standard deviation were both dragged upward
+by the very windows the threshold is meant to catch. So the mean was replaced by
+the median and the standard deviation by the MAD. The median and the MAD barely
+move until contamination approaches half, and the 1.4826 factor puts the MAD on
+the same scale as σ. The multiplier then went from 3 to 8, because conditioning
+concentrates the normal scores and shrinks the MAD with them; `fl/config.py` keeps
+the measurements behind that choice.
+
+The threshold is therefore `median + 8 · MAD · 1.4826` over the reference windows
 (`FL_THRESHOLD_N_SIGMA`, 8 by default; 3 when `FL_COND_NORM=0`).
 
-Not `mean + 3σ`. The reference windows come from the training stream, and the
-training stream is contaminated, so the mean and the standard deviation are both
-dragged upward by the very windows the threshold is meant to catch. The median and
-the MAD barely move until contamination approaches half, and the 1.4826 factor
-rescales the MAD onto the same footing as σ. The multiplier is 8 rather than 3
-because conditioning concentrates the normal scores and shrinks the MAD with them;
-`fl/config.py` keeps the measurements behind that choice.
+### Detection: anomaly scores before training, against a frozen reference
 
-### Verdict: score before training, against a frozen reference
-
-A round's windows are scored by the **previous round's detector before the site
-trains on them**. Scoring after training let a fault be absorbed: the model learned
-the faulty windows first and then judged them normal (a run that scored 200–400
-against a fixed reference scored 9–11 once absorbed, under a threshold of 15–17).
+The windows a site collects in a round are used twice. First the **previous
+round's detector** (model, reference and threshold) gives each window an anomaly
+score; only then does the site train on them. Computing anomaly scores after
+training let a fault be absorbed: the model learned the faulty windows first and
+then saw them as normal (anomaly scores of 200–400 against a fixed reference
+dropped to 9–11 once absorbed, under a threshold of 15–17). The validation set
+plays no part here; the fixed-set evaluation is covered under "Measuring a round
+against a fixed set" below.
 
 - **Frozen reference.** The reference pool (rounds 1–5) is frozen at
   `FL_REF_FREEZE_ROUND` (5). After that, references and thresholds come only from
@@ -650,7 +666,7 @@ the numbers could not be compared; and since the live stream carries no labels,
 `val_auroc` was a single-class 0.5 every time.
 
 `fl/valset.py` and `fl/valset_amr.npz` fix the ruler in place. The coordinator
-scores every global model against the same labelled windows and publishes the
+evaluates every global model on the same labelled windows and publishes the
 result to `cnt-fl-inference`, which the dashboard shows as a per-round log.
 `FL_VALSET_PATH` points at a different set. What the shipped set contains, and why
 that matters when reading the numbers, is in Known limitations.
@@ -663,7 +679,7 @@ measurement path is unsupervised end to end.
 
 This repository only **detects** the anomaly. Telling a floor fault from a robot
 fault is the job of a separate judge app, `JUDGE-AE-3`
-([mostonar/edgeway `judge_ae`](https://github.com/mostonar/edgeway/tree/main/judge_ae)),
+([mostonar/edgeway `judge_ae`](https://github.com/mostonar/edgeway/tree/main/Edge-ESTIMED-VM/Local-Model/judge_ae)),
 which currently runs for site C.
 
 ```
@@ -689,8 +705,8 @@ no-go zone → cnt-judgement until a clear_fault command
   `pose` from each verdict. Only one case is open at a time; a case with no
   conclusion within 600 s is closed.
 - It does not move robot 2. It watches robot 2's `telemetry` and waits until the
-  robot drives past the spot (in the demo, the `isaac_robot` scenario scripts
-  drive it there).
+  robot drives past the spot (in the demo, the scenario scripts in mostonar/edgeway
+  `Field-Isaac-Sim/demo_task_executor` drive it there).
 - Floor: a no-go zone around both positions is published to
   `JUDGE-AE-3/cnt-judgement` and sent with the verdict. The dashboard can clear a
   zone through `JUDGE-AE-3/cnt-request`.
@@ -706,16 +722,22 @@ DISCOVERY and CREATE (section 3).
 
 ## 5. ETSI MEC integration and network scenarios
 
-Each site MEP runs seven ETSI MEC services (section 12). The site app — the one
+Each site MEP runs seven ETSI MEC services. The site app — the one
 process per site that is both `TRAINING-AE-i` and `ANALYSIS-AE-i` — uses four of
-them. It is the only part of the system that is *located* at a MEP: the
-coordinator talks to the shared IN-CSE outside the sandbox and belongs to no MEP,
-so it is not a MEC application.
+them. In this repository the site app is the only process registered as a MEC
+app (MEC 011, below). The coordinator talks to the shared IN-CSE outside the
+sandbox and belongs to no MEP, so it does not register. The judge app
+(`JUDGE-AE-3`, scenario 5) is also defined in the scenario as an external app on
+mep-c (`edgeway-judge-c`).
 
 ### The site app as a MEC application — MEC 033, MEC 011
 
-On start-up, before it touches the MN-CSE, each site app does this against its
-own MEP:
+The app instances (`edgeway-fl-a/b/c`) are brought up by the sandbox's `edgeway`
+scenario, one per MEP, as external apps (`isExternal: true`); the site app finds
+the one on its MEP and registers against it. Each site app does the following
+against its own MEP. Step 1 runs as the app starts, to settle its MN-CSE address;
+steps 2–5 run once the robots' telemetry subscriptions are in place, before the
+first training round:
 
 | Step | API | Call | Why |
 | --- | --- | --- | --- |
@@ -731,10 +753,10 @@ Details that matter:
   `FL_SANDBOX_HOST` and a CSEBase retrieve must answer before it is used;
   otherwise the site app falls back to the naming rule in `config.mn_endpoint`.
   On the current sandbox both give the same address for all three sites.
-- **The FL side never creates or deletes app instances.** They belong to the
-  scenario, the way a real MEC orchestrator would own them. If the scenario has
-  no `edgeway-fl-<x>` on that MEP, MEC 011 is skipped with a warning and
-  training carries on.
+- **The scenario brings instances up and down; the FL side only registers.** It
+  never creates or deletes an instance, the way a real MEC orchestrator would own
+  them. If the scenario has no `edgeway-fl-<x>` on that MEP, MEC 011 is skipped
+  with a warning and training carries on.
 - **Step 3 must come before step 4.** This implementation answers a registration
   sent first with `403 Waiting for AppReadyConfirmation`. Step 4 is idempotent:
   an existing registration with the same endpoint is left alone, one with a
@@ -752,7 +774,10 @@ Once per round each site app reads MEC 028 link state and MEC 013 location for
 its robots and writes one snapshot to `TRAINING-AE-i/cnt-net-status`
 (`sources`, `mec_app`, per-robot AP, RSSI, link verdict, zone, coordinates).
 Every verdict CIN also carries a `mec` field with the robot's zone, AP and link
-state at the time of the verdict, so the anomaly can be placed on the map.
+state at the moment the verdict is written. These come from the robot's UE in the
+sandbox, so they say which zone and AP the robot is attached to, not where in the
+warehouse the anomaly happened; that position is the verdict's `pose{x,y}`, in
+Isaac Sim coordinates.
 
 All of this is auxiliary. A service that fails `FL_MEC_MAX_FAIL` times in a row
 is switched off for the rest of the run; rounds never wait on MEC.
@@ -787,7 +812,7 @@ does not touch the MN-CSE.
 
 | Step | What |
 | --- | --- |
-| 1 | rebind this process to the new CSE; rebuild every MN path (telemetry, `cnt-local-model`, `cnt-net-status`, `cnt-verdict`); clear subscriptions and read cursors |
+| 1 | rebind this process to the new CSE; point every MN path (telemetry, `cnt-local-model`, `cnt-net-status`, `cnt-verdict`) at it; clear subscriptions and read cursors |
 | 2 | wait up to `FL_CSE_HANDOVER_ROBOT_WAIT_SEC` (120 s) for the robots to appear on the new CSE |
 | 3 | recreate this site's resources with `setup_resources_standard.setup_mn_resources` — after step 2, so `acp-verdict-mnX` includes the robots' AE-IDs |
 | 4 | set the `poa` again and resubscribe to every robot's `telemetry` |
@@ -809,7 +834,7 @@ subscribes, it does not register them.
 
 ### Observation — MEC 028
 
-Each MEP runs `mec028-N` (`meep-wais`), AdvantEDGE's implementation of
+Each site MEP runs `mec028-N` (`meep-wais`), AdvantEDGE's implementation of
 **ETSI GS MEC 028** (WLAN Information API).
 
 ```
@@ -827,7 +852,8 @@ GET /<sandbox>/<mep>/wai/v2/queries/ap/ap_information
 | `apInfo.bssLoad.staCount` | associated stations |
 
 `fl/mec_wai.py` turns these into `GOOD` / `DEGRADED` / `LOST` with the reasons
-attached, so the dashboard can show *why* a link was judged bad.
+attached. Verdict and reasons go into `cnt-net-status` (and the verdict's `mec`
+field), so it is on record *why* a link was judged bad.
 
 ### Action — MEC Sandbox controller
 
@@ -848,7 +874,7 @@ restore. MEC028 names APs by BSSID while the controller names them by element
 name, so `fl/mec_topology.py` holds the translation table (regenerable from the
 scenario YAML via `export_from_yaml()`).
 
-### Scenario 2 — handover
+### Scenario 2 — Wi-Fi AP handover
 
 Degrade the serving AP → detect through MEC028 → pick a target (the robot's own
 neighbor report first, since that is evidence the robot can hear it; otherwise the
@@ -897,7 +923,7 @@ fl/
   amr_schema.py              38-channel spec, condition vector, window parsing
   model_cvae.py              CVAE1D
   model_codec.py             weight codec (fp16+gzip+base64, sha256, chunking)
-  edge_node.py               local training (trimmed loss), calibration, scoring
+  edge_node.py               local training (trimmed loss optional, off by default), calibration, anomaly scoring
   aggregator.py              FedAvg
   onem2m_utils.py            oneM2M client, dual-CSE routing, label discovery
   onem2m_pch.py              <pollingChannel> receiver for firewalled AEs
@@ -915,8 +941,8 @@ fl/
   mec_services.py            the site app's MEC services per round (net-status, verdict context)
   mec_sandbox.py             MEC Sandbox controller events
   net_scenarios.py           scenario 2
-  personalize.py             local fine-tuning for the non-contributing node
-  valset.py                  fixed validation set, per-round model scoring
+  personalize.py             offline, after FL: fine-tunes the global model per node and compares
+  valset.py                  fixed validation set, per-round model evaluation
   valset_amr.npz             the validation windows themselves
   build_valset.py            builds valset_amr.npz from Isaac Sim captures
   verdict.py                 writes anomaly verdicts to the analysis app's container
@@ -925,10 +951,12 @@ fl/
   probe_cra.py               diagnostic: reproduces the trainer's incremental fetch
   probe_drop.py              diagnostic: CINs dropped while building windows
   demo_verdict_sub.py        diagnostic: verdict subscription path end to end
+  probe_routing.py           diagnostic: relaying through an MN-CSE (to the IN-CSE, to another MN-CSE)
 
 fl_bearing_dashboard.html    dashboard front end
 FL-diagrams/                 PlantUML sequence/structure diagrams
 out/FL-diagrams/             rendered diagrams
+archive/experiments/         one-off evaluation scripts (mn1 hidden test)
 archive/femto/               previous FEMTO bearing demo, kept for reference
 archive/legacy/              superseded entry points
 env.local.example            environment template (copy to .env.local)
@@ -967,7 +995,7 @@ need it and runs regardless.
 | `FL_SANDBOX_SCHEME` | `https` | scheme |
 | `FL_TLS_VERIFY` | `1` | set `0` for a self-signed sandbox certificate |
 | `FL_IN_BASE_URL` / `FL_IN_CSE_NAME` | derived | override the central CSE |
-| `FL_MN_BASE_URL_MN1` … | derived | override one site's CSE |
+| `FL_MN_BASE_URL_MN1` / `FL_MN_CSE_NAME_MN1` … | derived | override one site's CSE |
 
 Derived endpoints, with `<host>` and `<sandbox>` taken from the environment:
 
@@ -1016,11 +1044,12 @@ to `source` it no longer sends every request to the wrong CSE.
 | `FL_EXCLUDE_FLAGGED` | `1` | leave above-threshold windows out of training |
 | `FL_SCORE_MODE` | `diff` | `recon` for plain reconstruction error |
 | `FL_THRESHOLD_N_SIGMA` | `8` | MAD multiplier of the threshold (`3` with `FL_COND_NORM=0`) |
+| `FL_COND_NORM` | `1` | `0` turns off per-condition normalization of the error (and the threshold multiplier falls back to `3`) |
 | `FL_MIN_STEPS` | `200` | minimum optimizer steps per local round; epochs are raised to reach it |
 | `FL_DP` | `0` | `1` turns per-batch clipping + noise back on (comparison only) |
 | `FL_LBL_SITE_TELEMETRY` | `{site}:telemetry` | combined label used to discover telemetry |
 | `FL_VALSET_PATH` | `fl/valset_amr.npz` | fixed validation set |
-| `FL_SENSOR_CIN_LIMIT_PER_ROBOT` | `150` | CINs fetched per robot per round |
+| `FL_SENSOR_CIN_LIMIT_PER_ROBOT` | derived (`50` with the defaults) | CINs fetched per robot per round; `max(50, 2 × site cap ÷ robots)`, or `300` when the site cap is `0` |
 | `FL_MAX_CIN_BYTES` | 4 MB | embed ceiling before falling back |
 | `FL_CHUNK_WEIGHTS` | `0` | fragment weights across CINs |
 | `FL_CREATE_AES` | `0` | robot AEs come from Isaac Sim |
@@ -1059,7 +1088,8 @@ clipped gradient, and the global model converged to near-zero output.
 | `FL_UL_MIN_KBPS` | `500` | minimum uplink rate |
 | `FL_CHU_WARN_PCT` | `70` | channel occupancy ceiling |
 
-**These are estimates, not measurements.** See Known limitations.
+**These are estimates, not measurements.** They have not been checked against
+a running sandbox.
 
 ---
 
@@ -1091,8 +1121,8 @@ python3 fl/mec_services.py --nodes mn1            # MEC011 register → discover
 python3 fl/mec_wai.py --nodes mn3                 # MEC028 link state
 ```
 
-`mec_iot.py` should print `(규칙 주소와 같음)` — same as the naming rule — for
-every site. `mec_services.py` registers, takes one snapshot and deregisters
+`mec_iot.py` should print `(규칙 주소와 같음)` ("same as the rule address": the
+address MEC033 returned matches the naming rule) for every site. `mec_services.py` registers, takes one snapshot and deregisters
 again, so it leaves nothing behind.
 
 `--verify` reports missing robot AEs as a warning: those belong to Isaac Sim, so
@@ -1111,9 +1141,18 @@ python3 fl/setup_resources_standard.py --nodes mn1,mn2
 ### Run the federated learning demo
 
 ```bash
-./run_fl.sh                           # resources → dashboard → 3 trainers → IN-AE
-FL_SENSOR_FROM_CSE=0 ./run_fl.sh      # offline: local pkl instead of the CSE
+./run_fl.sh                            # clean up → resources → dashboard → wait for robots → 3 trainers → IN-AE
+bash run_fl.sh 2>&1 | tee /tmp/fl.log  # same, and keep the whole terminal output in /tmp/fl.log
+AMR_DATA=/path/to/telemetry FL_SENSOR_FROM_CSE=0 ./run_fl.sh   # offline: build pkl from local telemetry, no CSE
 ```
+
+`run_fl.sh` first stops whatever a previous run left on ports 7000, 6000 and
+5001–5003 and empties `/tmp/fl_models` (`FL_RESET_ON_START=0` skips this). It
+creates resources only if `--verify` finds some missing, then waits up to 300 s
+(`FL_ROBOT_WAIT_SEC`) for at least one robot per site; robots that come up later
+join from that round. Each trainer and the IN-AE also log to
+`logs/run_<time>/`; the dashboard and the script itself print only to the
+terminal; the `tee` line keeps all of it in one file.
 
 Or individually:
 
@@ -1127,6 +1166,22 @@ python3 fl/dashboard_server.py        # http://localhost:7000
 
 Start the site trainers **before** the coordinator. Their `cnt-fl-control`
 subscriptions must exist first; otherwise the first round command notifies nobody.
+
+### Run the judge app (scenario 5)
+
+Scenario 5 needs the judge app. It lives in another repository
+([mostonar/edgeway `Edge-ESTIMED-VM/Local-Model/judge_ae`](https://github.com/mostonar/edgeway/tree/main/Edge-ESTIMED-VM/Local-Model/judge_ae)),
+so `run_fl.sh` does not start it. Start it after `run_fl.sh` has created the
+resources, since it subscribes to `ANALYSIS-AE-3/cnt-verdict`:
+
+```bash
+python3 judge_ae.py --site C --insecure \
+  --cse https://<MEC_HOST>/<SANDBOX>/mep-c/meep-acme-mn-cse/acme-cse-mn-mep-c-<SANDBOX>
+```
+
+Without `--notify` it receives notifications through a pollingChannel, so it
+works behind a firewall. `--iot <MEC033 registered_iot_platforms URL>` lets it
+follow the CSE to its replacement in scenario 6.
 
 ### Run the network scenarios
 
@@ -1163,88 +1218,40 @@ assigns robots to sites by the `siteA_*` / `siteB_*` / `siteC_*` prefix, or by
 | Dashboard | 7000 |
 
 `node_id` and port must stay aligned: `0 → mn1 → 5001`, `1 → mn2 → 5002`,
-`2 → mn3 → 5003`. The same port goes into each site app's MEC 011 registration
-`endpoint` (`http://<FL_MEC_APP_HOST>:500N`).
+`2 → mn3 → 5003`. The site MN-CSE calls the trainer on this port directly
+(`http://<FL_NOTIFY_HOST>:500N/notify`), so the sandbox must be able to reach
+it. Notifications from the IN-CSE come through a pollingChannel and are handed
+to the same server locally, so the IN-CSE never has to reach it; the IN-AE on
+6000 works the same way. The same port also goes into each site app's MEC 011
+registration `endpoint` (`http://<FL_MEC_APP_HOST>:500N`, or `FL_NOTIFY_HOST`
+when that is unset). `FL_DASHBOARD_PORT` changes the dashboard port, but
+`run_fl.sh` still checks and frees 7000.
 
 ---
 
 ## 11. Known limitations
 
-Stated plainly, because the measurements are what they are.
+**Site A raises occasional false alarms.** Scores jump in low-speed turns,
+where there are few samples.
 
-**One live three-site run detected the injected fault, with caveats.** On
-2026-11-19 (11:36 run, live Isaac Sim telemetry, ten rounds), a floor fault on
-`siteC_AMR_2` starting around 11:45:15 was flagged in round 8 and the verdict was
-posted at 11:46:11 (score 33.2, threshold 15.23); `siteC_AMR_1` raised none. The
-same run also showed:
+**Site A's windows wait longer.** Each round uses a fixed 50 windows per site.
+Site A's four robots produce about 1.3 windows/s, so the rest wait for later
+rounds. In the 11:36 run the waiting windows grew from 143 to 469, and by round
+10 site A was training on windows that had waited about 5.5 minutes.
 
-- **Two false alarms at site A** (rounds 6 and 10), both in low-speed turn cells
-  (`to_pick/turn_in`, `to_pick/turn_start`) that the frozen reference pool barely
-  covers.
-- **Site A lags behind its robots.** Four robots produce about 1.3 windows/s while
-  a round takes 50, so the backlog grew from 143 to 469 windows and site A was
-  about 5.5 minutes behind by round 10.
-- **The validation AUROC falls below the no-model baseline after round 2**
-  (baseline 0.8323 in `diff` mode), so the per-round gain on the fixed set is not
-  yet shown.
+**The per-round gain on the fixed validation set is not yet shown.** In a live
+run the validation AUROC fell below the no-model baseline after round 2
+(0.8323 in `diff` mode).
 
-One run is not a measurement. Earlier two-node rehearsals predate the current
-scoring and are not reproduced here.
+**The validation set covers site C only.** The 827 windows in
+`fl/valset_amr.npz` come from `siteC_AMR_1` (307 normal, 56 floor fault) and
+`siteC_AMR_2` (205 normal, 142 bearing, 117 wheel knob). They say nothing about
+other sites, and each fault type comes from a single robot.
 
-**Floor faults are more detectable than robot faults.** A single channel
-(`roller_rl.vel`) reaches AUROC 0.855 on floor bumps versus about 0.71 for robot
-faults — so scenario 5's floor side is on firmer ground than its robot side.
-
-**The MEC028 thresholds in section 8 are estimates.** They have not been checked
-against a running sandbox. If normal RSSI sits outside the assumed range,
-scenario 2 will either miss the degradation or flag healthy links.
-
-**Each site normalizes its inputs by its own statistics, and sharing them makes
-things worse.** A global model carries no normalization statistics: every site
-accumulates its own channel means and standard deviations and freezes them (see
-Input normalization), so FedAvg is averaging weights learned in three differently
-scaled input spaces. Pooling the statistics and giving every site the same ruler is the
-obvious fix, and it was measured: on a two-node FedAvg rehearsal (five seeds, ten
-rounds, two separate captures as the two sites) shared statistics scored AUROC
-0.5772 against 0.6752 for per-site statistics, losing in all fifty comparisons.
-Per-site normalization appears to be doing real work — each site's normal driving
-lands near zero on its own scale — and flattening that costs more than the
-mismatch does. The mechanism has not been measured, so the change is not made.
-
-**The validation set is normalized by its own statistics, and that turns out to
-be the right choice.** `fl/valset.py` standardizes the validation windows against
-themselves rather than borrowing a site's ruler. Scoring the same global models
-four ways — the validation set's own statistics, each site's, and the two pooled —
-the validation set's own won every one of fifty comparisons: AUROC 0.6752 against
-0.6248 (site 2), 0.5927 (pooled) and 0.5280 (site 1), with false alarms lowest as
-well. An earlier single-node rehearsal suggested the opposite and was wrong.
-
-**The validation set comes from one robot at one site.** `siteC_AMR_2`, a single
-continuous run. It says nothing about how the model generalizes across sites,
-which is the whole premise of the federated setup.
-
-**MEC 046 (Sensor Sharing) returns nothing on this sandbox.** `meep-sss` drops
-every IoT platform whose URI has no explicit port: it substitutes 80/443 and then
-`continue`s past the line that would add it. It is deployed but not used here.
-
-**MEC 021 is not exercised.** Handover in scenario 2 stays within one MEP; a
-handover to `mep-spare` would need Application Mobility, which is not
-implemented.
-
-**Scenario 6 has only been run against mocked CSEs.** It assumes the second
-MN-CSE brought up for it is registered in MEC 033 with the same transport format
-as the primary (HTTP URI, transport `name` = CSE name). Three caveats: if the robots do
-not reach the new CSE within 120 s, `acp-verdict-mnX` is created without them and
-is not rebuilt later (telemetry collection still picks them up); detection is
-fast when the sandbox ingress answers `503` for a dead pod, slower when the host
-is unreachable and every request runs through timeouts and retries; and the
-IN-AE's ACP self-check still looks at the rule-derived CSE name.
-
-**Earlier evaluation numbers came from a leaky split.** Until the run-aware split
-landed, training and validation drew neighbouring one-second windows from the
-same traversal, and the validation normals were reused inside the test set. Any
-AUROC measured before that fix was optimistic, and with only two normal windows
-on the honest side at site C it was also close to noise.
+**Each site normalizes with its own statistics.** A global model carries no
+normalization statistics, so FedAvg averages weights learned in differently
+scaled input spaces. Pooling the statistics made things worse (AUROC 0.5772
+against 0.6752 on a two-node rehearsal), so it stays as is.
 
 ---
 
@@ -1261,14 +1268,10 @@ on the honest side at site C it was also close to noise.
 
 | Standard | Title | Sandbox service | In this repository |
 | --- | --- | --- | --- |
-| ETSI GS MEC 003 | Framework and Reference Architecture | — | terminology only (MEP, MEC host) |
 | ETSI GS MEC 011 | Edge Platform Application Enablement | `mec011-N` | **called** — `fl/mec_app.py`: `confirm_ready` → `registrations` (app support, `isInsByMec=false`), `GET services` (service management) to find 013 and 028 |
-| ETSI GS MEC 013 | Location API | `mec013-N` | **called** — `fl/mec_loc.py`, queries `users` / `zones`; zone and AP go into `cnt-net-status` and verdicts |
-| ETSI GS MEC 021 | Application Mobility Service API | `mec021-N` | not called; would be needed for a cross-MEP handover to `spare` (section 5) |
+| ETSI GS MEC 013 | Location API | `mec013-N` | **called** — `fl/mec_loc.py`, queries `users`; zone and AP go into `cnt-net-status` and verdicts |
 | ETSI GS MEC 028 | WLAN Information API (WAI) | `mec028-N` | **called** — `fl/mec_wai.py`, queries `ap_information` / `sta_information`; scenario 2, and once per round via `fl/mec_services.py` |
 | ETSI GS MEC 033 | IoT API | `mec033-N` | **called** — `fl/mec_iot.py`: `GET registered_iot_platforms` gives each site app its MN-CSE address (checked with a CSEBase retrieve; falls back to the naming rule in `config.mn_endpoint`), and `fl/cse_failover.py` uses the same list to pick a replacement CSE (scenario 6) |
-| ETSI GS MEC 040 | Federation enablement APIs | `mec040-N` | not called |
-| ETSI GS MEC 046 | Sensor-sharing API | `mec046-N` | not called |
 
 `N` is the MEP index (1 = mep-a, 2 = mep-b, 3 = mep-c). The MEC Sandbox
 controller (`sandbox-ctrl/v1/events/…`) is not in this table because it is not an
