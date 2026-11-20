@@ -24,7 +24,7 @@ opposite responses.
 | Where | What | oneM2M identity | MEC identity |
 | --- | --- | --- | --- |
 | Shared IN-CSE, outside the sandbox | FL coordinator — starts rounds, runs FedAvg, scores each global model | `IN-AE` | — (belongs to no MEP) |
-| Each site's MEP (mep-a / b / c) | Site app — collects telemetry, trains locally, judges floor faults | `TRAINING-AE-i` + `ANALYSIS-AE-i` | MEC app `edgeway-fl-a/b/c` |
+| Each site's MEP (mep-a / b / c) | Site app — collects telemetry, trains locally, flags anomalous robots | `TRAINING-AE-i` + `ANALYSIS-AE-i` | MEC app `edgeway-fl-a/b/c` |
 | Isaac Sim host | Robots — drive, publish 38-channel telemetry | `siteX_AMR_n` | UE `robot-xn` |
 
 **One round, end to end**
@@ -38,8 +38,9 @@ opposite responses.
 4. `IN-AE` is notified of each upload, runs FedAvg, writes the new global model,
    and scores it on a fixed validation set (`cnt-fl-inference`).
 5. Inside each site: link state (MEC 028) and robot location (MEC 013) go to
-   `cnt-net-status`, and from round 6 every detected floor fault becomes a verdict
-   in `ANALYSIS-AE-i/cnt-verdict`. Neither leaves the site.
+   `cnt-net-status`, and from round 6 every detected anomaly becomes a verdict
+   in `ANALYSIS-AE-i/cnt-verdict`. Neither leaves the site. Whether an anomaly is
+   the floor or the robot is decided by a separate judge app (scenario 5).
 
 **Standards used**: oneM2M TS-0001 / TS-0004 / TS-0009, TR-0084 direction ·
 ETSI GS MEC 011, 013, 028, 033 (section 12).
@@ -67,16 +68,15 @@ ETSI GS MEC 011, 013, 028, 033 (section 12).
 | --- | --- | --- | --- |
 | 1 | Normal driving | Robots drive their loops; telemetry lands in each site's MN-CSE | MEC 033 (site app finds its MN-CSE) + MEC 011 (registers as a MEC app, discovers 013/028) |
 | 2 | Network anomaly → handover | MEC028 detects a degraded Wi-Fi AP; the robot is moved to another AP and data keeps flowing | MEC 028 (observe) + sandbox controller (act) |
-| 3 | Network anomaly → buffering | No AP is available; windows are queued on the MEP side and replayed on recovery, with zero loss | MEC 028 (observe) + sandbox controller (act) |
 | 4 | Federated learning in real time | Sites A and B train and FedAvg; site C never contributes and still receives the global model | MEC 028 + MEC 013, read once per round into `cnt-net-status` |
-| 5 | Anomaly detection: floor vs robot | A second robot is sent into the same zone to tell a floor fault apart from a faulty robot | MEC 013 + MEC 028, attached to each verdict as `mec` |
+| 5 | Anomaly detection: floor vs robot | The site app flags an anomalous robot; a separate judge app (`JUDGE-AE-3`) has the other robot cross-check the spot and decides floor or robot | MEC 013 + MEC 028, attached to each verdict as `mec` |
 | 6 | MN-CSE failure → CSE handover | A site's MN-CSE stops answering mid-training; the site app finds another CSE at the same MEP, rebuilds its resources there and keeps training | MEC 033 (find the replacement CSE) |
 
 The sandbox controller (`sandbox-ctrl`) is the MEC Sandbox's own control API, not
 an ETSI MEC specification, so it carries no GS number. Section 12 lists every MEC
 service on the MEPs and which of them this repository actually calls.
 
-Scenarios 2, 3 and 6 share one goal: **the link — or the CSE itself — may fail,
+Scenarios 2 and 6 share one goal: **the link — or the CSE itself — may fail,
 but the data must not be lost and the FL round must not stall.** Scenario 2 moves
 a robot between Wi-Fi APs; scenario 6 moves a site app between CSEs.
 
@@ -107,9 +107,9 @@ sandbox — it is a shared CSE operated outside it, reached over Mca.
   │   │ MEC 011 013 021│     │       ...      │     │       ...      │      │
   │   │ 028 033 040 046│     │                │     │                │      │
   │   └────────────────┘     └────────────────┘     └────────────────┘      │
-  │     poa-wifi 1..7          poa-wifi 1..7          poa-wifi 1..10        │
+  │     poa-wifi 1..6          poa-wifi 1..4          poa-wifi 1..3         │
   │     robot-a1..a4 UE        robot-b1..b2           robot-c1..c2          │
-  │                                   spare / mep-spare — 13 APs, no robots │
+  │                                   spare / mep-spare — no APs, no robots │
   └──────────────▲───────────────────────────────────────▲──────────────────┘
                  │ Mca                                   │ Mca
           Isaac Sim host                          FL processes, one host
@@ -122,16 +122,16 @@ The three site MEPs each run the same seven ETSI MEC services (`mec011-N` …
 **MEC 011, 013, 028 and 033**; the others are deployed but not used here — see
 section 12.
 
-For scenario 6 each site MEP also runs a **standby MN-CSE**, registered in the
-same MEP's MEC 033 as a second IoT platform. The diagram shows one CSE per MEP
-because only one is in use at a time.
+Each site MEP normally runs **one** MN-CSE. Only for scenario 6 is a second
+MN-CSE brought up at the same MEP and registered in its MEC 033 as another IoT
+platform; the site app moves to it when the first one stops answering.
 
 ### Resources are not processes
 
-A `<AE>` resource in a CSE is a registration, not a running program. None of this
-repository's code runs *inside* a CSE or a MEP: the three site trainers, the
-coordinator and the dashboard are ordinary Python processes on one host, and they
-talk to the CSEs over Mca. Isaac Sim runs on a second host and reaches the MN-CSEs
+The site apps' AE resources are created in the MN-CSEs inside the sandbox, but
+the processes acting as those AEs run outside it: the three site trainers, the
+coordinator and the dashboard are Python processes on one host, and they talk to
+the CSEs over Mca. Isaac Sim runs on a second host and reaches the MN-CSEs
 the same way.
 
 ### Why the site trainer is registered on two CSEs
@@ -172,9 +172,18 @@ Each MN-CSE *is* registered to the IN-CSE — every one of them carries a
 traffic does not simply ride that link, with the sites addressing the IN-CSE
 through their own registrar.
 
-It does not, for a reason that survives whether or not retargeting works: the
-`<pollingChannel>` has to live on the CSE that delivers the notification. The
-round command is a `<contentInstance>` created under `IN-AE/cnt-fl-control` on the
+It does not, for two reasons.
+
+**ACME does not route upwards yet.** An ACME MN-CSE does not forward a request
+for a target it does not know up to its registrar (TS-0004 clause 7.3.2.6), so a
+request from a site AE through its MN-CSE to the IN-CSE stops at the MN with
+`4004`. This was reported on the ACME / Mobius4 developer channel in October
+2026; the ACME author said a fix was in progress but not yet released, and we
+have not checked whether the sandbox's `meep-acme-mn-cse` image includes it.
+
+**Even with routing, the notification would not move.** The `<pollingChannel>`
+has to live on the CSE that delivers the notification. The round command is a
+`<contentInstance>` created under `IN-AE/cnt-fl-control` on the
 IN-CSE, so the IN-CSE is the CSE that notifies — and the only place it can leave a
 notification for an unreachable AE is a polling channel under that AE, on itself.
 Relaying the *request* through a registrar would not move the *notification*.
@@ -216,8 +225,8 @@ MEC028 (WAI)  ──▶  the site judges  ──▶  writes a verdict to oneM2M
                                   (MOBILITY / NETWORK-CHARACTERISTICS-UPDATE)
 ```
 
-Floor verdicts go to `ANALYSIS-AE-i/cnt-verdict` on the site's own MN-CSE and
-never leave the site; link state and buffering go to `cnt-net-status`. The
+Anomaly verdicts go to `ANALYSIS-AE-i/cnt-verdict` on the site's own MN-CSE and
+never leave the site; link state goes to `cnt-net-status`. The
 sandbox and Isaac Sim read those and move robots.
 
 Writing the verdict is the analysis app's job, not the trainer's. They are
@@ -338,7 +347,7 @@ acme-cse-mn-mep-a-<sandbox>            registered at mep-a as an IoT platform (M
 │   │                                  poa=http://<FL_NOTIFY_HOST>:5001, rr=true
 │   │                                  (local notifications are direct, so no pch here)
 │   ├── cnt-local-model        <CNT>   mni=5    acp=acp-cache-mn1   round model cache
-│   └── cnt-net-status         <CNT>   mni=100  acp=acp-cache-mn1   link / location / buffering
+│   └── cnt-net-status         <CNT>   mni=100  acp=acp-cache-mn1   link / location / CSE handover
 │       ├── <CIN>  every round: {type:"net-status", node, mep, round, timestamp,
 │       │                        sources:["MEC028","MEC013"],
 │       │                        mec_app{appInstanceId, ready, registered},
@@ -346,7 +355,7 @@ acme-cse-mn-mep-a-<sandbox>            registered at mep-a as an IoT platform (M
 │       │                                         dl_kbps, channel_util_pct,
 │       │                                         verdict, reasons,
 │       │                                         zone, loc_ap, lat, lon}]}
-│       ├── <CIN>  scenarios 2/3: {scenario:"s2-detect"|"s2-handover"|"s3-outage-start"|…,
+│       ├── <CIN>  scenario 2: {scenario:"s2-detect"|"s2-no-target"|"s2-handover",
 │       │                          robot, verdict, node, ts}
 │       │          lbl = scenario:… · verdict:… · robot:…
 │       └── <CIN>  scenario 6, written on the *new* CSE after a handover:
@@ -402,7 +411,7 @@ carries a manifest instead. Off by default.
 | Access control | `<accessControlPolicy>` + `acpi`, per-node scoped |
 | Per-round model evaluation | `<contentInstance>` under `cnt-fl-inference` |
 | Link and location record | `<contentInstance>` under `TRAINING-AE-i/cnt-net-status` (MN-CSE) |
-| Floor verdict | `<contentInstance>` under `ANALYSIS-AE-i/cnt-verdict` (MN-CSE) |
+| Anomaly verdict | `<contentInstance>` under `ANALYSIS-AE-i/cnt-verdict` (MN-CSE) |
 
 Each drop-box carries its own ACP so one site cannot read another site's updates.
 `pvs` is scoped as tightly as `pv`; otherwise any originator could rewrite the policy.
@@ -429,9 +438,9 @@ Each drop-box carries its own ACP so one site cannot read another site's updates
 | B (`mn2`, mep-b) | 2 | Trains, contributes to FedAvg |
 | C (`mn3`, mep-c) | 2 | **Never contributes.** Receives the global model, fine-tunes locally |
 
-Site C is the point of the demo. It joins late, has little data of its own, and
-must still detect faults it has never seen — using a model trained on two other
-sites' floors.
+Site C is the point of the demo. It only ever trains locally and never uploads
+its weights, yet it must still detect faults it has never seen — using a model
+trained on two other sites' floors.
 
 #### Aggregation weighting: equal per site, not per sample
 
@@ -652,25 +661,46 @@ measurement path is unsupervised end to end.
 
 ### Scenario 5: floor fault or robot fault
 
+This repository only **detects** the anomaly. Telling a floor fault from a robot
+fault is the job of a separate judge app, `JUDGE-AE-3`
+([mostonar/edgeway `judge_ae`](https://github.com/mostonar/edgeway/tree/main/judge_ae)),
+which currently runs for site C.
+
 ```
-robot 1 reports an anomaly in zone Z
+site app: robot 1 anomalous ──▶ ANOMALY verdict in ANALYSIS-AE-3/cnt-verdict
+        │  subscription
+        ▼
+JUDGE-AE-3 opens a case ──▶ stage "suspect" to both robots' <robot>/command
         │
         ▼
-send robot 2 into zone Z
+robot 2 passes within 3 m of the reported spot
         │
-   ┌────┴────┐
-   ▼         ▼
-also      no anomaly
-anomalous      │
-   │           ▼
-   ▼      robot 1 is faulty
-floor     → move it to the standby area
-fault
+   ┌────┴──────────────────────┐
+   ▼                           ▼
+the site app reports       no report within 30 s
+robot 2 anomalous there        │
+   │                           ▼
+   ▼                       final: robot
+final: floor               robot 1's reports ignored
+no-go zone → cnt-judgement until a clear_fault command
 ```
 
-The verdict is written to `ANALYSIS-AE-i/cnt-verdict` on the site's own MN-CSE.
-Dispatching the second robot and moving the faulty one are sandbox actions, not FL
-actions.
+- The judge subscribes to `ANALYSIS-AE-3/cnt-verdict` and reads `robot` and
+  `pose` from each verdict. Only one case is open at a time; a case with no
+  conclusion within 600 s is closed.
+- It does not move robot 2. It watches robot 2's `telemetry` and waits until the
+  robot drives past the spot (in the demo, the `isaac_robot` scenario scripts
+  drive it there).
+- Floor: a no-go zone around both positions is published to
+  `JUDGE-AE-3/cnt-judgement` and sent with the verdict. The dashboard can clear a
+  zone through `JUDGE-AE-3/cnt-request`.
+- Robot: later reports from that robot are ignored until a `clear_fault` command
+  appears in its `command` container after maintenance.
+
+Verdicts go to the robots' `command` containers; acting on them is the robot
+side's job, not FL's. What this repository provides is the verdict itself and the
+right to read it: `acp-verdict-mnX` grants `CJUDGE-AE-X` RETRIEVE, NOTIFY,
+DISCOVERY and CREATE (section 3).
 
 ---
 
@@ -722,7 +752,7 @@ Once per round each site app reads MEC 028 link state and MEC 013 location for
 its robots and writes one snapshot to `TRAINING-AE-i/cnt-net-status`
 (`sources`, `mec_app`, per-robot AP, RSSI, link verdict, zone, coordinates).
 Every verdict CIN also carries a `mec` field with the robot's zone, AP and link
-state at the time of the verdict, so a floor fault can be placed on the map.
+state at the time of the verdict, so the anomaly can be placed on the map.
 
 All of this is auxiliary. A service that fails `FL_MEC_MAX_FAIL` times in a row
 is switched off for the rest of the run; rounds never wait on MEC.
@@ -828,23 +858,14 @@ which is deployed but not called here) → request MOBILITY → confirm the new 
 
 Staying inside the site keeps the same MN-CSE, so only the path changes.
 
-### Scenario 3 — store-and-forward buffering
-
-While the link is down, windows are written to a disk queue
-(`fl/net_scenarios.py:StoreAndForward`) and replayed in order on recovery.
-
-Disk rather than memory, and `os.replace` for every write, so a crash mid-outage
-still leaves a complete queue — otherwise "zero loss" would not hold. A failed
-send stops the drain instead of skipping ahead, preserving order.
-
 ### Topology (`edgeway` scenario)
 
 | Site | MEP | Wi-Fi APs | Robots |
 | --- | --- | ---: | ---: |
-| site-a | mep-a | 7 | 4 |
-| site-b | mep-b | 7 | 2 |
-| site-c | mep-c | 10 | 2 |
-| spare | mep-spare | 13 | 0 (handover refuge) |
+| site-a | mep-a | 6 | 4 |
+| site-b | mep-b | 4 | 2 |
+| site-c | mep-c | 3 | 2 |
+| spare | mep-spare | 0 | 0 (empty MEP: no APs, robots or MEC services) |
 
 ---
 
@@ -893,12 +914,12 @@ fl/
   mec_wai.py                 MEC028 client and link judgement
   mec_services.py            the site app's MEC services per round (net-status, verdict context)
   mec_sandbox.py             MEC Sandbox controller events
-  net_scenarios.py           scenarios 2 and 3
+  net_scenarios.py           scenario 2
   personalize.py             local fine-tuning for the non-contributing node
   valset.py                  fixed validation set, per-round model scoring
   valset_amr.npz             the validation windows themselves
   build_valset.py            builds valset_amr.npz from Isaac Sim captures
-  verdict.py                 writes floor verdicts to the analysis app's container
+  verdict.py                 writes anomaly verdicts to the analysis app's container
   dashboard_server.py        dashboard backend
   check_telemetry.py         diagnostic: how full each robot's telemetry container is
   probe_cra.py               diagnostic: reproduces the trainer's incremental fetch
@@ -1112,7 +1133,6 @@ subscriptions must exist first; otherwise the first round command notifies nobod
 ```bash
 python3 fl/net_scenarios.py watch   --node mn3 --seconds 60
 python3 fl/net_scenarios.py s2      --node mn3 --robot siteC_AMR_2
-python3 fl/net_scenarios.py s3      --node mn3 --robot siteC_AMR_2 --outage 40
 python3 fl/net_scenarios.py restore --node mn3
 ```
 
@@ -1171,10 +1191,6 @@ same run also showed:
 One run is not a measurement. Earlier two-node rehearsals predate the current
 scoring and are not reproduced here.
 
-**Site C is data-starved.** Only one robot has usable data, 25 moving windows.
-The design calls for four. Normal driving at site A's scale (~400 windows) and
-50+ bump samples are needed before the comparison means anything.
-
 **Floor faults are more detectable than robot faults.** A single channel
 (`roller_rl.vel`) reaches AUROC 0.855 on floor bumps versus about 0.71 for robot
 faults — so scenario 5's floor side is on firmer ground than its robot side.
@@ -1215,17 +1231,14 @@ every IoT platform whose URI has no explicit port: it substitutes 80/443 and the
 handover to `mep-spare` would need Application Mobility, which is not
 implemented.
 
-**Scenario 6 has only been run against mocked CSEs.** It assumes a standby
-MN-CSE per MEP registered in MEC 033 with the same transport format as the
-primary (HTTP URI, transport `name` = CSE name). Three caveats: if the robots do
+**Scenario 6 has only been run against mocked CSEs.** It assumes the second
+MN-CSE brought up for it is registered in MEC 033 with the same transport format
+as the primary (HTTP URI, transport `name` = CSE name). Three caveats: if the robots do
 not reach the new CSE within 120 s, `acp-verdict-mnX` is created without them and
 is not rebuilt later (telemetry collection still picks them up); detection is
 fast when the sandbox ingress answers `503` for a dead pod, slower when the host
 is unreachable and every request runs through timeouts and retries; and the
 IN-AE's ACP self-check still looks at the rule-derived CSE name.
-
-**The sandbox scenario YAML lists four robots at site B** while the code and data
-use two (`ROBOTS_PER_NODE`). The YAML is being corrected.
 
 **Earlier evaluation numbers came from a leaky split.** Until the run-aware split
 landed, training and validation drew neighbouring one-second windows from the
@@ -1252,7 +1265,7 @@ on the honest side at site C it was also close to noise.
 | ETSI GS MEC 011 | Edge Platform Application Enablement | `mec011-N` | **called** — `fl/mec_app.py`: `confirm_ready` → `registrations` (app support, `isInsByMec=false`), `GET services` (service management) to find 013 and 028 |
 | ETSI GS MEC 013 | Location API | `mec013-N` | **called** — `fl/mec_loc.py`, queries `users` / `zones`; zone and AP go into `cnt-net-status` and verdicts |
 | ETSI GS MEC 021 | Application Mobility Service API | `mec021-N` | not called; would be needed for a cross-MEP handover to `spare` (section 5) |
-| ETSI GS MEC 028 | WLAN Information API (WAI) | `mec028-N` | **called** — `fl/mec_wai.py`, queries `ap_information` / `sta_information`; scenarios 2 and 3, and once per round via `fl/mec_services.py` |
+| ETSI GS MEC 028 | WLAN Information API (WAI) | `mec028-N` | **called** — `fl/mec_wai.py`, queries `ap_information` / `sta_information`; scenario 2, and once per round via `fl/mec_services.py` |
 | ETSI GS MEC 033 | IoT API | `mec033-N` | **called** — `fl/mec_iot.py`: `GET registered_iot_platforms` gives each site app its MN-CSE address (checked with a CSEBase retrieve; falls back to the naming rule in `config.mn_endpoint`), and `fl/cse_failover.py` uses the same list to pick a replacement CSE (scenario 6) |
 | ETSI GS MEC 040 | Federation enablement APIs | `mec040-N` | not called |
 | ETSI GS MEC 046 | Sensor-sharing API | `mec046-N` | not called |
