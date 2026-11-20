@@ -70,13 +70,15 @@ ETSI GS MEC 011, 013, 028, 033 (section 12).
 | 3 | Network anomaly → buffering | No AP is available; windows are queued on the MEP side and replayed on recovery, with zero loss | MEC 028 (observe) + sandbox controller (act) |
 | 4 | Federated learning in real time | Sites A and B train and FedAvg; site C never contributes and still receives the global model | MEC 028 + MEC 013, read once per round into `cnt-net-status` |
 | 5 | Anomaly detection: floor vs robot | A second robot is sent into the same zone to tell a floor fault apart from a faulty robot | MEC 013 + MEC 028, attached to each verdict as `mec` |
+| 6 | MN-CSE failure → CSE handover | A site's MN-CSE stops answering mid-training; the site app finds another CSE at the same MEP, rebuilds its resources there and keeps training | MEC 033 (find the replacement CSE) |
 
 The sandbox controller (`sandbox-ctrl`) is the MEC Sandbox's own control API, not
 an ETSI MEC specification, so it carries no GS number. Section 12 lists every MEC
 service on the MEPs and which of them this repository actually calls.
 
-Scenarios 2 and 3 share one goal: **the link may degrade, but the data must not be
-lost and the FL round must not stall.**
+Scenarios 2, 3 and 6 share one goal: **the link — or the CSE itself — may fail,
+but the data must not be lost and the FL round must not stall.** Scenario 2 moves
+a robot between Wi-Fi APs; scenario 6 moves a site app between CSEs.
 
 ---
 
@@ -94,20 +96,20 @@ sandbox — it is a shared CSE operated outside it, reached over Mca.
                 └──────────────────────┬───────────────────────┘
                                        │ Mca   HTTPS + <pollingChannel>
   ┌────────────────────────────────────┴────────────────────────────────────┐
-  │  MEC Sandbox — scenario `edgeway`                                        │
-  │                                                                          │
-  │   site-a / mep-a         site-b / mep-b         site-c / mep-c           │
-  │   ┌────────────────┐     ┌────────────────┐     ┌────────────────┐       │
-  │   │ MN-CSE         │     │ MN-CSE         │     │ MN-CSE         │       │
-  │   │  TRAINING-AE-1 │     │  TRAINING-AE-2 │     │  TRAINING-AE-3 │       │
-  │   │  ANALYSIS-AE-1 │     │  ANALYSIS-AE-2 │     │  ANALYSIS-AE-3 │       │
-  │   │  siteA_AMR_1-4 │     │  siteB_AMR_1-2 │     │  siteC_AMR_1-2 │       │
-  │   │ MEC 011 013 021│     │       ...      │     │       ...      │       │
-  │   │ 028 033 040 046│     │                │     │                │       │
-  │   └────────────────┘     └────────────────┘     └────────────────┘       │
-  │     poa-wifi 1..7          poa-wifi 1..7          poa-wifi 1..10         │
-  │     robot-a1..a4 UE        robot-b1..b4           robot-c1..c4           │
-  │                                      spare / mep-spare — 13 APs, no robots│
+  │  MEC Sandbox — scenario `edgeway`                                       │
+  │                                                                         │
+  │   site-a / mep-a         site-b / mep-b         site-c / mep-c          │
+  │   ┌────────────────┐     ┌────────────────┐     ┌────────────────┐      │
+  │   │ MN-CSE         │     │ MN-CSE         │     │ MN-CSE         │      │
+  │   │  TRAINING-AE-1 │     │  TRAINING-AE-2 │     │  TRAINING-AE-3 │      │
+  │   │  ANALYSIS-AE-1 │     │  ANALYSIS-AE-2 │     │  ANALYSIS-AE-3 │      │
+  │   │  siteA_AMR_1-4 │     │  siteB_AMR_1-2 │     │  siteC_AMR_1-2 │      │
+  │   │ MEC 011 013 021│     │       ...      │     │       ...      │      │
+  │   │ 028 033 040 046│     │                │     │                │      │
+  │   └────────────────┘     └────────────────┘     └────────────────┘      │
+  │     poa-wifi 1..7          poa-wifi 1..7          poa-wifi 1..10        │
+  │     robot-a1..a4 UE        robot-b1..b2           robot-c1..c2          │
+  │                                   spare / mep-spare — 13 APs, no robots │
   └──────────────▲───────────────────────────────────────▲──────────────────┘
                  │ Mca                                   │ Mca
           Isaac Sim host                          FL processes, one host
@@ -119,6 +121,10 @@ The three site MEPs each run the same seven ETSI MEC services (`mec011-N` …
 `mec046-N` in the scenario); `mep-spare` runs none. This repository calls
 **MEC 011, 013, 028 and 033**; the others are deployed but not used here — see
 section 12.
+
+For scenario 6 each site MEP also runs a **standby MN-CSE**, registered in the
+same MEP's MEC 033 as a second IoT platform. The diagram shows one CSE per MEP
+because only one is in use at a time.
 
 ### Resources are not processes
 
@@ -282,13 +288,13 @@ C R U D N Disc = CREATE RETRIEVE UPDATE DELETE NOTIFY DISCOVERY   (TS-0001 acop)
     ├── cnt-local-updates      <CNT>   mni=50   acp=acp-local-updates   sites → IN
     │   ├── cnt-mn1            <CNT>   mni=50   acp=acp-dropbox-mn1     site A drop-box
     │   │   ├── sub_in_dropbox_mn1  <SUB>  [runtime] net=3, nu = IN-AE's pch
-    │   │   └── <CIN>  {type:"fl-update", node, round, train_loss, val_loss,
+    │   │   └── <CIN>  {type:"fl-update", mn_cse, cse_handovers, node, round, train_loss, val_loss,
     │   │               val_auroc, num_samples, weights_b64, weights_codec,
     │   │               weights_sha256, weights_bytes, window_scores,
     │   │               window_labels, window_robots, threshold, timestamp}
     │   ├── cnt-mn2            <CNT>   acp=acp-dropbox-mn2     site B drop-box (same)
     │   └── cnt-mn3            <CNT>   acp=acp-dropbox-mn3     site C drop-box
-    │       └── <CIN>  {type:"fl-inference", …}   metrics only, no weights
+    │       └── <CIN>  {type:"fl-inference", mn_cse, cse_handovers, …}   metrics only, no weights
     │
     └── cnt-fl-inference       <CNT>   mni=200  acp=acp-fl-inference    per-round evaluation
         └── <CIN>  lbl=round_N, global-eval
@@ -340,9 +346,14 @@ acme-cse-mn-mep-a-<sandbox>            registered at mep-a as an IoT platform (M
 │       │                                         dl_kbps, channel_util_pct,
 │       │                                         verdict, reasons,
 │       │                                         zone, loc_ap, lat, lon}]}
-│       └── <CIN>  scenarios 2/3: {scenario:"s2-detect"|"s2-handover"|"s3-outage-start"|…,
-│                                  robot, verdict, node, ts}
-│                  lbl = scenario:… · verdict:… · robot:…
+│       ├── <CIN>  scenarios 2/3: {scenario:"s2-detect"|"s2-handover"|"s3-outage-start"|…,
+│       │                          robot, verdict, node, ts}
+│       │          lbl = scenario:… · verdict:… · robot:…
+│       └── <CIN>  scenario 6, written on the *new* CSE after a handover:
+│                  {type:"cse-handover", node, mep, round, timestamp, down_sec,
+│                   from{base, cse}, to{base, cse, iotPlatformId},
+│                   source:"MEC033", robots}
+│                  lbl = cse-handover · round_N
 │
 └── ANALYSIS-AE-1              <AE>    CANALYSIS-AE-1   analysis role
     └── cnt-verdict            <CNT>   mni=500  acp=acp-verdict-mn1  never leaves the site
@@ -358,7 +369,9 @@ only grants them the right to. The `mec` field is present when MEC 013 / MEC 028
 answered for that robot.
 
 mep-b and mep-c have the same structure apart from the robot count (4 / 2 / 2)
-and the node suffix. Site C (`FL_LOCAL_ONLY_NODES=mn3`) still trains locally and
+and the node suffix. After a CSE handover (scenario 6) the same tree is rebuilt on
+the standby CSE; `mn_cse` and `cse_handovers` in every drop-box upload tell the
+IN side which CSE a site is currently on. Site C (`FL_LOCAL_ONLY_NODES=mn3`) still trains locally and
 still writes verdicts to `ANALYSIS-AE-3/cnt-verdict`; it differs only in *what it
 uploads*:
 
@@ -714,6 +727,56 @@ state at the time of the verdict, so a floor fault can be placed on the map.
 All of this is auxiliary. A service that fails `FL_MEC_MAX_FAIL` times in a row
 is switched off for the rest of the run; rounds never wait on MEC.
 
+### Scenario 6 — MN-CSE handover via MEC 033
+
+If a site's MN-CSE stops answering during a run, the site app moves to another
+CSE registered at the same MEP and keeps training (`fl/cse_failover.py`,
+`MNAETrainer._maybe_cse_handover`).
+
+**Detection is by response, not by MEC 033.** A MEC 033 entry says a CSE is
+registered, not that it is alive, and may outlive the CSE. So a background
+thread retrieves the CSEBase every `FL_CSE_PROBE_SEC` (5 s). Connection failure,
+timeout, `404` and `5xx` count as down; `401`/`403` mean the CSE is alive and
+are ignored. Down without a break for `FL_CSE_FAILOVER_SEC` (30 s) triggers a
+handover; any answer in between resets the clock.
+
+30 s, not the 600 s round timeout: `FL_COLLECTION_NOTIFY_TIMEOUT` (600 s) is how
+long the IN-AE waits for uploads each round, and a site's data-collection budget
+is 60 s shorter. Detecting late would leave no time to collect the round's data
+on the new CSE.
+
+**MEC 033 picks the replacement.** Among the same MEP's
+`registered_iot_platforms`, the first CSE other than the current one whose
+CSEBase answers. It is checked as the admin originator, because the site app's
+own AE does not exist there yet.
+
+**The switch happens at safe points only** — right after a round command, inside
+the data-collection loop, and just before verdicts are written — never from the
+background thread, so paths do not change under a running fetch. Training itself
+does not touch the MN-CSE.
+
+| Step | What |
+| --- | --- |
+| 1 | rebind this process to the new CSE; rebuild every MN path (telemetry, `cnt-local-model`, `cnt-net-status`, `cnt-verdict`); clear subscriptions and read cursors |
+| 2 | wait up to `FL_CSE_HANDOVER_ROBOT_WAIT_SEC` (120 s) for the robots to appear on the new CSE |
+| 3 | recreate this site's resources with `setup_resources_standard.setup_mn_resources` — after step 2, so `acp-verdict-mnX` includes the robots' AE-IDs |
+| 4 | set the `poa` again and resubscribe to every robot's `telemetry` |
+| 5 | write a `cse-handover` CIN to the new `cnt-net-status` |
+
+What does **not** change: everything on the IN-CSE (round-command subscription,
+drop-box, global model), the model in memory, and the windows already collected
+this round. The site rejoins the round in progress if the collection budget
+allows, otherwise the next one.
+
+**The dashboard shows it.** The dashboard reads only the IN-CSE, so the site app
+reports its current CSE in every drop-box upload (`mn_cse`, `cse_handovers`).
+When `cse_handovers > 0` a `spare` tag appears next to the node name; hovering
+shows which CSE it moved to. The tag appears with the site's next upload, not at
+the moment of the handover.
+
+Moving the robots is Isaac Sim's job: this repository waits for them and
+subscribes, it does not register them.
+
 ### Observation — MEC 028
 
 Each MEP runs `mec028-N` (`meep-wais`), AdvantEDGE's implementation of
@@ -824,6 +887,7 @@ fl/
   mn_ae_standard.py          site trainer (TRAINING-AE-i) + analysis app
   mec_topology.py            AP↔BSSID, robot AE↔UE↔MAC tables
   mec_iot.py                 MEC033 client: MN-CSE address from the IoT platform registry
+  cse_failover.py            MN-CSE health watch and MEC033 replacement pick (scenario 6)
   mec_app.py                 MEC011 client: confirm_ready, registration, service discovery
   mec_loc.py                 MEC013 client: robot zone, AP, coordinates
   mec_wai.py                 MEC028 client and link judgement
@@ -959,6 +1023,11 @@ clipped gradient, and the global model converged to near-zero output.
 | `FL_MEC_APP_PROVIDER` | `edgeway` | `appProvider` in the registration |
 | `FL_MEC_MAX_FAIL` | `3` | consecutive failures before a MEC service is switched off for the run |
 | `FL_MEC_TIMEOUT_SEC` | `4` | per-request timeout for MEC calls |
+| `FL_CSE_HANDOVER` | `1` | `0` turns MN-CSE handover (scenario 6) off |
+| `FL_CSE_PROBE_SEC` | `5` | how often the MN-CSE is probed |
+| `FL_CSE_FAILOVER_SEC` | `30` | continuous downtime before a handover |
+| `FL_CSE_HANDOVER_RETRY_SEC` | `15` | retry interval when no replacement CSE answers |
+| `FL_CSE_HANDOVER_ROBOT_WAIT_SEC` | `120` | how long to wait for robots on the new CSE |
 
 ### MEC028 judgement thresholds
 
@@ -1146,6 +1215,15 @@ every IoT platform whose URI has no explicit port: it substitutes 80/443 and the
 handover to `mep-spare` would need Application Mobility, which is not
 implemented.
 
+**Scenario 6 has only been run against mocked CSEs.** It assumes a standby
+MN-CSE per MEP registered in MEC 033 with the same transport format as the
+primary (HTTP URI, transport `name` = CSE name). Three caveats: if the robots do
+not reach the new CSE within 120 s, `acp-verdict-mnX` is created without them and
+is not rebuilt later (telemetry collection still picks them up); detection is
+fast when the sandbox ingress answers `503` for a dead pod, slower when the host
+is unreachable and every request runs through timeouts and retries; and the
+IN-AE's ACP self-check still looks at the rule-derived CSE name.
+
 **The sandbox scenario YAML lists four robots at site B** while the code and data
 use two (`ROBOTS_PER_NODE`). The YAML is being corrected.
 
@@ -1175,7 +1253,7 @@ on the honest side at site C it was also close to noise.
 | ETSI GS MEC 013 | Location API | `mec013-N` | **called** — `fl/mec_loc.py`, queries `users` / `zones`; zone and AP go into `cnt-net-status` and verdicts |
 | ETSI GS MEC 021 | Application Mobility Service API | `mec021-N` | not called; would be needed for a cross-MEP handover to `spare` (section 5) |
 | ETSI GS MEC 028 | WLAN Information API (WAI) | `mec028-N` | **called** — `fl/mec_wai.py`, queries `ap_information` / `sta_information`; scenarios 2 and 3, and once per round via `fl/mec_services.py` |
-| ETSI GS MEC 033 | IoT API | `mec033-N` | **called** — `fl/mec_iot.py`: `GET registered_iot_platforms` gives each site app its MN-CSE address (checked with a CSEBase retrieve; falls back to the naming rule in `config.mn_endpoint`) |
+| ETSI GS MEC 033 | IoT API | `mec033-N` | **called** — `fl/mec_iot.py`: `GET registered_iot_platforms` gives each site app its MN-CSE address (checked with a CSEBase retrieve; falls back to the naming rule in `config.mn_endpoint`), and `fl/cse_failover.py` uses the same list to pick a replacement CSE (scenario 6) |
 | ETSI GS MEC 040 | Federation enablement APIs | `mec040-N` | not called |
 | ETSI GS MEC 046 | Sensor-sharing API | `mec046-N` | not called |
 
